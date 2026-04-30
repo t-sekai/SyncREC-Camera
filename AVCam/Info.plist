@@ -34,6 +34,11 @@
 	<string>AVCam uses your location to tag where photos and videos are taken.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>To record audio for Live Photos and videos.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>To save captured photos and videos.</string>
 	<key>UISupportedInterfaceOrientations</key>

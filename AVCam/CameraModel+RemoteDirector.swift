@@ -1,0 +1,644 @@
+/*
+See the LICENSE.txt file for this sample’s licensing information.
+
+Abstract:
+Remote director control plane types and client.
+*/
+
+import Foundation
+import SwiftUI
+
+struct RemoteDirectorStatusPayload {
+    let recording: Bool
+    let armed: Bool
+    let battery: Double?
+    let storageGB: Double?
+    let tentacleState: String
+    let timecode: String
+    let fps: Int?
+
+    static let empty = RemoteDirectorStatusPayload(recording: false,
+                                                   armed: false,
+                                                   battery: nil,
+                                                   storageGB: nil,
+                                                   tentacleState: "unknown",
+                                                   timecode: "",
+                                                   fps: nil)
+}
+
+enum RemoteDirectorCommand {
+    case arm
+    case prepareStart(sessionID: String, startAtUnixMS: Int64)
+    case commitStart(sessionID: String, startAtUnixMS: Int64)
+    case prepareStop(sessionID: String, stopAtUnixMS: Int64)
+    case pullVideos(jobID: String, policy: String, maxFiles: Int, uploadURL: String?)
+}
+
+struct RemoteDirectorCommandEnvelope {
+    let requestID: String
+    let command: RemoteDirectorCommand
+}
+
+struct RemoteDirectorCommandReply {
+    let ok: Bool
+    let detail: String
+
+    static func success(_ detail: String) -> RemoteDirectorCommandReply {
+        .init(ok: true, detail: detail)
+    }
+
+    static func failure(_ detail: String) -> RemoteDirectorCommandReply {
+        .init(ok: false, detail: detail)
+    }
+}
+
+@MainActor
+final class RemoteDirectorClient {
+
+    typealias StatusProvider = () -> RemoteDirectorStatusPayload
+    typealias CommandHandler = (RemoteDirectorCommandEnvelope) async -> RemoteDirectorCommandReply
+    typealias TimeSyncHandler = (DirectorTimeSyncPacket) -> Void
+
+    private static let deviceIDDefaultsKey = "RemoteDirectorDeviceID"
+    private static let reconnectDelayMS: UInt64 = 2_000
+    private static let statusIntervalMS: UInt64 = 1_000
+    private static let burstStatusDebounceMS: UInt64 = 150
+    private static let maxClockOffsetSamples = 32
+
+    var statusProvider: StatusProvider?
+    var commandHandler: CommandHandler?
+    var timeSyncHandler: TimeSyncHandler?
+    var deviceNameProvider: (() -> String)?
+
+    private let session = URLSession(configuration: .default)
+    private let deviceID: String
+    private let appVersion: String
+
+    private var webSocketTask: URLSessionWebSocketTask?
+    private var receiveTask: Task<Void, Never>?
+    private var statusTask: Task<Void, Never>?
+    private var reconnectTask: Task<Void, Never>?
+    private var pendingBurstStatusTask: Task<Void, Never>?
+    private var shouldRun = false
+    private var isConnecting = false
+    private var clockOffsetSamplesMS = [Double]()
+    private var estimatedClockOffsetMS = 0.0
+
+    init() {
+        deviceID = Self.loadOrCreateDeviceID()
+        appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        UIDevice.current.isBatteryMonitoringEnabled = true
+    }
+
+    func start() {
+        guard !shouldRun else { return }
+        guard directorURL() != nil else {
+            logger.info("Remote director disabled. Set UserDefaults key \(RemoteDirectorConfiguration.directorWebSocketURLDefaultsKey, privacy: .public) to ws://<host>:8765.")
+            return
+        }
+        shouldRun = true
+        connectIfNeeded()
+    }
+
+    func stop() {
+        shouldRun = false
+        reconnectTask?.cancel()
+        receiveTask?.cancel()
+        statusTask?.cancel()
+        pendingBurstStatusTask?.cancel()
+        reconnectTask = nil
+        receiveTask = nil
+        statusTask = nil
+        pendingBurstStatusTask = nil
+        webSocketTask?.cancel(with: .goingAway, reason: nil)
+        webSocketTask = nil
+        isConnecting = false
+        clockOffsetSamplesMS.removeAll(keepingCapacity: true)
+        estimatedClockOffsetMS = 0
+    }
+
+    var hasConfiguredDirectorURL: Bool {
+        directorURL() != nil
+    }
+
+    func currentDirectorSynchronizedUnixMilliseconds() -> Int64 {
+        let now = Self.unixNowMS()
+        guard !clockOffsetSamplesMS.isEmpty else { return now }
+        return now + Int64(estimatedClockOffsetMS.rounded())
+    }
+
+    func sendStatusNow() {
+        Task { @MainActor in
+            await sendStatus()
+        }
+    }
+
+    func sendStatusSoon() {
+        guard shouldRun else { return }
+        guard pendingBurstStatusTask == nil else { return }
+
+        pendingBurstStatusTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: Self.burstStatusDebounceMS * 1_000_000)
+            guard !Task.isCancelled else { return }
+            self.pendingBurstStatusTask = nil
+            await self.sendStatus()
+        }
+    }
+
+    func sendTransferUpdate(jobID: String,
+                            state: String,
+                            detail: String? = nil,
+                            sentFiles: Int? = nil,
+                            totalFiles: Int? = nil,
+                            sentBytes: Int64? = nil) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.sendTransferUpdatePayload(jobID: jobID,
+                                                 state: state,
+                                                 detail: detail,
+                                                 sentFiles: sentFiles,
+                                                 totalFiles: totalFiles,
+                                                 sentBytes: sentBytes)
+        }
+    }
+
+    func transferDeviceID() -> String {
+        deviceID
+    }
+
+    func resolveUploadBaseURL(override uploadURLString: String?) -> URL? {
+        if let uploadURLString {
+            let trimmed = uploadURLString.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty,
+               let uploadURL = URL(string: trimmed),
+               let scheme = uploadURL.scheme?.lowercased(),
+               scheme == "http" || scheme == "https" {
+                return uploadURL
+            }
+        }
+
+        guard let wsURL = directorURL(),
+              var components = URLComponents(url: wsURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+
+        switch components.scheme?.lowercased() {
+        case "ws":
+            components.scheme = "http"
+        case "wss":
+            components.scheme = "https"
+        case "http", "https":
+            break
+        default:
+            return nil
+        }
+
+        components.user = nil
+        components.password = nil
+        components.query = nil
+        components.fragment = nil
+        components.path = "/upload"
+        return components.url
+    }
+
+    private func sendTransferUpdatePayload(jobID: String,
+                                           state: String,
+                                           detail: String? = nil,
+                                           sentFiles: Int? = nil,
+                                           totalFiles: Int? = nil,
+                                           sentBytes: Int64? = nil) async {
+        var message: [String: Any] = [
+            "type": "transfer",
+            "device_id": deviceID,
+            "job_id": jobID,
+            "state": state
+        ]
+
+        if let detail, !detail.isEmpty {
+            message["detail"] = detail
+        }
+        if let sentFiles {
+            message["sent_files"] = sentFiles
+        }
+        if let totalFiles {
+            message["total_files"] = totalFiles
+        }
+        if let sentBytes {
+            message["sent_bytes"] = sentBytes
+        }
+
+        await sendJSONObject(message)
+    }
+
+    private func connectIfNeeded() {
+        guard shouldRun else { return }
+        guard !isConnecting, webSocketTask == nil else { return }
+        guard let url = directorURL() else { return }
+
+        isConnecting = true
+        let task = session.webSocketTask(with: url)
+        webSocketTask = task
+        task.resume()
+        isConnecting = false
+
+        logger.info("Connected to remote director \(url.absoluteString, privacy: .public)")
+
+        receiveTask?.cancel()
+        statusTask?.cancel()
+        receiveTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.receiveLoop()
+        }
+        statusTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.statusLoop()
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.sendHello()
+            await self.sendStatus()
+        }
+    }
+
+    private func receiveLoop() async {
+        guard let task = webSocketTask else { return }
+
+        do {
+            while shouldRun {
+                let message = try await task.receive()
+                switch message {
+                case .string(let text):
+                    await handleInboundText(text)
+                case .data(let data):
+                    if let text = String(data: data, encoding: .utf8) {
+                        await handleInboundText(text)
+                    }
+                @unknown default:
+                    break
+                }
+            }
+        } catch {
+            logger.error("Remote director receive loop failed: \(error.localizedDescription, privacy: .public)")
+        }
+
+        handleDisconnectAndReconnect()
+    }
+
+    private func statusLoop() async {
+        while shouldRun {
+            try? await Task.sleep(nanoseconds: Self.statusIntervalMS * 1_000_000)
+            if Task.isCancelled { return }
+            await sendStatus()
+        }
+    }
+
+    private func handleDisconnectAndReconnect() {
+        receiveTask?.cancel()
+        statusTask?.cancel()
+        pendingBurstStatusTask?.cancel()
+        receiveTask = nil
+        statusTask = nil
+        pendingBurstStatusTask = nil
+        webSocketTask = nil
+        isConnecting = false
+
+        guard shouldRun else { return }
+        reconnectTask?.cancel()
+        reconnectTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            try? await Task.sleep(nanoseconds: Self.reconnectDelayMS * 1_000_000)
+            guard !Task.isCancelled else { return }
+            self.connectIfNeeded()
+        }
+    }
+
+    private func sendHello() async {
+        let message: [String: Any] = [
+            "type": "hello",
+            "device_id": deviceID,
+            "name": resolvedDeviceName(),
+            "app_version": appVersion
+        ]
+        await sendJSONObject(message)
+    }
+
+    private func sendStatus() async {
+        guard let statusProvider else { return }
+        let status = statusProvider()
+
+        var message: [String: Any] = [
+            "type": "status",
+            "device_id": deviceID,
+            "name": resolvedDeviceName(),
+            "recording": status.recording,
+            "armed": status.armed,
+            "tentacle_state": status.tentacleState,
+            "timecode": status.timecode
+        ]
+
+        if let battery = status.battery {
+            message["battery"] = battery
+        }
+        if let storageGB = status.storageGB {
+            message["storage_gb"] = storageGB
+        }
+        if let fps = status.fps {
+            message["fps"] = fps
+        }
+
+        await sendJSONObject(message)
+    }
+
+    private func handleInboundText(_ text: String) async {
+        guard let data = text.data(using: .utf8) else { return }
+        guard let object = try? JSONSerialization.jsonObject(with: data),
+              let payload = object as? [String: Any] else {
+            logger.error("Invalid remote director payload.")
+            return
+        }
+
+        guard let type = payload["type"] as? String else {
+            return
+        }
+
+        if type == "time_sync" {
+            handleTimeSyncPayload(payload)
+            return
+        }
+        guard type == "command" else { return }
+        guard let commandName = payload["command"] as? String else {
+            return
+        }
+        let requestID = payload["request_id"] as? String ?? UUID().uuidString
+
+        if commandName == "ping" {
+            await sendJSONObject([
+                "type": "pong",
+                "device_id": deviceID,
+                "request_id": requestID
+            ])
+            return
+        }
+
+        guard let envelope = parseCommandEnvelope(commandName: commandName,
+                                                  payload: payload,
+                                                  requestID: requestID) else {
+            await sendAck(requestID: requestID, reply: .failure("Invalid command payload."))
+            return
+        }
+
+        guard let commandHandler else {
+            await sendAck(requestID: requestID, reply: .failure("Command handler unavailable."))
+            return
+        }
+
+        let reply = await commandHandler(envelope)
+        await sendAck(requestID: requestID, reply: reply)
+        await sendStatus()
+    }
+
+    private func handleTimeSyncPayload(_ payload: [String: Any]) {
+        guard let packet = parseTimeSyncPacket(payload) else { return }
+        updateClockOffsetEstimate(usingDirectorUnixMilliseconds: packet.directorUnixMilliseconds)
+        timeSyncHandler?(packet)
+    }
+
+    private func parseTimeSyncPacket(_ payload: [String: Any]) -> DirectorTimeSyncPacket? {
+        guard let unixMS = int64Value(payload["unix_ms"]) else { return nil }
+        let sequence = int64Value(payload["seq"])
+        let source = (payload["source"] as? String) ?? "director"
+
+        var parsedTimecode: TentacleTimecode?
+        if let fps = intValue(payload["fps"]),
+           let hours = intValue(payload["hours"]),
+           let minutes = intValue(payload["minutes"]),
+           let seconds = intValue(payload["seconds"]),
+           let frames = intValue(payload["frames"]) {
+            parsedTimecode = TentacleTimecode(fps: fps,
+                                              hours: hours,
+                                              minutes: minutes,
+                                              seconds: seconds,
+                                              frames: frames)
+        } else {
+            parsedTimecode = synthesizedTimecodeFromUnixMilliseconds(unixMS)
+        }
+
+        return DirectorTimeSyncPacket(directorUnixMilliseconds: unixMS,
+                                      sequence: sequence,
+                                      source: source,
+                                      timecode: parsedTimecode)
+    }
+
+    private func synthesizedTimecodeFromUnixMilliseconds(_ unixMS: Int64) -> TentacleTimecode? {
+        let defaultFPS = 30
+        let date = Date(timeIntervalSince1970: Double(unixMS) / 1000.0)
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
+        let components = calendar.dateComponents([.hour, .minute, .second, .nanosecond], from: date)
+        guard let hours = components.hour,
+              let minutes = components.minute,
+              let seconds = components.second else {
+            return nil
+        }
+
+        let nanoseconds = components.nanosecond ?? 0
+        let frame = min(max(Int((Double(nanoseconds) / 1_000_000_000.0) * Double(defaultFPS)), 0), defaultFPS - 1)
+        return TentacleTimecode(fps: defaultFPS,
+                                hours: hours,
+                                minutes: minutes,
+                                seconds: seconds,
+                                frames: frame)
+    }
+
+    private func updateClockOffsetEstimate(usingDirectorUnixMilliseconds directorUnixMS: Int64) {
+        let localUnixMS = Self.unixNowMS()
+        let sampleOffsetMS = Double(directorUnixMS - localUnixMS)
+        clockOffsetSamplesMS.append(sampleOffsetMS)
+
+        if clockOffsetSamplesMS.count > Self.maxClockOffsetSamples {
+            let overflow = clockOffsetSamplesMS.count - Self.maxClockOffsetSamples
+            clockOffsetSamplesMS.removeFirst(overflow)
+        }
+        estimatedClockOffsetMS = median(clockOffsetSamplesMS)
+    }
+
+    private func parseCommandEnvelope(commandName: String,
+                                      payload: [String: Any],
+                                      requestID: String) -> RemoteDirectorCommandEnvelope? {
+        let command: RemoteDirectorCommand
+        switch commandName {
+        case "arm":
+            command = .arm
+        case "prepare_start":
+            guard let sessionID = payload["session_id"] as? String,
+                  let startAtUnixMS = int64Value(payload["start_at_unix_ms"]) else { return nil }
+            command = .prepareStart(sessionID: sessionID, startAtUnixMS: startAtUnixMS)
+        case "commit_start":
+            guard let sessionID = payload["session_id"] as? String,
+                  let startAtUnixMS = int64Value(payload["start_at_unix_ms"]) else { return nil }
+            command = .commitStart(sessionID: sessionID, startAtUnixMS: startAtUnixMS)
+        case "prepare_stop":
+            let sessionID = payload["session_id"] as? String ?? "unknown-session"
+            guard let stopAtUnixMS = int64Value(payload["stop_at_unix_ms"]) else { return nil }
+            command = .prepareStop(sessionID: sessionID, stopAtUnixMS: stopAtUnixMS)
+        case "pull_videos":
+            let jobID = (payload["job_id"] as? String).flatMap {
+                let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            } ?? UUID().uuidString
+            let policy = (payload["policy"] as? String) ?? "new_only"
+            let maxFiles = max(0, intValue(payload["max_files"]) ?? 0)
+            let uploadURL = payload["upload_url"] as? String
+            command = .pullVideos(jobID: jobID,
+                                  policy: policy,
+                                  maxFiles: maxFiles,
+                                  uploadURL: uploadURL)
+        default:
+            return nil
+        }
+
+        return RemoteDirectorCommandEnvelope(requestID: requestID, command: command)
+    }
+
+    private func sendAck(requestID: String, reply: RemoteDirectorCommandReply) async {
+        await sendJSONObject([
+            "type": "ack",
+            "device_id": deviceID,
+            "request_id": requestID,
+            "ok": reply.ok,
+            "detail": reply.detail
+        ])
+    }
+
+    private func sendJSONObject(_ object: [String: Any]) async {
+        guard let webSocketTask else { return }
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object),
+              let text = String(data: data, encoding: .utf8) else {
+            logger.error("Unable to encode remote director payload.")
+            return
+        }
+
+        do {
+            try await webSocketTask.send(.string(text))
+        } catch {
+            logger.error("Unable to send remote director payload: \(error.localizedDescription, privacy: .public)")
+            handleDisconnectAndReconnect()
+        }
+    }
+
+    private func directorURL() -> URL? {
+        // Disable remote control in extensions; run only in the app.
+        guard Bundle.main.bundleURL.pathExtension != "appex" else { return nil }
+
+        if let defaultsURL = UserDefaults.standard.string(forKey: RemoteDirectorConfiguration.directorWebSocketURLDefaultsKey),
+           !defaultsURL.isEmpty,
+           let url = URL(string: defaultsURL) {
+            return url
+        }
+
+        if let environmentURL = ProcessInfo.processInfo.environment["DIRECTOR_WS_URL"],
+           !environmentURL.isEmpty,
+           let url = URL(string: environmentURL) {
+            return url
+        }
+
+        if let infoURL = Bundle.main.object(forInfoDictionaryKey: RemoteDirectorConfiguration.directorWebSocketURLInfoKey) as? String,
+           !infoURL.isEmpty,
+           let url = URL(string: infoURL) {
+            return url
+        }
+
+        return nil
+    }
+
+    private static func loadOrCreateDeviceID() -> String {
+        if let existing = UserDefaults.standard.string(forKey: deviceIDDefaultsKey), !existing.isEmpty {
+            return existing
+        }
+        let generated = UUID().uuidString
+        UserDefaults.standard.set(generated, forKey: deviceIDDefaultsKey)
+        return generated
+    }
+
+    private static func unixNowMS() -> Int64 {
+        Int64((Date().timeIntervalSince1970 * 1000).rounded())
+    }
+
+    private func int64Value(_ value: Any?) -> Int64? {
+        if let value = value as? Int64 {
+            return value
+        }
+        if let value = value as? Int {
+            return Int64(value)
+        }
+        if let value = value as? Double {
+            return Int64(value)
+        }
+        if let value = value as? NSNumber {
+            return value.int64Value
+        }
+        if let value = value as? String {
+            return Int64(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
+    }
+
+    private func intValue(_ value: Any?) -> Int? {
+        if let value = value as? Int {
+            return value
+        }
+        if let value = value as? Int64 {
+            return Int(exactly: value)
+        }
+        if let value = value as? Double {
+            return Int(value)
+        }
+        if let value = value as? NSNumber {
+            return value.intValue
+        }
+        if let value = value as? String {
+            return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
+    }
+
+    private func resolvedDeviceName() -> String {
+        let candidate = deviceNameProvider?().trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return candidate.isEmpty ? UIDevice.current.name : candidate
+    }
+
+    private func median(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        let sorted = values.sorted()
+        let mid = sorted.count / 2
+        if sorted.count.isMultiple(of: 2) {
+            return (sorted[mid - 1] + sorted[mid]) / 2
+        }
+        return sorted[mid]
+    }
+}
+
+extension UIDevice {
+    var batteryLevelNormalized: Double? {
+        let level = batteryLevel
+        guard level >= 0 else { return nil }
+        return Double(level)
+    }
+}
+
+extension FileManager {
+    var availableStorageGB: Double? {
+        do {
+            let values = try URL.homeDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+            if let bytes = values.volumeAvailableCapacityForImportantUsage {
+                return Double(bytes) / 1_000_000_000.0
+            }
+        } catch {
+            return nil
+        }
+        return nil
+    }
+}

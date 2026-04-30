@@ -8,6 +8,7 @@ An object that manages a capture session and its inputs and outputs.
 import Foundation
 @preconcurrency import AVFoundation
 import Combine
+import simd
 
 /// An actor that manages the capture pipeline, which includes the capture session, device inputs, and capture outputs.
 /// The app defines it as an `actor` type to ensure that all camera operations happen off of the `@MainActor`.
@@ -35,6 +36,10 @@ actor CaptureService {
     
     // An object that manages the app's video capture behavior.
     private let movieCapture = MovieCapture()
+    // A lightweight video-data output used to read camera intrinsics from sample-buffer metadata.
+    private let calibrationVideoDataOutput = AVCaptureVideoDataOutput()
+    private let calibrationVideoDataDelegate = CalibrationVideoDataDelegate()
+    private let calibrationVideoDataOutputQueue = DispatchQueue(label: "com.example.apple-samplecode.AVCam.calibrationVideoDataOutputQueue")
     
     // An internal collection of active output services for this video-only build.
     private var outputServices: [any OutputService] { [movieCapture] }
@@ -75,6 +80,9 @@ actor CaptureService {
 
     // The most recently applied manual control state.
     private var manualControlState = ManualCameraControlState.default
+    // The most recent camera intrinsic matrix observed from video sample-buffer attachments.
+    private var latestCameraIntrinsics: [Double]?
+    private var latestCameraIntrinsicsTimestamp: Date?
     
     // A serial dispatch queue to use for capture control actions.
     private let sessionQueue = DispatchSerialQueue(label: "com.example.apple-samplecode.AVCam.sessionQueue")
@@ -87,6 +95,13 @@ actor CaptureService {
     init() {
         // Create a source object to connect the preview view with the capture session.
         previewSource = DefaultPreviewSource(session: captureSession)
+
+        calibrationVideoDataDelegate.onSampleBuffer = { [weak self] sampleBuffer in
+            guard let self else { return }
+            Task {
+                await self.handleCalibrationVideoSampleBuffer(sampleBuffer)
+            }
+        }
     }
     
     // MARK: - Authorization
@@ -159,6 +174,13 @@ actor CaptureService {
             captureSession.sessionPreset = .high
             // Add the movie output as the default output type.
             try addOutput(movieCapture.output)
+            if captureSession.canAddOutput(calibrationVideoDataOutput) {
+                captureSession.addOutput(calibrationVideoDataOutput)
+            } else {
+                logger.error("Unable to add calibration video-data output; sample-buffer intrinsics won't be available.")
+            }
+            configureCalibrationVideoDataOutput()
+            configureCameraIntrinsicsDelivery()
             setHDRVideoEnabled(isHDRVideoEnabled)
             
             // Configure controls to use with the Camera Control.
@@ -540,6 +562,15 @@ actor CaptureService {
         if !captureSession.outputs.contains(where: { $0 === movieCapture.output }) {
             try addOutput(movieCapture.output)
         }
+        if !captureSession.outputs.contains(where: { $0 === calibrationVideoDataOutput }) {
+            if captureSession.canAddOutput(calibrationVideoDataOutput) {
+                captureSession.addOutput(calibrationVideoDataOutput)
+            } else {
+                logger.error("Unable to add calibration video-data output during mode reconfiguration.")
+            }
+        }
+        configureCalibrationVideoDataOutput()
+        configureCameraIntrinsicsDelivery()
         if isHDRVideoEnabled {
             setHDRVideoEnabled(true)
         }
@@ -597,6 +628,8 @@ actor CaptureService {
             createRotationCoordinator(for: device)
             // Register for device observations.
             observeSubjectAreaChanges(of: device)
+            configureCalibrationVideoDataOutput()
+            configureCameraIntrinsicsDelivery()
             // Update the service's advertised capabilities.
             updateCaptureCapabilities()
         } catch {
@@ -667,6 +700,7 @@ actor CaptureService {
     private func updateCaptureRotation(_ angle: CGFloat) {
         // Update the orientation for all output services.
         outputServices.forEach { $0.setVideoRotationAngle(angle) }
+        calibrationVideoDataOutput.connection(with: .video)?.videoRotationAngle = angle
     }
     
     private var videoPreviewLayer: AVCaptureVideoPreviewLayer {
@@ -849,6 +883,9 @@ actor CaptureService {
         payload["captureState"] = captureStatePayload
 
         if let connection = movieCapture.output.connection(with: .video) {
+            if connection.isCameraIntrinsicMatrixDeliverySupported {
+                connection.isCameraIntrinsicMatrixDeliveryEnabled = true
+            }
             var connectionPayload: [String: Any] = [
                 "isEnabled": connection.isEnabled,
                 "isActive": connection.isActive,
@@ -864,6 +901,37 @@ actor CaptureService {
             payload["videoConnection"] = connectionPayload
         }
 
+        if let connection = calibrationVideoDataOutput.connection(with: .video) {
+            var connectionPayload: [String: Any] = [
+                "isEnabled": connection.isEnabled,
+                "isActive": connection.isActive,
+                "isCameraIntrinsicMatrixDeliverySupported": connection.isCameraIntrinsicMatrixDeliverySupported,
+                "isCameraIntrinsicMatrixDeliveryEnabled": connection.isCameraIntrinsicMatrixDeliveryEnabled
+            ]
+            if connection.videoRotationAngle.isFinite {
+                connectionPayload["videoRotationAngleDegrees"] = connection.videoRotationAngle
+            }
+            payload["videoDataConnection"] = connectionPayload
+        }
+
+        if let intrinsics = latestCameraIntrinsics {
+            payload["cameraIntrinsicsFromSampleBuffer"] = [
+                "source": "sampleBufferAttachment",
+                "timestamp": Self.calibrationTimestampFormatter.string(from: latestCameraIntrinsicsTimestamp ?? Date()),
+                "matrix3x3RowMajor": [
+                    [intrinsics[0], intrinsics[1], intrinsics[2]],
+                    [intrinsics[3], intrinsics[4], intrinsics[5]],
+                    [intrinsics[6], intrinsics[7], intrinsics[8]]
+                ],
+                "matrix3x3FlatRowMajor": intrinsics
+            ]
+        } else {
+            payload["cameraIntrinsicsFromSampleBuffer"] = [
+                "available": false,
+                "reason": "no_intrinsics_sample_buffer_attachment_seen"
+            ]
+        }
+
         if let extensions = CMFormatDescriptionGetExtensions(formatDescription),
            let sanitizedExtensions = jsonSafeValue(from: extensions) {
             payload["formatDescriptionExtensions"] = sanitizedExtensions
@@ -871,7 +939,113 @@ actor CaptureService {
 
         return serializedCalibrationPayload(payload)
     }
-    
+
+    private func configureCameraIntrinsicsDelivery() {
+        guard let connection = movieCapture.output.connection(with: .video) else {
+            return
+        }
+        guard connection.isCameraIntrinsicMatrixDeliverySupported else {
+            return
+        }
+        connection.isCameraIntrinsicMatrixDeliveryEnabled = true
+    }
+
+    private func configureCalibrationVideoDataOutput() {
+        calibrationVideoDataOutput.alwaysDiscardsLateVideoFrames = true
+        calibrationVideoDataOutput.setSampleBufferDelegate(calibrationVideoDataDelegate,
+                                                           queue: calibrationVideoDataOutputQueue)
+
+        guard let connection = calibrationVideoDataOutput.connection(with: .video) else {
+            return
+        }
+        if connection.isCameraIntrinsicMatrixDeliverySupported {
+            connection.isCameraIntrinsicMatrixDeliveryEnabled = true
+        }
+    }
+
+    private func handleCalibrationVideoSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        guard let attachment = CMGetAttachment(sampleBuffer,
+                                               key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix,
+                                               attachmentModeOut: nil) else {
+            return
+        }
+        guard let intrinsics = decodeIntrinsicMatrix(attachment) else {
+            return
+        }
+        latestCameraIntrinsics = intrinsics
+        latestCameraIntrinsicsTimestamp = Date()
+    }
+
+    private func decodeIntrinsicMatrix(_ attachment: CFTypeRef) -> [Double]? {
+        if CFGetTypeID(attachment) == CFDataGetTypeID() {
+            let data = attachment as! CFData as Data
+            return decodeIntrinsicMatrixData(data)
+        }
+        if let data = attachment as? Data {
+            return decodeIntrinsicMatrixData(data)
+        }
+        if let values = attachment as? [NSNumber], values.count == 9 {
+            return values.map(\.doubleValue)
+        }
+        if let values = attachment as? [Double], values.count == 9 {
+            return values
+        }
+        if let values = attachment as? [Float], values.count == 9 {
+            return values.map(Double.init)
+        }
+        return nil
+    }
+
+    private func decodeIntrinsicMatrixData(_ data: Data) -> [Double]? {
+        // CoreMedia commonly stores this as matrix_float3x3 (48 bytes due SIMD padding).
+        if data.count == MemoryLayout<matrix_float3x3>.size {
+            var matrix = matrix_float3x3()
+            withUnsafeMutableBytes(of: &matrix) { destination in
+                data.copyBytes(to: destination)
+            }
+            let c0 = matrix.columns.0
+            let c1 = matrix.columns.1
+            let c2 = matrix.columns.2
+            // Export row-major for JSON readability/consistency.
+            return [
+                Double(c0.x), Double(c1.x), Double(c2.x),
+                Double(c0.y), Double(c1.y), Double(c2.y),
+                Double(c0.z), Double(c1.z), Double(c2.z)
+            ]
+        }
+
+        if data.count == 9 * MemoryLayout<Float>.size {
+            return data.withUnsafeBytes { rawBuffer in
+                let values = rawBuffer.bindMemory(to: Float.self)
+                guard values.count >= 9 else { return nil }
+                return Array(values.prefix(9)).map(Double.init)
+            }
+        }
+        // Some producers serialize 3x4 padded float columns (12 floats total).
+        if data.count == 12 * MemoryLayout<Float>.size {
+            return data.withUnsafeBytes { rawBuffer in
+                let values = rawBuffer.bindMemory(to: Float.self)
+                guard values.count >= 12 else { return nil }
+                let c0 = SIMD3<Float>(values[0], values[1], values[2])
+                let c1 = SIMD3<Float>(values[4], values[5], values[6])
+                let c2 = SIMD3<Float>(values[8], values[9], values[10])
+                return [
+                    Double(c0.x), Double(c1.x), Double(c2.x),
+                    Double(c0.y), Double(c1.y), Double(c2.y),
+                    Double(c0.z), Double(c1.z), Double(c2.z)
+                ]
+            }
+        }
+        if data.count == 9 * MemoryLayout<Double>.size {
+            return data.withUnsafeBytes { rawBuffer in
+                let values = rawBuffer.bindMemory(to: Double.self)
+                guard values.count >= 9 else { return nil }
+                return Array(values.prefix(9))
+            }
+        }
+        return nil
+    }
+
     /// Sets whether the app captures HDR video.
     func setHDRVideoEnabled(_ isEnabled: Bool) {
         // Bracket the following configuration in a begin/commit configuration pair.
@@ -971,5 +1145,15 @@ class CaptureControlsDelegate: NSObject, AVCaptureSessionControlsDelegate {
     
     func sessionControlsDidBecomeInactive(_ session: AVCaptureSession) {
         logger.debug("Capture controls inactive.")
+    }
+}
+
+private final class CalibrationVideoDataDelegate: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+    var onSampleBuffer: ((CMSampleBuffer) -> Void)?
+
+    func captureOutput(_ output: AVCaptureOutput,
+                       didOutput sampleBuffer: CMSampleBuffer,
+                       from connection: AVCaptureConnection) {
+        onSampleBuffer?(sampleBuffer)
     }
 }

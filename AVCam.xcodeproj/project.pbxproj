@@ -20,6 +20,12 @@
 		C47C99C32CA1C6BB00B5338B /* AVCamCaptureExtension.appex in Embed ExtensionKit Extensions */ = {isa = PBXBuildFile; fileRef = C47C99BA2CA1C6BB00B5338B /* AVCamCaptureExtension.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		C48091852BD584AD00753C4A /* CameraModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C48091832BD584AD00753C4A /* CameraModel.swift */; };
 		C480918B2BD59D7D00753C4A /* SPCObserver.swift in Sources */ = {isa = PBXBuildFile; fileRef = C48091892BD59D7D00753C4A /* SPCObserver.swift */; };
+		C5A1F1112D9A000100AA1001 /* CameraModel+RemoteDirector.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5A1F1012D9A000100AA1001 /* CameraModel+RemoteDirector.swift */; };
+		C5A1F1122D9A000100AA1001 /* CameraModel+TimecodeServices.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5A1F1022D9A000100AA1001 /* CameraModel+TimecodeServices.swift */; };
+		C5A1F1132D9A000100AA1001 /* LocalVideoStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5A1F1032D9A000100AA1001 /* LocalVideoStore.swift */; };
+		C5A1F1212D9A000100AA1001 /* CameraModel+RemoteDirector.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5A1F1012D9A000100AA1001 /* CameraModel+RemoteDirector.swift */; };
+		C5A1F1222D9A000100AA1001 /* CameraModel+TimecodeServices.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5A1F1022D9A000100AA1001 /* CameraModel+TimecodeServices.swift */; };
+		C5A1F1232D9A000100AA1001 /* LocalVideoStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C5A1F1032D9A000100AA1001 /* LocalVideoStore.swift */; };
 		C4A349DF28BD4B700056FAAF /* SwitchCameraButton.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4A349DE28BD4B700056FAAF /* SwitchCameraButton.swift */; };
 		C4A73C9E2CC015E300C2FA84 /* DataTypes.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4DFD84328C3E173005B74F0 /* DataTypes.swift */; };
 		C4A73CA02CC0748800C2FA84 /* CameraState.swift in Sources */ = {isa = PBXBuildFile; fileRef = C4A73C9F2CC0748800C2FA84 /* CameraState.swift */; };
@@ -133,6 +139,9 @@
 		C47C99BA2CA1C6BB00B5338B /* AVCamCaptureExtension.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.extensionkit-extension"; includeInIndex = 0; path = AVCamCaptureExtension.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		C48091832BD584AD00753C4A /* CameraModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraModel.swift; sourceTree = "<group>"; };
 		C48091892BD59D7D00753C4A /* SPCObserver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SPCObserver.swift; sourceTree = "<group>"; };
+		C5A1F1012D9A000100AA1001 /* CameraModel+RemoteDirector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CameraModel+RemoteDirector.swift"; sourceTree = "<group>"; };
+		C5A1F1022D9A000100AA1001 /* CameraModel+TimecodeServices.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "CameraModel+TimecodeServices.swift"; sourceTree = "<group>"; };
+		C5A1F1032D9A000100AA1001 /* LocalVideoStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LocalVideoStore.swift; sourceTree = "<group>"; };
 		C4A349DE28BD4B700056FAAF /* SwitchCameraButton.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SwitchCameraButton.swift; sourceTree = "<group>"; };
 		C4A73C9F2CC0748800C2FA84 /* CameraState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CameraState.swift; sourceTree = "<group>"; };
 		C4C686222892E33E0038EDE1 /* RecordingTimeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecordingTimeView.swift; sourceTree = "<group>"; };
@@ -354,6 +363,9 @@
 			children = (
 				C4F82C9C285ADDA2005D427A /* AVCamApp.swift */,
 				C48091832BD584AD00753C4A /* CameraModel.swift */,
+				C5A1F1012D9A000100AA1001 /* CameraModel+RemoteDirector.swift */,
+				C5A1F1022D9A000100AA1001 /* CameraModel+TimecodeServices.swift */,
+				C5A1F1032D9A000100AA1001 /* LocalVideoStore.swift */,
 				C4F82CCB285AE206005D427A /* CaptureService.swift */,
 				C4E15AAE2898620E00827683 /* CameraView.swift */,
 				C47390512BC3464500EC7B9D /* Capture */,
@@ -540,6 +552,9 @@
 				C4C553292CA1D5A3005D940C /* CaptureExtensions.swift in Sources */,
 				C4C5532A2CA1D5A3005D940C /* DeviceLookup.swift in Sources */,
 				C4C5532B2CA1D5A3005D940C /* CameraModel.swift in Sources */,
+				C5A1F1212D9A000100AA1001 /* CameraModel+RemoteDirector.swift in Sources */,
+				C5A1F1222D9A000100AA1001 /* CameraModel+TimecodeServices.swift in Sources */,
+				C5A1F1232D9A000100AA1001 /* LocalVideoStore.swift in Sources */,
 				C4C5532C2CA1D5A3005D940C /* ThumbnailButton.swift in Sources */,
 				C4C5532D2CA1D5A3005D940C /* SwitchCameraButton.swift in Sources */,
 				C4C5532E2CA1D5A3005D940C /* MediaLibrary.swift in Sources */,
@@ -570,6 +585,9 @@
 				C44DC7BE289AC3DD0099BB87 /* PreviewContainer.swift in Sources */,
 				C4DCF51428947AFA00805EE2 /* PreviewCameraModel.swift in Sources */,
 				C48091852BD584AD00753C4A /* CameraModel.swift in Sources */,
+				C5A1F1112D9A000100AA1001 /* CameraModel+RemoteDirector.swift in Sources */,
+				C5A1F1122D9A000100AA1001 /* CameraModel+TimecodeServices.swift in Sources */,
+				C5A1F1132D9A000100AA1001 /* LocalVideoStore.swift in Sources */,
 				C4F82CCE285AE233005D427A /* CameraPreview.swift in Sources */,
 				C4F82CCA285AE13B005D427A /* Camera.swift in Sources */,
 				C4E15AB12898660900827683 /* PhotoCapture.swift in Sources */,
