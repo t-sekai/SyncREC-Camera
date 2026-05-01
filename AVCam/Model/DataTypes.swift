@@ -604,6 +604,36 @@ struct Movie: Sendable {
     let url: URL
 }
 
+struct RemotePreviewPhotoCapture: Sendable {
+    let jpegData: Data
+    let metadataJSONData: Data
+    let imageWidth: Int
+    let imageHeight: Int
+    let captureTimestampUnixMilliseconds: Int64
+}
+
+struct RemotePreviewPhotoImageMetadata: Codable, Sendable, Equatable {
+    var width: Int
+    var height: Int
+    var byteCount: Int
+    var longEdgeLimit: Int
+    var jpegQuality: Double
+}
+
+struct RemotePreviewPhotoMetadata: Codable, Sendable, Equatable {
+    var schemaVersion: Int = 1
+    var requestID: String
+    var deviceID: String
+    var deviceName: String
+    var captureTimestampUnixMilliseconds: Int64
+    var captureTimestamp: String
+    var captureSource: String
+    var image: RemotePreviewPhotoImageMetadata
+    var videoRotationAngleDegrees: Double?
+    var activeManualLockProfileID: String?
+    var actualCameraSnapshot: ManualCameraActualSnapshot
+}
+
 struct PhotoFeatures {
     let isLivePhotoEnabled: Bool
     let qualityPrioritization: QualityPrioritization

@@ -29,6 +29,13 @@ class DeviceState:
     last_camera_params_status: str = ""
     last_camera_params_report: dict[str, Any] | None = None
     pending_camera_param_requests: dict[str, str] = field(default_factory=dict)
+    preview_state: str = ""
+    preview_detail: str = ""
+    preview_request_id: str = ""
+    preview_batch_id: str = ""
+    preview_image_path: str = ""
+    preview_metadata_path: str = ""
+    preview_updated_unix: float | None = None
 
     @property
     def endpoint(self) -> str:

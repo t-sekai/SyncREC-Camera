@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import queue
+import subprocess
+import sys
 import time
 from datetime import datetime
+from pathlib import Path
 from tkinter import BOTH, END, LEFT, RIGHT, TOP, X, Y, StringVar, Text, Tk, ttk
 from typing import Any
 
@@ -44,6 +47,7 @@ class DirectorGUI:
         self.pull_status_var = StringVar(value="Pull queue: idle")
         self.upload_endpoint_var = StringVar(value="Upload endpoint: stopped")
         self.camera_params_var = StringVar(value="Camera params: no preset")
+        self.preview_status_var = StringVar(value="Preview photos: idle")
         self._upload_url_for_clients = ""
 
         self._tentacle_anchor_monotonic: float | None = None
@@ -115,6 +119,18 @@ class DirectorGUI:
         ttk.Button(transfer_actions,
                    text="Pull Videos (Selected)",
                    command=self.pull_selected_device).pack(side=LEFT, padx=6)
+        ttk.Button(transfer_actions,
+                   text="Preview Photo Selected",
+                   command=self.preview_photo_selected).pack(side=LEFT, padx=(12, 3))
+        ttk.Button(transfer_actions,
+                   text="Preview Photos All",
+                   command=self.preview_photos_all).pack(side=LEFT, padx=3)
+        ttk.Button(transfer_actions,
+                   text="Open Preview Folder",
+                   command=self.open_preview_folder).pack(side=LEFT, padx=(12, 3))
+        ttk.Button(transfer_actions,
+                   text="Open Image",
+                   command=self.open_selected_preview_image).pack(side=LEFT, padx=3)
 
         camera_param_actions = ttk.Frame(self.root, padding=(8, 2))
         camera_param_actions.pack(side=TOP, fill=X)
@@ -142,6 +158,8 @@ class DirectorGUI:
             "timecode",
             "camera_params",
             "transfer",
+            "preview",
+            "preview_path",
             "last_seen",
             "pending",
         )
@@ -162,6 +180,8 @@ class DirectorGUI:
             "timecode": 120,
             "camera_params": 180,
             "transfer": 180,
+            "preview": 170,
+            "preview_path": 260,
             "last_seen": 90,
             "pending": 210,
         }
@@ -185,6 +205,8 @@ class DirectorGUI:
         self.upload_endpoint_label.pack(anchor="w", pady=(0, 2))
         self.camera_params_label = ttk.Label(bottom, textvariable=self.camera_params_var)
         self.camera_params_label.pack(anchor="w", pady=(0, 6))
+        self.preview_status_label = ttk.Label(bottom, textvariable=self.preview_status_var)
+        self.preview_status_label.pack(anchor="w", pady=(0, 6))
 
         self.log_box = Text(bottom, height=12, wrap="word")
         self.log_box.pack(side=LEFT, fill=BOTH, expand=True)
@@ -212,6 +234,9 @@ class DirectorGUI:
                 self.status_label.configure(text="Server: stopped")
             elif etype == "devices_updated":
                 self._refresh_tree(payload)
+            elif etype == "preview_upload_received":
+                if isinstance(payload, dict):
+                    self.server.handle_preview_upload_received(payload)
             elif etype == "camera_params_status":
                 self.camera_params_var.set(str(payload))
             elif etype == "tentacle_state":
@@ -319,6 +344,12 @@ class DirectorGUI:
             camera_params_summary = str(d.get("camera_params_summary") or "")
             if camera_params_summary:
                 camera_params = f"{camera_params}: {camera_params_summary}" if camera_params else camera_params_summary
+            preview_state = str(d.get("preview_state") or "")
+            preview_detail = str(d.get("preview_detail") or "")
+            preview = preview_state
+            if preview_detail:
+                preview = f"{preview_state} ({preview_detail})" if preview_state else preview_detail
+            preview_path = str(d.get("preview_image_path") or "")
 
             item_id = self.tree.insert(
                 "",
@@ -336,6 +367,8 @@ class DirectorGUI:
                     timecode_text(d["timecode"], d["fps"]),
                     camera_params,
                     transfer,
+                    preview,
+                    preview_path,
                     last_seen,
                     pending,
                 ),
@@ -403,16 +436,19 @@ class DirectorGUI:
             configured_upload_host = self.upload_host_var.get().strip()
             advertised_host = configured_upload_host or discover_advertised_host(host)
             self._upload_url_for_clients = self.upload_server.upload_url_for_clients(advertised_host=advertised_host)
+            self.server.configure_preview_upload_url(self._upload_url_for_clients)
             self.upload_endpoint_var.set(f"Upload endpoint: {self._upload_url_for_clients}")
             if not configured_upload_host and advertised_host in {"127.0.0.1", "::1"}:
                 self._append_log("Upload host auto-detected as loopback. Set Upload Host to your LAN IP for iPhone access.")
         else:
             self._upload_url_for_clients = ""
+            self.server.configure_preview_upload_url("")
             self.upload_endpoint_var.set("Upload endpoint: failed to start")
 
     def stop_server(self) -> None:
         self.upload_server.stop()
         self._upload_url_for_clients = ""
+        self.server.configure_preview_upload_url("")
         self.upload_endpoint_var.set("Upload endpoint: stopped")
         self.server.stop()
 
@@ -475,6 +511,73 @@ class DirectorGUI:
                                       max_files=max_files,
                                       policy="new_only",
                                       upload_url=self._upload_url_for_clients)
+
+    def preview_photo_selected(self) -> None:
+        device_id = self._selected_device_id()
+        if not device_id:
+            self._append_log("Select one device row before requesting a preview photo.")
+            return
+        if not self.upload_server.is_running or not self._upload_url_for_clients:
+            self._append_log("Upload endpoint is not running. Start server first.")
+            return
+
+        self.server.configure_preview_upload_url(self._upload_url_for_clients)
+        self.preview_status_var.set(f"Preview photos: requesting selected device {device_id}")
+        self.server.request_preview_photo(device_id)
+
+    def preview_photos_all(self) -> None:
+        if not self.upload_server.is_running or not self._upload_url_for_clients:
+            self._append_log("Upload endpoint is not running. Start server first.")
+            return
+
+        self.server.configure_preview_upload_url(self._upload_url_for_clients)
+        self.preview_status_var.set("Preview photos: requesting all devices")
+        self.server.request_preview_photos_all()
+
+    def open_preview_folder(self) -> None:
+        self._open_path(Path("director_app/captures/preview_photos"))
+
+    def open_selected_preview_image(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            self._append_log("Select one device row before opening a preview image.")
+            return
+        values = self.tree.item(selected[0], "values")
+        columns = list(self.tree["columns"])
+        try:
+            path_index = columns.index("preview_path")
+        except ValueError:
+            self._append_log("Preview path column is unavailable.")
+            return
+        if not values or len(values) <= path_index:
+            self._append_log("No preview image path is available for the selected row.")
+            return
+        preview_path = str(values[path_index])
+        if not preview_path:
+            self._append_log("No preview image path is available for the selected row.")
+            return
+        self._open_path(Path(preview_path))
+
+    def _selected_device_id(self) -> str:
+        selected = self.tree.selection()
+        if not selected:
+            return ""
+        values = self.tree.item(selected[0], "values")
+        if not values or len(values) < 2:
+            return ""
+        return str(values[1])
+
+    def _open_path(self, path: Path) -> None:
+        try:
+            path.mkdir(parents=True, exist_ok=True) if path.suffix == "" else None
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            elif sys.platform.startswith("win"):
+                subprocess.Popen(["cmd", "/c", "start", "", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:
+            self._append_log(f"Unable to open {path}: {exc}")
 
     def copy_camera_params_selected(self) -> None:
         selected = self.tree.selection()

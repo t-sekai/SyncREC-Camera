@@ -31,6 +31,18 @@ class PullVideosRequest:
     payload: dict[str, Any]
 
 
+@dataclass
+class PreviewPhotoRequest:
+    device_id: str
+    request_id: str
+    batch_id: str
+    attempt: int
+    started_unix: float
+    image_path: str = ""
+    metadata_path: str = ""
+    timeout_task: asyncio.Task | None = None
+
+
 class DirectorServer:
     def __init__(self, event_queue: queue.Queue[tuple[str, Any]]):
         self.event_queue = event_queue
@@ -48,6 +60,13 @@ class DirectorServer:
         self._pull_queue: deque[PullVideosRequest] = deque()
         self._active_pull: PullVideosRequest | None = None
         self._ack_waiters: dict[tuple[str, str], asyncio.Future] = {}
+
+        self._preview_upload_url = ""
+        self._preview_timeout_seconds = 35.0
+        self._preview_max_retries = 1
+        self._preview_batch_size = 5
+        self._preview_requests: dict[tuple[str, str], PreviewPhotoRequest] = {}
+        self._preview_current_request_by_device: dict[str, str] = {}
 
         # Director-side anchor derived from the single Tentacle BLE reader.
         self._time_sync_sequence = 0
@@ -108,6 +127,11 @@ class DirectorServer:
         with self._lock:
             self._pull_queue.clear()
             self._active_pull = None
+            for request in self._preview_requests.values():
+                if request.timeout_task:
+                    request.timeout_task.cancel()
+            self._preview_requests.clear()
+            self._preview_current_request_by_device.clear()
 
         self.event_queue.put(("server_stopped", None))
 
@@ -251,6 +275,45 @@ class DirectorServer:
 
         asyncio.run_coroutine_threadsafe(_enqueue(), loop)
 
+    def configure_preview_upload_url(self, upload_url: str) -> None:
+        self._preview_upload_url = upload_url.strip()
+
+    def request_preview_photo(self, device_id: str) -> None:
+        loop = self._loop
+        if not loop:
+            self.log("Server not running.")
+            return
+        if not self._preview_upload_url:
+            self.log("Preview photo request failed; upload endpoint is not configured.")
+            return
+
+        batch_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        asyncio.run_coroutine_threadsafe(
+            self._request_preview_photo(device_id=device_id, batch_id=batch_id, attempt=1),
+            loop,
+        )
+
+    def request_preview_photos_all(self) -> None:
+        loop = self._loop
+        if not loop:
+            self.log("Server not running.")
+            return
+        if not self._preview_upload_url:
+            self.log("Preview photo request failed; upload endpoint is not configured.")
+            return
+
+        batch_id = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        asyncio.run_coroutine_threadsafe(
+            self._request_preview_photos_all(batch_id=batch_id),
+            loop,
+        )
+
+    def handle_preview_upload_received(self, payload: dict[str, Any]) -> None:
+        loop = self._loop
+        if not loop:
+            return
+        asyncio.run_coroutine_threadsafe(self._handle_preview_upload_received(payload), loop)
+
     def pull_status(self) -> dict[str, Any]:
         with self._lock:
             active = self._active_pull
@@ -283,6 +346,13 @@ class DirectorServer:
                     "camera_params_summary": d.last_camera_params_summary,
                     "camera_params_status": d.last_camera_params_status,
                     "camera_params_report": d.last_camera_params_report,
+                    "preview_state": d.preview_state,
+                    "preview_detail": d.preview_detail,
+                    "preview_request_id": d.preview_request_id,
+                    "preview_batch_id": d.preview_batch_id,
+                    "preview_image_path": d.preview_image_path,
+                    "preview_metadata_path": d.preview_metadata_path,
+                    "preview_updated_unix": d.preview_updated_unix,
                 }
                 for d in self.devices.values()
             ]
@@ -320,6 +390,11 @@ class DirectorServer:
             self.devices.clear()
             self._pull_queue.clear()
             self._active_pull = None
+            for request in self._preview_requests.values():
+                if request.timeout_task:
+                    request.timeout_task.cancel()
+            self._preview_requests.clear()
+            self._preview_current_request_by_device.clear()
         for ws in websockets_to_close:
             try:
                 await ws.close(code=1001, reason="Director shutdown")
@@ -462,6 +537,7 @@ class DirectorServer:
             if disconnected:
                 await self._release_active_pull_if_device(disconnected.device_id,
                                                           reason="device disconnected")
+                self._mark_preview_disconnected(disconnected.device_id)
                 self.log(f"Client disconnected: {disconnected.name} ({disconnected.device_id})")
             self.event_queue.put(("devices_updated", self.snapshot_devices()))
 
@@ -564,6 +640,17 @@ class DirectorServer:
                 await self._release_active_pull_if_device(device.device_id,
                                                           reason=f"transfer {state}")
 
+        elif mtype == "preview_photo":
+            request_id = str(msg.get("request_id") or "")
+            state = str(msg.get("state") or "")
+            detail = str(msg.get("detail") or "")
+            failure_reason = str(msg.get("failure_reason") or "")
+            await self._handle_preview_status_message(device=device,
+                                                      request_id=request_id,
+                                                      state=state,
+                                                      detail=detail,
+                                                      failure_reason=failure_reason)
+
         else:
             self.log(f"Unhandled message type '{mtype}' from {device.name}")
 
@@ -624,9 +711,10 @@ class DirectorServer:
                                      device: DeviceState,
                                      command: str,
                                      payload: dict[str, Any] | None = None,
-                                     timeout: float = 15.0) -> dict[str, Any]:
+                                     timeout: float = 15.0,
+                                     request_id: str | None = None) -> dict[str, Any]:
         payload = payload or {}
-        request_id = str(uuid.uuid4())
+        request_id = request_id or str(uuid.uuid4())
         future: asyncio.Future = asyncio.get_running_loop().create_future()
         self._ack_waiters[(device.device_id, request_id)] = future
         device.pending_acks[request_id] = command
@@ -655,6 +743,290 @@ class DirectorServer:
             device.pending_acks.pop(request_id, None)
             device.pending_camera_param_requests.pop(request_id, None)
             raise
+
+    async def _request_preview_photos_all(self, batch_id: str) -> None:
+        with self._lock:
+            devices = list(self.devices.values())
+        if not devices:
+            self.log("No devices connected for preview photo request.")
+            return
+
+        self.log(f"Requesting preview photos from {len(devices)} device(s), batch={batch_id}.")
+        for index in range(0, len(devices), self._preview_batch_size):
+            batch = devices[index:index + self._preview_batch_size]
+            await asyncio.gather(
+                *(self._request_preview_photo(device.device_id, batch_id=batch_id, attempt=1) for device in batch),
+                return_exceptions=True,
+            )
+            if index + self._preview_batch_size < len(devices):
+                await asyncio.sleep(0.4)
+
+    async def _request_preview_photo(self, device_id: str, batch_id: str, attempt: int) -> None:
+        with self._lock:
+            device = next((d for d in self.devices.values() if d.device_id == device_id), None)
+        if not device:
+            self.log(f"Preview photo request failed; device not connected: {device_id}")
+            return
+
+        request_id = str(uuid.uuid4())
+        request = PreviewPhotoRequest(device_id=device_id,
+                                      request_id=request_id,
+                                      batch_id=batch_id,
+                                      attempt=attempt,
+                                      started_unix=time.time())
+        self._store_preview_request(request, state="requested", detail=f"Attempt {attempt}.")
+
+        payload = {
+            "batch_id": batch_id,
+            "upload_url": self._preview_upload_url,
+            "long_edge": 1600,
+            "jpeg_quality": 0.8,
+            "upload_jitter_seconds": 3.0,
+            "attempt": attempt,
+        }
+
+        try:
+            ack = await self._send_command_wait_ack(device,
+                                                    "capture_preview_photo",
+                                                    payload=payload,
+                                                    timeout=8.0,
+                                                    request_id=request_id)
+        except Exception as exc:
+            await self._retry_or_fail_preview_request(request,
+                                                      status="timeout",
+                                                      detail=f"Preview command ACK timed out/failed: {exc}",
+                                                      retryable=True)
+            return
+
+        if not bool(ack.get("ok")):
+            payload_status = ""
+            ack_payload = ack.get("payload")
+            if isinstance(ack_payload, dict):
+                payload_status = str(ack_payload.get("status") or "")
+            status = payload_status if payload_status else "capture_failed"
+            await self._finish_preview_request(request,
+                                               status=status,
+                                               detail=str(ack.get("detail") or "Preview capture was rejected."),
+                                               retryable=False)
+            return
+
+        self._update_preview_device(device_id=device_id,
+                                    request_id=request_id,
+                                    batch_id=batch_id,
+                                    state="accepted",
+                                    detail="Capture accepted; waiting for upload.")
+        timeout_task = asyncio.create_task(self._preview_timeout_after(device_id=device_id,
+                                                                       request_id=request_id))
+        with self._lock:
+            current = self._preview_requests.get((device_id, request_id))
+            if current:
+                current.timeout_task = timeout_task
+
+    def _store_preview_request(self,
+                               request: PreviewPhotoRequest,
+                               state: str,
+                               detail: str) -> None:
+        with self._lock:
+            previous_request_id = self._preview_current_request_by_device.get(request.device_id)
+            if previous_request_id:
+                previous = self._preview_requests.pop((request.device_id, previous_request_id), None)
+                if previous and previous.timeout_task:
+                    previous.timeout_task.cancel()
+            self._preview_requests[(request.device_id, request.request_id)] = request
+            self._preview_current_request_by_device[request.device_id] = request.request_id
+        self._update_preview_device(device_id=request.device_id,
+                                    request_id=request.request_id,
+                                    batch_id=request.batch_id,
+                                    state=state,
+                                    detail=detail)
+
+    async def _handle_preview_status_message(self,
+                                             device: DeviceState,
+                                             request_id: str,
+                                             state: str,
+                                             detail: str,
+                                             failure_reason: str) -> None:
+        if not request_id:
+            return
+        normalized_state = state or "unknown"
+        with self._lock:
+            current_request_id = self._preview_current_request_by_device.get(device.device_id)
+            current_state = device.preview_state
+        if current_request_id and current_request_id != request_id:
+            return
+        if normalized_state == "done" and not current_request_id and current_state == "success":
+            return
+        if normalized_state == "failed":
+            request = self._preview_request(device.device_id, request_id)
+            retryable = failure_reason == "upload_failed"
+            await self._retry_or_fail_preview_request(
+                request or PreviewPhotoRequest(device_id=device.device_id,
+                                               request_id=request_id,
+                                               batch_id=device.preview_batch_id or "unknown-batch",
+                                               attempt=1,
+                                               started_unix=time.time()),
+                status=failure_reason or "capture_failed",
+                detail=detail or "Preview photo failed.",
+                retryable=retryable,
+            )
+            return
+
+        if normalized_state in {"capturing", "uploading", "done"}:
+            self._update_preview_device(device_id=device.device_id,
+                                        request_id=request_id,
+                                        batch_id=device.preview_batch_id,
+                                        state=normalized_state,
+                                        detail=detail)
+
+    async def _handle_preview_upload_received(self, payload: dict[str, Any]) -> None:
+        device_id = str(payload.get("device_id") or "")
+        request_id = str(payload.get("request_id") or "")
+        batch_id = str(payload.get("batch_id") or "")
+        kind = str(payload.get("kind") or "")
+        path = str(payload.get("path") or "")
+        if not device_id or not request_id or not path:
+            return
+
+        with self._lock:
+            current_request_id = self._preview_current_request_by_device.get(device_id)
+            request = self._preview_requests.get((device_id, request_id))
+            if current_request_id and current_request_id != request_id:
+                self.log(
+                    f"Ignoring late preview upload from {device_id} req={request_id}; "
+                    f"current req={current_request_id}."
+                )
+                return
+            device = next((d for d in self.devices.values() if d.device_id == device_id), None)
+            if not device:
+                self.log(f"Preview upload received for disconnected device {device_id}: {path}")
+                return
+
+            if request is None:
+                request = PreviewPhotoRequest(device_id=device_id,
+                                              request_id=request_id,
+                                              batch_id=batch_id,
+                                              attempt=1,
+                                              started_unix=time.time())
+                self._preview_requests[(device_id, request_id)] = request
+                self._preview_current_request_by_device[device_id] = request_id
+
+            if kind == "preview_photo":
+                request.image_path = path
+                device.preview_image_path = path
+            elif kind == "preview_photo_metadata":
+                request.metadata_path = path
+                device.preview_metadata_path = path
+
+            device.preview_state = "receiving"
+            device.preview_detail = "Received preview upload."
+            device.preview_request_id = request_id
+            device.preview_batch_id = request.batch_id or batch_id
+            device.preview_updated_unix = time.time()
+
+            completed = bool(request.image_path and request.metadata_path)
+            if completed:
+                if request.timeout_task:
+                    request.timeout_task.cancel()
+                device.preview_state = "success"
+                device.preview_detail = "Preview photo received."
+                self._preview_requests.pop((device_id, request_id), None)
+                if self._preview_current_request_by_device.get(device_id) == request_id:
+                    self._preview_current_request_by_device.pop(device_id, None)
+
+        self.log(f"Preview upload {kind} from {device_id} req={request_id}: {path}")
+        self.event_queue.put(("devices_updated", self.snapshot_devices()))
+
+    async def _preview_timeout_after(self, device_id: str, request_id: str) -> None:
+        await asyncio.sleep(self._preview_timeout_seconds)
+        request = self._preview_request(device_id, request_id)
+        if not request:
+            return
+        await self._retry_or_fail_preview_request(request,
+                                                  status="timeout",
+                                                  detail="Timed out waiting for preview image and metadata uploads.",
+                                                  retryable=True)
+
+    async def _retry_or_fail_preview_request(self,
+                                             request: PreviewPhotoRequest,
+                                             status: str,
+                                             detail: str,
+                                             retryable: bool) -> None:
+        if retryable and request.attempt <= self._preview_max_retries:
+            self._cleanup_preview_request(request)
+            self._update_preview_device(device_id=request.device_id,
+                                        request_id=request.request_id,
+                                        batch_id=request.batch_id,
+                                        state="retrying",
+                                        detail=f"{detail} Retrying once.")
+            self.log(
+                f"Retrying preview photo for {request.device_id} batch={request.batch_id} "
+                f"after {status}."
+            )
+            await self._request_preview_photo(device_id=request.device_id,
+                                              batch_id=request.batch_id,
+                                              attempt=request.attempt + 1)
+            return
+
+        await self._finish_preview_request(request,
+                                           status=status,
+                                           detail=detail,
+                                           retryable=False)
+
+    async def _finish_preview_request(self,
+                                      request: PreviewPhotoRequest,
+                                      status: str,
+                                      detail: str,
+                                      retryable: bool) -> None:
+        _ = retryable
+        self._cleanup_preview_request(request)
+        self._update_preview_device(device_id=request.device_id,
+                                    request_id=request.request_id,
+                                    batch_id=request.batch_id,
+                                    state=status,
+                                    detail=detail)
+        self.log(
+            f"Preview photo {status} for {request.device_id} "
+            f"req={request.request_id}: {detail}"
+        )
+
+    def _preview_request(self, device_id: str, request_id: str) -> PreviewPhotoRequest | None:
+        with self._lock:
+            return self._preview_requests.get((device_id, request_id))
+
+    def _cleanup_preview_request(self, request: PreviewPhotoRequest) -> None:
+        with self._lock:
+            current = self._preview_requests.pop((request.device_id, request.request_id), None)
+            current_task = asyncio.current_task()
+            if current and current.timeout_task and current.timeout_task is not current_task:
+                current.timeout_task.cancel()
+            if self._preview_current_request_by_device.get(request.device_id) == request.request_id:
+                self._preview_current_request_by_device.pop(request.device_id, None)
+
+    def _mark_preview_disconnected(self, device_id: str) -> None:
+        with self._lock:
+            request_id = self._preview_current_request_by_device.pop(device_id, "")
+            request = self._preview_requests.pop((device_id, request_id), None) if request_id else None
+            if request and request.timeout_task:
+                request.timeout_task.cancel()
+        if request_id:
+            self.log(f"Preview photo disconnected for {device_id} req={request_id}.")
+
+    def _update_preview_device(self,
+                               device_id: str,
+                               request_id: str,
+                               batch_id: str,
+                               state: str,
+                               detail: str) -> None:
+        with self._lock:
+            device = next((d for d in self.devices.values() if d.device_id == device_id), None)
+            if not device:
+                return
+            device.preview_state = state
+            device.preview_detail = detail
+            device.preview_request_id = request_id
+            device.preview_batch_id = batch_id
+            device.preview_updated_unix = time.time()
+        self.event_queue.put(("devices_updated", self.snapshot_devices()))
 
     async def _copy_camera_params(self, device_id: str) -> None:
         with self._lock:

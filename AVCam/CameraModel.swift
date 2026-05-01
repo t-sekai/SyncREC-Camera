@@ -163,6 +163,9 @@ final class CameraModel: Camera {
     /// Task for an active remote pull-videos upload job.
     private var remotePullVideosTask: Task<Void, Never>?
 
+    /// Task for an active remote preview-photo capture/upload job.
+    private var remotePreviewPhotoTask: Task<Void, Never>?
+
     /// Task that advances Tentacle timecode display between BLE updates.
     private var tentacleClockTask: Task<Void, Never>?
 
@@ -1377,6 +1380,16 @@ final class CameraModel: Camera {
         let uploadURLString: String?
     }
 
+    private struct RemotePreviewPhotoRequest {
+        let requestID: String
+        let batchID: String
+        let uploadURLString: String?
+        let longEdge: Int
+        let jpegQuality: Double
+        let uploadJitterSeconds: Double
+        let attempt: Int
+    }
+
     private struct RemoteTransferItem {
         let videoURL: URL
         let sidecarURL: URL?
@@ -1470,6 +1483,42 @@ final class CameraModel: Camera {
                 await self.runRemotePullVideosJob(request)
             }
             return .success("Accepted pull_videos job \(jobID).")
+
+        case .capturePreviewPhoto(let batchID, let uploadURL, let longEdge, let jpegQuality, let uploadJitterSeconds, let attempt):
+            guard status == .running else {
+                return .failure("Camera is not running.", payload: ["status": "capture_failed"])
+            }
+            guard !captureActivity.isRecording else {
+                return .failure("Refused to capture preview photo while recording.",
+                                payload: ["status": "recording_active"])
+            }
+            guard remoteDirectorClient.resolveUploadBaseURL(override: uploadURL) != nil else {
+                return .failure("Unable to resolve upload URL.", payload: ["status": "upload_failed"])
+            }
+            if let remotePreviewPhotoTask, !remotePreviewPhotoTask.isCancelled {
+                return .failure("A preview photo capture is already running.",
+                                payload: ["status": "busy"])
+            }
+
+            let request = RemotePreviewPhotoRequest(requestID: command.requestID,
+                                                    batchID: batchID,
+                                                    uploadURLString: uploadURL,
+                                                    longEdge: longEdge,
+                                                    jpegQuality: jpegQuality,
+                                                    uploadJitterSeconds: uploadJitterSeconds,
+                                                    attempt: attempt)
+            remotePreviewPhotoTask = Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.remotePreviewPhotoTask = nil }
+                await self.runRemotePreviewPhotoJob(request)
+            }
+            return .success("Accepted preview photo request.",
+                            payload: [
+                                "status": "accepted",
+                                "capture_source": "video_data_output",
+                                "batch_id": batchID,
+                                "attempt": attempt
+                            ])
 
         case .exportCameraParams:
             let payload = await exportCameraParamsPayload(requestID: command.requestID)
@@ -1640,6 +1689,171 @@ final class CameraModel: Camera {
             hash &*= 0x100000001b3
         }
         return String(format: "%016llx", hash)
+    }
+
+    private func runRemotePreviewPhotoJob(_ request: RemotePreviewPhotoRequest) async {
+        guard let uploadBaseURL = remoteDirectorClient.resolveUploadBaseURL(override: request.uploadURLString) else {
+            remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
+                                                        state: "failed",
+                                                        detail: "Unable to resolve upload URL.",
+                                                        failureReason: "upload_failed")
+            return
+        }
+
+        let jitterSeconds = min(max(request.uploadJitterSeconds, 0), 3)
+        if jitterSeconds > 0 {
+            let delay = Double.random(in: 0...jitterSeconds)
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+        guard !Task.isCancelled else { return }
+
+        remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
+                                                    state: "capturing",
+                                                    detail: "Capturing preview frame.")
+
+        let capture: RemotePreviewPhotoCapture
+        do {
+            capture = try await captureService.capturePreviewPhoto(requestID: request.requestID,
+                                                                   identity: remoteDirectorClient.manualSnapshotIdentity(),
+                                                                   longEdge: request.longEdge,
+                                                                   jpegQuality: request.jpegQuality)
+        } catch {
+            remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
+                                                        state: "failed",
+                                                        detail: error.localizedDescription,
+                                                        failureReason: "capture_failed")
+            return
+        }
+
+        remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
+                                                    state: "uploading",
+                                                    detail: "Uploading preview photo.",
+                                                    imageBytes: capture.jpegData.count,
+                                                    metadataBytes: capture.metadataJSONData.count)
+
+        do {
+            try await uploadPreviewCaptureWithRetry(capture,
+                                                    uploadBaseURL: uploadBaseURL,
+                                                    request: request)
+            remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
+                                                        state: "done",
+                                                        detail: "Preview photo uploaded.",
+                                                        imageBytes: capture.jpegData.count,
+                                                        metadataBytes: capture.metadataJSONData.count)
+        } catch {
+            remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
+                                                        state: "failed",
+                                                        detail: "Preview upload failed: \(error.localizedDescription)",
+                                                        imageBytes: capture.jpegData.count,
+                                                        metadataBytes: capture.metadataJSONData.count,
+                                                        failureReason: "upload_failed")
+        }
+    }
+
+    private func uploadPreviewCaptureWithRetry(_ capture: RemotePreviewPhotoCapture,
+                                               uploadBaseURL: URL,
+                                               request: RemotePreviewPhotoRequest) async throws {
+        var lastError: Error?
+        for attempt in 1...2 {
+            do {
+                try await uploadSinglePreviewFile(data: capture.jpegData,
+                                                  uploadBaseURL: uploadBaseURL,
+                                                  request: request,
+                                                  filename: previewFilename(extension: "jpg"),
+                                                  contentKind: "preview_photo",
+                                                  mimeType: "image/jpeg")
+                try await uploadSinglePreviewFile(data: capture.metadataJSONData,
+                                                  uploadBaseURL: uploadBaseURL,
+                                                  request: request,
+                                                  filename: previewFilename(extension: "json"),
+                                                  contentKind: "preview_photo_metadata",
+                                                  mimeType: "application/json")
+                return
+            } catch {
+                lastError = error
+                guard attempt == 1 else { break }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        throw lastError ?? NSError(domain: "RemotePreviewPhoto",
+                                   code: 2001,
+                                   userInfo: [NSLocalizedDescriptionKey: "Preview upload failed."])
+    }
+
+    private func uploadSinglePreviewFile(data: Data,
+                                         uploadBaseURL: URL,
+                                         request: RemotePreviewPhotoRequest,
+                                         filename: String,
+                                         contentKind: String,
+                                         mimeType: String) async throws {
+        guard let requestURL = previewUploadRequestURL(baseURL: uploadBaseURL,
+                                                       request: request,
+                                                       filename: filename,
+                                                       contentKind: contentKind) else {
+            throw NSError(domain: "RemotePreviewPhoto",
+                          code: 2002,
+                          userInfo: [NSLocalizedDescriptionKey: "Invalid preview upload URL components."])
+        }
+
+        var urlRequest = URLRequest(url: requestURL)
+        urlRequest.httpMethod = "POST"
+        urlRequest.timeoutInterval = 30
+        urlRequest.setValue(mimeType, forHTTPHeaderField: "Content-Type")
+        urlRequest.setValue(contentKind, forHTTPHeaderField: "X-Content-Kind")
+        urlRequest.setValue(filename, forHTTPHeaderField: "X-Original-Filename")
+        urlRequest.setValue(remoteDirectorClient.transferDeviceID(), forHTTPHeaderField: "X-Device-ID")
+        urlRequest.setValue(directorDeviceName, forHTTPHeaderField: "X-Device-Name")
+        urlRequest.setValue(request.requestID, forHTTPHeaderField: "X-Request-ID")
+        urlRequest.setValue(request.batchID, forHTTPHeaderField: "X-Preview-Batch-ID")
+        urlRequest.setValue(request.requestID, forHTTPHeaderField: "X-Transfer-Job-ID")
+
+        let (_, response) = try await URLSession.shared.upload(for: urlRequest, from: data)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw NSError(domain: "RemotePreviewPhoto",
+                          code: 2003,
+                          userInfo: [NSLocalizedDescriptionKey: "Preview upload returned a non-HTTP response."])
+        }
+        guard (200..<300).contains(httpResponse.statusCode) else {
+            throw NSError(domain: "RemotePreviewPhoto",
+                          code: 2004,
+                          userInfo: [NSLocalizedDescriptionKey: "Preview upload rejected with HTTP \(httpResponse.statusCode)."])
+        }
+    }
+
+    private func previewUploadRequestURL(baseURL: URL,
+                                         request: RemotePreviewPhotoRequest,
+                                         filename: String,
+                                         contentKind: String) -> URL? {
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
+            return nil
+        }
+        var queryItems = components.queryItems ?? []
+        queryItems.append(URLQueryItem(name: "device_id", value: remoteDirectorClient.transferDeviceID()))
+        queryItems.append(URLQueryItem(name: "device_name", value: directorDeviceName))
+        queryItems.append(URLQueryItem(name: "job_id", value: request.requestID))
+        queryItems.append(URLQueryItem(name: "request_id", value: request.requestID))
+        queryItems.append(URLQueryItem(name: "batch_id", value: request.batchID))
+        queryItems.append(URLQueryItem(name: "kind", value: contentKind))
+        queryItems.append(URLQueryItem(name: "filename", value: filename))
+        components.queryItems = queryItems
+        return components.url
+    }
+
+    private func previewFilename(extension pathExtension: String) -> String {
+        let safeBase = sanitizedTransferComponent(directorDeviceName)
+            ?? String(remoteDirectorClient.transferDeviceID().prefix(8))
+        return "\(safeBase).\(pathExtension)"
+    }
+
+    private func sanitizedTransferComponent(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
+        let scalars = trimmed.unicodeScalars.map { scalar -> Character in
+            allowed.contains(scalar) ? Character(scalar) : "_"
+        }
+        let cleaned = String(scalars).trimmingCharacters(in: CharacterSet(charactersIn: "._"))
+        return cleaned.isEmpty ? nil : String(cleaned.prefix(80))
     }
 
     private func runRemotePullVideosJob(_ request: RemotePullVideosRequest) async {

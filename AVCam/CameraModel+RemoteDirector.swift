@@ -36,6 +36,12 @@ enum RemoteDirectorCommand {
     case commitStart(sessionID: String, startAtUnixMS: Int64)
     case prepareStop(sessionID: String, stopAtUnixMS: Int64)
     case pullVideos(jobID: String, policy: String, maxFiles: Int, uploadURL: String?)
+    case capturePreviewPhoto(batchID: String,
+                             uploadURL: String?,
+                             longEdge: Int,
+                             jpegQuality: Double,
+                             uploadJitterSeconds: Double,
+                             attempt: Int)
     case exportCameraParams
     case applyCameraParams(profile: ManualLockProfile, dryRun: Bool)
     case validateCameraParams
@@ -171,6 +177,23 @@ final class RemoteDirectorClient {
         }
     }
 
+    func sendPreviewPhotoUpdate(requestID: String,
+                                state: String,
+                                detail: String? = nil,
+                                imageBytes: Int? = nil,
+                                metadataBytes: Int? = nil,
+                                failureReason: String? = nil) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.sendPreviewPhotoUpdatePayload(requestID: requestID,
+                                                     state: state,
+                                                     detail: detail,
+                                                     imageBytes: imageBytes,
+                                                     metadataBytes: metadataBytes,
+                                                     failureReason: failureReason)
+        }
+    }
+
     func transferDeviceID() -> String {
         deviceID
     }
@@ -240,6 +263,35 @@ final class RemoteDirectorClient {
         }
         if let sentBytes {
             message["sent_bytes"] = sentBytes
+        }
+
+        await sendJSONObject(message)
+    }
+
+    private func sendPreviewPhotoUpdatePayload(requestID: String,
+                                               state: String,
+                                               detail: String? = nil,
+                                               imageBytes: Int? = nil,
+                                               metadataBytes: Int? = nil,
+                                               failureReason: String? = nil) async {
+        var message: [String: Any] = [
+            "type": "preview_photo",
+            "device_id": deviceID,
+            "request_id": requestID,
+            "state": state
+        ]
+
+        if let detail, !detail.isEmpty {
+            message["detail"] = detail
+        }
+        if let imageBytes {
+            message["image_bytes"] = imageBytes
+        }
+        if let metadataBytes {
+            message["metadata_bytes"] = metadataBytes
+        }
+        if let failureReason, !failureReason.isEmpty {
+            message["failure_reason"] = failureReason
         }
 
         await sendJSONObject(message)
@@ -515,6 +567,22 @@ final class RemoteDirectorClient {
                                   policy: policy,
                                   maxFiles: maxFiles,
                                   uploadURL: uploadURL)
+        case "capture_preview_photo":
+            let batchID = (payload["batch_id"] as? String).flatMap {
+                let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                return trimmed.isEmpty ? nil : trimmed
+            } ?? "preview-\(UUID().uuidString)"
+            let uploadURL = payload["upload_url"] as? String
+            let longEdge = intValue(payload["long_edge"]) ?? 1600
+            let jpegQuality = doubleValue(payload["jpeg_quality"]) ?? 0.8
+            let uploadJitterSeconds = max(0, doubleValue(payload["upload_jitter_seconds"]) ?? 0)
+            let attempt = max(1, intValue(payload["attempt"]) ?? 1)
+            command = .capturePreviewPhoto(batchID: batchID,
+                                           uploadURL: uploadURL,
+                                           longEdge: longEdge,
+                                           jpegQuality: jpegQuality,
+                                           uploadJitterSeconds: uploadJitterSeconds,
+                                           attempt: attempt)
         case "export_camera_params":
             command = .exportCameraParams
         case "apply_camera_params":
@@ -634,6 +702,28 @@ final class RemoteDirectorClient {
         }
         if let value = value as? String {
             return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+        return nil
+    }
+
+    private func doubleValue(_ value: Any?) -> Double? {
+        if let value = value as? Double {
+            return value
+        }
+        if let value = value as? Float {
+            return Double(value)
+        }
+        if let value = value as? Int {
+            return Double(value)
+        }
+        if let value = value as? Int64 {
+            return Double(value)
+        }
+        if let value = value as? NSNumber {
+            return value.doubleValue
+        }
+        if let value = value as? String {
+            return Double(value.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         return nil
     }

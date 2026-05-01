@@ -8,7 +8,35 @@ An object that manages a capture session and its inputs and outputs.
 import Foundation
 @preconcurrency import AVFoundation
 import Combine
+import CoreImage
 import simd
+import UIKit
+
+private enum PreviewPhotoCaptureError: LocalizedError {
+    case captureServiceNotReady
+    case sessionNotRunning
+    case interrupted
+    case recordingActive
+    case noRecentVideoFrame
+    case imageEncodingFailed
+
+    var errorDescription: String? {
+        switch self {
+        case .captureServiceNotReady:
+            return "Capture service is not ready."
+        case .sessionNotRunning:
+            return "Capture session is not running."
+        case .interrupted:
+            return "Capture session is interrupted."
+        case .recordingActive:
+            return "Refused to capture preview photo while recording."
+        case .noRecentVideoFrame:
+            return "No recent video frame is available for preview capture."
+        case .imageEncodingFailed:
+            return "Unable to encode preview photo JPEG."
+        }
+    }
+}
 
 /// An actor that manages the capture pipeline, which includes the capture session, device inputs, and capture outputs.
 /// The app defines it as an `actor` type to ensure that all camera operations happen off of the `@MainActor`.
@@ -88,6 +116,10 @@ actor CaptureService {
     // The most recent camera intrinsic matrix observed from video sample-buffer attachments.
     private var latestCameraIntrinsics: [Double]?
     private var latestCameraIntrinsicsTimestamp: Date?
+    // The most recent video frame from the lightweight video-data output for remote preview checks.
+    private var latestPreviewPixelBuffer: CVPixelBuffer?
+    private var latestPreviewPixelBufferTimestamp: Date?
+    private let previewCIContext = CIContext()
     
     // A serial dispatch queue to use for capture control actions.
     private let sessionQueue = DispatchSerialQueue(label: "com.example.apple-samplecode.AVCam.sessionQueue")
@@ -1887,6 +1919,93 @@ actor CaptureService {
     func capturePhoto(with features: PhotoFeatures) async throws -> Photo {
         try await photoCapture.capturePhoto(with: features)
     }
+
+    func capturePreviewPhoto(requestID: String,
+                             identity: ManualSnapshotDeviceIdentity,
+                             longEdge: Int,
+                             jpegQuality: Double) async throws -> RemotePreviewPhotoCapture {
+        guard isSetUp else {
+            throw PreviewPhotoCaptureError.captureServiceNotReady
+        }
+        guard captureSession.isRunning else {
+            throw PreviewPhotoCaptureError.sessionNotRunning
+        }
+        guard !isInterrupted else {
+            throw PreviewPhotoCaptureError.interrupted
+        }
+        guard !captureActivity.isRecording else {
+            throw PreviewPhotoCaptureError.recordingActive
+        }
+        guard let pixelBuffer = latestPreviewPixelBuffer,
+              let pixelBufferTimestamp = latestPreviewPixelBufferTimestamp,
+              Date().timeIntervalSince(pixelBufferTimestamp) <= 2.0 else {
+            throw PreviewPhotoCaptureError.noRecentVideoFrame
+        }
+
+        let clampedLongEdge = min(max(longEdge, 1280), 1920)
+        let clampedQuality = min(max(jpegQuality, 0.75), 0.85)
+        let encoded = try encodePreviewJPEG(from: pixelBuffer,
+                                            longEdge: clampedLongEdge,
+                                            jpegQuality: clampedQuality)
+        let capturedAt = Date()
+        let actualSnapshot = exportActualCameraSnapshot(reason: "remote_capture_preview_photo",
+                                                        identity: identity)
+        let rotationAngle = calibrationVideoDataOutput.connection(with: .video)?.videoRotationAngle
+        let metadata = RemotePreviewPhotoMetadata(
+            requestID: requestID,
+            deviceID: identity.remoteDeviceID,
+            deviceName: identity.remoteDeviceName,
+            captureTimestampUnixMilliseconds: Self.unixMilliseconds(capturedAt),
+            captureTimestamp: Self.calibrationTimestampFormatter.string(from: capturedAt),
+            captureSource: "AVCaptureVideoDataOutput",
+            image: RemotePreviewPhotoImageMetadata(width: encoded.width,
+                                                   height: encoded.height,
+                                                   byteCount: encoded.data.count,
+                                                   longEdgeLimit: clampedLongEdge,
+                                                   jpegQuality: clampedQuality),
+            videoRotationAngleDegrees: rotationAngle.map(Double.init),
+            activeManualLockProfileID: activeManualLockProfile?.profileID,
+            actualCameraSnapshot: actualSnapshot
+        )
+
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        let metadataData = try encoder.encode(metadata)
+        return RemotePreviewPhotoCapture(jpegData: encoded.data,
+                                         metadataJSONData: metadataData,
+                                         imageWidth: encoded.width,
+                                         imageHeight: encoded.height,
+                                         captureTimestampUnixMilliseconds: Self.unixMilliseconds(capturedAt))
+    }
+
+    private func encodePreviewJPEG(from pixelBuffer: CVPixelBuffer,
+                                   longEdge: Int,
+                                   jpegQuality: Double) throws -> (data: Data, width: Int, height: Int) {
+        let sourceWidth = CVPixelBufferGetWidth(pixelBuffer)
+        let sourceHeight = CVPixelBufferGetHeight(pixelBuffer)
+        guard sourceWidth > 0, sourceHeight > 0 else {
+            throw PreviewPhotoCaptureError.imageEncodingFailed
+        }
+
+        let maxSourceEdge = max(sourceWidth, sourceHeight)
+        let scale = min(1.0, Double(longEdge) / Double(maxSourceEdge))
+        let outputWidth = max(1, Int((Double(sourceWidth) * scale).rounded()))
+        let outputHeight = max(1, Int((Double(sourceHeight) * scale).rounded()))
+
+        let sourceImage = CIImage(cvPixelBuffer: pixelBuffer)
+        let scaledImage = sourceImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let outputRect = CGRect(x: 0, y: 0, width: outputWidth, height: outputHeight)
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let cgImage = previewCIContext.createCGImage(scaledImage,
+                                                           from: outputRect,
+                                                           format: .RGBA8,
+                                                           colorSpace: colorSpace),
+              let data = UIImage(cgImage: cgImage).jpegData(compressionQuality: jpegQuality) else {
+            throw PreviewPhotoCaptureError.imageEncodingFailed
+        }
+
+        return (data, outputWidth, outputHeight)
+    }
     
     // MARK: - Movie capture
     /// Starts recording video. The video records until the user stops recording,
@@ -2107,6 +2226,11 @@ actor CaptureService {
     }
 
     private func handleCalibrationVideoSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+        if let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) {
+            latestPreviewPixelBuffer = pixelBuffer
+            latestPreviewPixelBufferTimestamp = Date()
+        }
+
         guard let attachment = CMGetAttachment(sampleBuffer,
                                                key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix,
                                                attachmentModeOut: nil) else {

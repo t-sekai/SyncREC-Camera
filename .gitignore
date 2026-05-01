@@ -27,3 +27,5 @@ camera_param_presets/
 camera_param_sync_reports/
 
 **/__pycache__/
+
+director_app/captures/

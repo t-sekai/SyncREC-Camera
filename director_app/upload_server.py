@@ -63,9 +63,11 @@ def _format_host_for_url(host: str) -> str:
 class UploadIngestServer:
     def __init__(self,
                  event_queue: queue.Queue[tuple[str, Any]],
-                 ingest_root: str = "ingest"):
+                 ingest_root: str = "ingest",
+                 preview_root: str = "director_app/captures/preview_photos"):
         self.event_queue = event_queue
         self.ingest_root = Path(ingest_root)
+        self.preview_root = Path(preview_root)
         self._bind_host = "0.0.0.0"
         self._port = 0
         self._server: ThreadingHTTPServer | None = None
@@ -175,6 +177,14 @@ class UploadIngestServer:
             _first_value(query, "job_id", handler.headers.get("X-Transfer-Job-ID", "")),
             fallback="unknown-job",
         )
+        request_id = _safe_component(
+            _first_value(query, "request_id", handler.headers.get("X-Request-ID", "")),
+            fallback=job_id,
+        )
+        batch_id = _safe_component(
+            _first_value(query, "batch_id", handler.headers.get("X-Preview-Batch-ID", "")),
+            fallback=datetime.utcnow().strftime("%Y%m%d_%H%M%S"),
+        )
         kind = _safe_component(
             _first_value(query, "kind", handler.headers.get("X-Content-Kind", "")),
             fallback="file",
@@ -195,10 +205,19 @@ class UploadIngestServer:
             self._write_json(handler, 411, {"ok": False, "error": "Content-Length required."})
             return
 
-        target_dir = self.ingest_root / f"{device_name}_{device_id}" / job_id / kind
-        target_dir.mkdir(parents=True, exist_ok=True)
-
-        destination = self._unique_destination(target_dir / filename)
+        is_preview_upload = kind in {"preview_photo", "preview_photo_metadata"}
+        if is_preview_upload:
+            target_dir = self.preview_root / batch_id
+            target_dir.mkdir(parents=True, exist_ok=True)
+            destination = self._preview_destination(target_dir=target_dir,
+                                                    kind=kind,
+                                                    device_id=device_id,
+                                                    device_name=device_name,
+                                                    fallback_filename=filename)
+        else:
+            target_dir = self.ingest_root / f"{device_name}_{device_id}" / job_id / kind
+            target_dir.mkdir(parents=True, exist_ok=True)
+            destination = self._unique_destination(target_dir / filename)
         temp_path = destination.with_suffix(destination.suffix + ".part")
 
         try:
@@ -233,11 +252,26 @@ class UploadIngestServer:
             self._write_json(handler, 500, {"ok": False, "error": f"Failed to store upload: {exc}"})
             return
 
-        relative_path = str(destination.relative_to(self.ingest_root))
+        relative_path = str(destination.relative_to(self.ingest_root)) if not is_preview_upload else str(destination)
         self.log(
             f"Upload received device={device_id} job={job_id} kind={kind} "
             f"bytes={content_length} file={relative_path}"
         )
+
+        if is_preview_upload:
+            self.event_queue.put((
+                "preview_upload_received",
+                {
+                    "device_id": device_id,
+                    "device_name": device_name,
+                    "request_id": request_id,
+                    "batch_id": batch_id,
+                    "kind": kind,
+                    "path": str(destination),
+                    "bytes": content_length,
+                    "received_at": datetime.utcnow().isoformat() + "Z",
+                },
+            ))
 
         self._write_json(handler,
                          200,
@@ -247,6 +281,22 @@ class UploadIngestServer:
                              "bytes": content_length,
                              "received_at": datetime.utcnow().isoformat() + "Z",
                          })
+
+    def _preview_destination(self,
+                             target_dir: Path,
+                             kind: str,
+                             device_id: str,
+                             device_name: str,
+                             fallback_filename: str) -> Path:
+        device_part = _safe_component(device_name, fallback="")
+        id_part = _safe_component(device_id, fallback="unknown-device")
+        short_id = id_part[:8] if id_part else "unknown"
+        if device_part and device_part.lower() not in {"unknown-name", "unknown"}:
+            stem = f"{device_part}_{short_id}"
+        else:
+            stem = short_id or Path(fallback_filename).stem or "preview"
+        suffix = ".jpg" if kind == "preview_photo" else ".json"
+        return target_dir / f"{stem}{suffix}"
 
     def _unique_destination(self, candidate: Path) -> Path:
         if not candidate.exists():
