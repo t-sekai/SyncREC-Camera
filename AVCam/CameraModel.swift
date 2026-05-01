@@ -21,6 +21,9 @@ private enum RemoteTransferConfiguration {
 
 private enum ManualControlConfiguration {
     static let manualControlStateDefaultsKey = "ManualCameraControlState"
+    static let manualLockProfileDefaultsKey = "ManualLockProfileStorePath"
+    static let manualLockProfileDirectoryName = "ManualCameraParameters"
+    static let manualLockProfileFilename = "ManualLockProfileStore.json"
 }
 
 private enum TentacleSyncConfiguration {
@@ -128,6 +131,14 @@ final class CameraModel: Camera {
     /// The capabilities and supported numeric ranges for manual camera controls.
     private(set) var manualControlCapabilities = ManualCameraControlCapabilities.unavailable
 
+    /// Draft and active deterministic camera profiles for copy/sync operation.
+    private(set) var draftManualLockProfile: ManualLockProfile?
+    private(set) var activeManualLockProfile: ManualLockProfile?
+    private(set) var lastManualActualSnapshot: ManualCameraActualSnapshot?
+    private(set) var lastManualApplyReport: ManualApplyReport?
+    private(set) var lastManualValidationReport: ManualValidationReport?
+    private(set) var manualProfileDriftStatus = ManualProfileDriftStatus.unknown
+
     /// A Boolean value that indicates whether this camera is armed for remote trigger.
     private(set) var isRemoteArmed = false
 
@@ -136,6 +147,9 @@ final class CameraModel: Camera {
 
     /// Tracks whether internal code is setting the capture mode directly.
     private var isApplyingCaptureModeInternally = false
+
+    /// Tracks whether internal code is restoring the HDR UI value while a profile owns HDR/format.
+    private var isApplyingHDRInternally = false
 
     /// The most recent prepared remote start command.
     private var pendingRemoteStart: PreparedRemoteStart?
@@ -178,6 +192,9 @@ final class CameraModel: Camera {
 
     /// Task that advances the local recording timer display.
     private var recordingClockTask: Task<Void, Never>?
+
+    /// Task that refreshes displayed unlocked manual-control values from the camera.
+    private var manualControlRefreshTask: Task<Void, Never>?
 
     /// Anchor for a recording timer display seeded from Tentacle at record start.
     private var recordingClockAnchor: RecordingClockAnchor?
@@ -267,6 +284,14 @@ final class CameraModel: Camera {
         isUpdatingManualControlState = true
         manualControlState = loadManualControlState()
         isUpdatingManualControlState = false
+
+        let manualProfileStore = loadManualLockProfileStore()
+        draftManualLockProfile = manualProfileStore.draftProfile
+        activeManualLockProfile = manualProfileStore.activeDesiredProfile
+        lastManualActualSnapshot = manualProfileStore.lastActualSnapshot
+        lastManualApplyReport = manualProfileStore.lastApplyReport
+        lastManualValidationReport = manualProfileStore.lastValidationReport
+        manualProfileDriftStatus = manualProfileStore.driftStatus
     }
 
     deinit {
@@ -413,11 +438,19 @@ final class CameraModel: Camera {
 
         Task { @MainActor [weak self] in
             guard let self else { return }
+            if self.activeManualLockProfile != nil {
+                await self.disableActiveManualLockProfile(reason: "manual_control_override")
+            }
             await self.applyManualControlStateToDevice()
         }
     }
 
     private func applyManualControlStateToDevice() async {
+        if activeManualLockProfile != nil {
+            await reapplyActiveManualLockProfile(reason: "legacy_manual_apply_redirect")
+            return
+        }
+
         let snapshot = await captureService.applyManualControlState(manualControlState)
 
         isUpdatingManualControlState = true
@@ -426,7 +459,55 @@ final class CameraModel: Camera {
         isUpdatingManualControlState = false
 
         persistManualControlState(snapshot.state)
+        startManualControlRefreshIfNeeded()
         remoteDirectorClient.sendStatusNow()
+    }
+
+    private func refreshManualControlStateFromDevice() async {
+        guard status == .running, activeManualLockProfile == nil else { return }
+
+        let snapshot = await captureService.currentManualControlSnapshot()
+        guard snapshot.state != manualControlState || snapshot.capabilities != manualControlCapabilities else {
+            return
+        }
+
+        isUpdatingManualControlState = true
+        manualControlCapabilities = snapshot.capabilities
+        manualControlState = snapshot.state
+        isUpdatingManualControlState = false
+    }
+
+    private func startManualControlRefreshIfNeeded() {
+        guard status == .running, activeManualLockProfile == nil else {
+            stopManualControlRefresh()
+            return
+        }
+        guard manualControlRefreshTask == nil else { return }
+
+        manualControlRefreshTask = Task { @MainActor [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 250_000_000)
+                guard let self else { return }
+                guard self.status == .running, self.activeManualLockProfile == nil else { return }
+                await self.refreshManualControlStateFromDevice()
+            }
+        }
+    }
+
+    private func stopManualControlRefresh() {
+        manualControlRefreshTask?.cancel()
+        manualControlRefreshTask = nil
+    }
+
+    private func disableActiveManualLockProfile(reason: String) async {
+        guard activeManualLockProfile != nil else { return }
+
+        activeManualLockProfile = nil
+        manualProfileDriftStatus = .unknown
+        await captureService.clearManualLockProfile(reason: reason)
+        persistManualLockProfileStore()
+        remoteDirectorClient.sendStatusNow()
+        startManualControlRefreshIfNeeded()
     }
 
     private func loadManualControlState() -> ManualCameraControlState {
@@ -442,6 +523,214 @@ final class CameraModel: Camera {
     private func persistManualControlState(_ state: ManualCameraControlState) {
         guard let data = try? JSONEncoder().encode(state) else { return }
         UserDefaults.standard.set(data, forKey: ManualControlConfiguration.manualControlStateDefaultsKey)
+    }
+
+    private func installActiveManualLockProfile(reason: String, requestID: String? = nil) async {
+        guard let profile = activeManualLockProfile else {
+            await applyManualControlStateToDevice()
+            return
+        }
+
+        stopManualControlRefresh()
+        manualProfileDriftStatus = .reapplying
+        let report = await captureService.installManualLockProfile(profile,
+                                                                   reason: reason,
+                                                                   requestID: requestID,
+                                                                   dryRun: false)
+        updateManualLockProfileState(from: report)
+        persistManualLockProfileStore()
+        remoteDirectorClient.sendStatusNow()
+    }
+
+    private func reapplyActiveManualLockProfile(reason: String, requestID: String? = nil) async {
+        guard activeManualLockProfile != nil else { return }
+
+        stopManualControlRefresh()
+        manualProfileDriftStatus = .reapplying
+        let report = await captureService.reapplyManualLockProfile(reason: reason, requestID: requestID)
+        updateManualLockProfileState(from: report)
+        persistManualLockProfileStore()
+        remoteDirectorClient.sendStatusNow()
+    }
+
+    private func validateActiveManualLockProfile(reason: String, requestID: String? = nil) async -> ManualValidationReport? {
+        guard activeManualLockProfile != nil else { return nil }
+        let report = await captureService.validateManualLockProfile(reason: reason, requestID: requestID)
+        updateManualLockProfileState(from: report)
+        persistManualLockProfileStore()
+        remoteDirectorClient.sendStatusNow()
+        return report
+    }
+
+    private func updateManualLockProfileState(from report: ManualApplyReport) {
+        lastManualApplyReport = report
+        lastManualActualSnapshot = report.actualSnapshot
+
+        if var profile = activeManualLockProfile {
+            profile.lastApplyReport = report
+            profile.actualValidatedSnapshot = report.actualSnapshot
+            activeManualLockProfile = profile
+        }
+
+        switch report.classification {
+        case .exactMatch, .adjustedMatch:
+            manualProfileDriftStatus = .inSync
+        case .drifted:
+            manualProfileDriftStatus = .drifted
+        case .incompatible, .failed, .refused:
+            manualProfileDriftStatus = .failed
+        case .unknown:
+            manualProfileDriftStatus = .unknown
+        }
+
+        if report.classification == .exactMatch || report.classification == .adjustedMatch {
+            updateManualControlStateFromActiveProfile(actualSnapshot: report.actualSnapshot)
+        }
+    }
+
+    private func updateManualLockProfileState(from report: ManualValidationReport) {
+        lastManualValidationReport = report
+        lastManualActualSnapshot = report.actualSnapshot
+
+        switch report.classification {
+        case .exactMatch, .adjustedMatch:
+            manualProfileDriftStatus = .inSync
+        case .drifted:
+            manualProfileDriftStatus = .drifted
+        case .incompatible, .failed, .refused:
+            manualProfileDriftStatus = .failed
+        case .unknown:
+            manualProfileDriftStatus = .unknown
+        }
+    }
+
+    private func updateManualControlStateFromActiveProfile(actualSnapshot: ManualCameraActualSnapshot?) {
+        guard let profile = activeManualLockProfile else { return }
+
+        let desired = profile.desired
+        var state = manualControlState
+
+        if let selectedFPS = desired.selectedFPS {
+            state.fps = selectedFPS
+            state.isFPSLocked = true
+        } else if let minDuration = desired.activeVideoMinFrameDurationSeconds,
+                  let maxDuration = desired.activeVideoMaxFrameDurationSeconds,
+                  minDuration > 0,
+                  abs(minDuration - maxDuration) <= max(0.000_001, minDuration * 0.0005) {
+            state.fps = 1.0 / minDuration
+            state.isFPSLocked = true
+        } else if let actualSnapshot,
+                  let actualFPS = selectedFPS(from: actualSnapshot) {
+            state.fps = actualFPS
+            state.isFPSLocked = true
+        }
+
+        if let iso = desired.iso ?? actualSnapshot?.exposure?.iso {
+            state.iso = iso
+            state.isISOLocked = desired.iso != nil
+        }
+
+        if let shutter = desired.exposureDurationSeconds ?? actualSnapshot?.exposure?.exposureDurationSeconds {
+            state.shutterSeconds = shutter
+            state.isShutterLocked = desired.exposureDurationSeconds != nil
+        }
+
+        if desired.whiteBalanceGains != nil ||
+            desired.whiteBalanceTemperature != nil ||
+            desired.whiteBalanceTint != nil {
+            if let temperature = desired.whiteBalanceTemperature ?? actualSnapshot?.whiteBalance?.temperature {
+                state.whiteBalanceTemperature = temperature
+            }
+            if let tint = desired.whiteBalanceTint ?? actualSnapshot?.whiteBalance?.tint {
+                state.tint = tint
+            }
+            state.isWhiteBalanceLocked = true
+            state.isTintLocked = true
+        }
+
+        if let focus = desired.focusLensPosition ?? actualSnapshot?.focus?.lensPosition {
+            state.focusLensPosition = focus
+            state.isFocusLocked = desired.focusLensPosition != nil
+        }
+
+        isUpdatingManualControlState = true
+        manualControlState = state
+        isUpdatingManualControlState = false
+        persistManualControlState(state)
+    }
+
+    private func loadManualLockProfileStore() -> ManualLockProfileStore {
+        if let url = manualLockProfileStoreURL(),
+           let data = try? Data(contentsOf: url),
+           let decoded = try? JSONDecoder().decode(ManualLockProfileStore.self, from: data) {
+            return decoded
+        }
+
+        if let legacyURL = legacyManualLockProfileStoreURL(),
+           let data = try? Data(contentsOf: legacyURL),
+           let decoded = try? JSONDecoder().decode(ManualLockProfileStore.self, from: data) {
+            return decoded
+        }
+
+        return ManualLockProfileStore()
+    }
+
+    private func persistManualLockProfileStore() {
+        guard let url = manualLockProfileStoreURL() else { return }
+        let store = ManualLockProfileStore(activeDesiredProfile: activeManualLockProfile,
+                                           draftProfile: draftManualLockProfile,
+                                           lastActualSnapshot: lastManualActualSnapshot,
+                                           lastApplyReport: lastManualApplyReport,
+                                           lastValidationReport: lastManualValidationReport,
+                                           driftStatus: manualProfileDriftStatus)
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(store) else { return }
+
+        do {
+            try FileManager.default.createDirectory(at: url.deletingLastPathComponent(),
+                                                    withIntermediateDirectories: true,
+                                                    attributes: nil)
+            try data.write(to: url, options: [.atomic])
+            UserDefaults.standard.set(url.path, forKey: ManualControlConfiguration.manualLockProfileDefaultsKey)
+        } catch {
+            logger.error("Unable to persist manual lock profile store: \(error.localizedDescription, privacy: .public)")
+        }
+    }
+
+    private func manualLockProfileStoreURL() -> URL? {
+        manualLockProfileStoreDirectoryURL()?
+            .appendingPathComponent(ManualControlConfiguration.manualLockProfileFilename,
+                                    isDirectory: false)
+    }
+
+    private func manualLockProfileStoreDirectoryURL() -> URL? {
+        if let directory = FileManager.default.urls(for: .applicationSupportDirectory,
+                                                    in: .userDomainMask).first {
+            return directory.appendingPathComponent(ManualControlConfiguration.manualLockProfileDirectoryName,
+                                                    isDirectory: true)
+        }
+
+        if let directory = FileManager.default.urls(for: .documentDirectory,
+                                                    in: .userDomainMask).first {
+            return directory.appendingPathComponent(ManualControlConfiguration.manualLockProfileDirectoryName,
+                                                    isDirectory: true)
+        }
+
+        return URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+            .appendingPathComponent(ManualControlConfiguration.manualLockProfileDirectoryName,
+                                    isDirectory: true)
+    }
+
+    private func legacyManualLockProfileStoreURL() -> URL? {
+        if let storedPath = UserDefaults.standard.string(forKey: ManualControlConfiguration.manualLockProfileDefaultsKey),
+           !storedPath.isEmpty {
+            let url = URL(fileURLWithPath: storedPath)
+            if url.path != manualLockProfileStoreURL()?.path {
+                return url
+            }
+        }
+        return nil
     }
 
     private func seedTentacleClock(with timecode: TentacleTimecode, at uptime: TimeInterval) {
@@ -815,7 +1104,11 @@ final class CameraModel: Camera {
             }
             status = .running
             localVideoURLs = await localVideoStore.loadStoredVideos()
-            await applyManualControlStateToDevice()
+            if activeManualLockProfile != nil {
+                await installActiveManualLockProfile(reason: "camera_start")
+            } else {
+                await applyManualControlStateToDevice()
+            }
             remoteDirectorClient.start()
             startActiveTimecodeService()
         } catch {
@@ -835,6 +1128,7 @@ final class CameraModel: Camera {
         stopAllTimecodeServices()
         remoteDirectorClient.stop()
         stopRecordingClock()
+        stopManualControlRefresh()
         displayedTentacleTimecode = ""
         displayedTentacleFPS = nil
 
@@ -854,7 +1148,9 @@ final class CameraModel: Camera {
         isApplyingCaptureModeInternally = false
         qualityPrioritization = cameraState.qualityPrioritization
         isLivePhotoEnabled = cameraState.isLivePhotoEnabled
-        isHDRVideoEnabled = cameraState.isVideoHDREnabled
+        if activeManualLockProfile?.policy.ownsHDRAndFormat != true {
+            isHDRVideoEnabled = cameraState.isVideoHDREnabled
+        }
     }
 
     func refreshLocalVideos() async {
@@ -904,7 +1200,11 @@ final class CameraModel: Camera {
         isSwitchingVideoDevices = true
         defer { isSwitchingVideoDevices = false }
         await captureService.selectNextVideoDevice()
-        await applyManualControlStateToDevice()
+        if activeManualLockProfile != nil {
+            await reapplyActiveManualLockProfile(reason: "switch_video_devices")
+        } else {
+            await applyManualControlStateToDevice()
+        }
     }
     
     // MARK: - Photo capture
@@ -938,6 +1238,9 @@ final class CameraModel: Camera {
     
     /// Performs a focus and expose operation at the specified screen point.
     func focusAndExpose(at point: CGPoint) async {
+        if activeManualLockProfile != nil {
+            return
+        }
         if manualControlState.isFocusLocked {
             return
         }
@@ -957,6 +1260,17 @@ final class CameraModel: Camera {
     /// A Boolean value that indicates whether the camera captures video in HDR format.
     var isHDRVideoEnabled = false {
         didSet {
+            guard !isApplyingHDRInternally else { return }
+            if activeManualLockProfile?.policy.ownsHDRAndFormat == true {
+                isApplyingHDRInternally = true
+                isHDRVideoEnabled = oldValue
+                isApplyingHDRInternally = false
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.reapplyActiveManualLockProfile(reason: "hdr_toggle_blocked_by_profile")
+                }
+                return
+            }
             guard status == .running, captureMode == .video else { return }
             Task {
                 await captureService.setHDRVideoEnabled(isHDRVideoEnabled)
@@ -987,9 +1301,19 @@ final class CameraModel: Camera {
             // In any other case, start recording.
             let recordingSeedTimecode = recordingSeedTentacleTimecode()
             recordingStartTimecodeMetadata = currentRecordingStartMetadata()
-            pendingRecordingCalibrationJSON = await captureService.recordingCalibrationJSONData()
+            let calibrationJSON = await captureService.recordingCalibrationJSONData()
+            let validation = await captureService.startRecording(recordingStartMetadata: recordingStartTimecodeMetadata)
+            if let validation {
+                updateManualLockProfileState(from: validation)
+                persistManualLockProfileStore()
+                guard validation.classification == .exactMatch || validation.classification == .adjustedMatch else {
+                    recordingStartTimecodeMetadata = nil
+                    remoteDirectorClient.sendStatusNow()
+                    return
+                }
+            }
+            pendingRecordingCalibrationJSON = calibrationJSON
             startRecordingClock(seedTimecode: recordingSeedTimecode)
-            await captureService.startRecording(recordingStartMetadata: recordingStartTimecodeMetadata)
         }
     }
     
@@ -1085,7 +1409,9 @@ final class CameraModel: Camera {
             storageGB: storageGB,
             tentacleState: tentacleConnectionState.remoteControlValue,
             timecode: currentTimecode?.formatted ?? displayedTentacleTimecode,
-            fps: currentTimecode?.fps ?? displayedTentacleFPS
+            fps: currentTimecode?.fps ?? displayedTentacleFPS,
+            cameraParamsStatus: activeManualLockProfile == nil ? "none" : manualProfileDriftStatus.rawValue,
+            cameraParamsSummary: manualCameraParamsSummary()
         )
     }
 
@@ -1144,7 +1470,176 @@ final class CameraModel: Camera {
                 await self.runRemotePullVideosJob(request)
             }
             return .success("Accepted pull_videos job \(jobID).")
+
+        case .exportCameraParams:
+            let payload = await exportCameraParamsPayload(requestID: command.requestID)
+            return .success("Exported camera parameters.", payload: payload)
+
+        case .applyCameraParams(let profile, let dryRun):
+            let report = await applyRemoteCameraParams(profile,
+                                                       requestID: command.requestID,
+                                                       dryRun: dryRun)
+            let payload = cameraParamsReportPayload(applyReport: report)
+            let ok = report.classification == .exactMatch || report.classification == .adjustedMatch
+            return ok ? .success(report.detail, payload: payload) : .failure(report.detail, payload: payload)
+
+        case .validateCameraParams:
+            guard let report = await validateActiveManualLockProfile(reason: "remote_validate_camera_params",
+                                                                     requestID: command.requestID) else {
+                return .failure("No active manual lock profile.")
+            }
+            let payload = cameraParamsReportPayload(validationReport: report)
+            let ok = report.classification == .exactMatch || report.classification == .adjustedMatch
+            return ok ? .success(report.detail, payload: payload) : .failure(report.detail, payload: payload)
         }
+    }
+
+    private func applyRemoteCameraParams(_ profile: ManualLockProfile,
+                                         requestID: String,
+                                         dryRun: Bool) async -> ManualApplyReport {
+        if dryRun {
+            let report = await captureService.installManualLockProfile(profile,
+                                                                       reason: "remote_apply_camera_params_dry_run",
+                                                                       requestID: requestID,
+                                                                       dryRun: true)
+            updateManualLockProfileState(from: report)
+            return report
+        }
+
+        activeManualLockProfile = profile
+        stopManualControlRefresh()
+        manualProfileDriftStatus = .reapplying
+        let report = await captureService.installManualLockProfile(profile,
+                                                                   reason: "remote_apply_camera_params",
+                                                                   requestID: requestID,
+                                                                   dryRun: false)
+        updateManualLockProfileState(from: report)
+        persistManualLockProfileStore()
+        remoteDirectorClient.sendStatusNow()
+        return report
+    }
+
+    private func exportCameraParamsPayload(requestID: String) async -> [String: Any] {
+        let identity = remoteDirectorClient.manualSnapshotIdentity()
+        let actualSnapshot = await captureService.exportActualCameraSnapshot(reason: "remote_export_camera_params",
+                                                                             identity: identity)
+        lastManualActualSnapshot = actualSnapshot
+        let profile = activeManualLockProfile ?? manualLockProfile(from: actualSnapshot)
+        persistManualLockProfileStore()
+
+        var payload: [String: Any] = [
+            "schema_version": 1,
+            "request_id": requestID,
+            "source_snapshot_hash": stableHash(of: actualSnapshot)
+        ]
+        if let requestedProfile = jsonObject(profile) {
+            payload["requested_profile"] = requestedProfile
+        }
+        if let lastManualApplyReport,
+           let lastApplyPayload = jsonObject(lastManualApplyReport) {
+            payload["last_apply_report"] = lastApplyPayload
+        }
+        if let actualPayload = jsonObject(actualSnapshot) {
+            payload["actual_snapshot"] = actualPayload
+        }
+        return payload
+    }
+
+    private func cameraParamsReportPayload(applyReport: ManualApplyReport) -> [String: Any] {
+        [
+            "schema_version": 1,
+            "apply_report": jsonObject(applyReport) ?? [:],
+            "actual_snapshot": applyReport.actualSnapshot.flatMap(jsonObject(_:)) ?? [:],
+            "requested_profile": activeManualLockProfile.flatMap(jsonObject(_:)) ?? [:]
+        ]
+    }
+
+    private func cameraParamsReportPayload(validationReport: ManualValidationReport) -> [String: Any] {
+        [
+            "schema_version": 1,
+            "validation_report": jsonObject(validationReport) ?? [:],
+            "actual_snapshot": validationReport.actualSnapshot.flatMap(jsonObject(_:)) ?? [:],
+            "requested_profile": activeManualLockProfile.flatMap(jsonObject(_:)) ?? [:]
+        ]
+    }
+
+    private func manualLockProfile(from snapshot: ManualCameraActualSnapshot) -> ManualLockProfile {
+        let desired = ManualCameraDesiredSettings(
+            format: snapshot.activeFormat,
+            selectedFPS: selectedFPS(from: snapshot),
+            activeVideoMinFrameDurationSeconds: snapshot.actualFPSMinFrameDurationSeconds,
+            activeVideoMaxFrameDurationSeconds: snapshot.actualFPSMaxFrameDurationSeconds,
+            exposureDurationSeconds: snapshot.exposure?.exposureDurationSeconds,
+            iso: snapshot.exposure?.iso,
+            whiteBalanceTemperature: snapshot.whiteBalance?.temperature,
+            whiteBalanceTint: snapshot.whiteBalance?.tint,
+            whiteBalanceGains: snapshot.whiteBalance?.gains,
+            focusLensPosition: snapshot.focus?.lensPosition,
+            zoomFactor: snapshot.zoom?.factor,
+            preferredStabilizationModeRawValue: snapshot.stabilization?.preferredModeRawValue,
+            preferredStabilizationMode: snapshot.stabilization?.preferredMode,
+            hdrIntent: snapshot.activeFormat?.isTenBit == true ? "hdr10bit" : "sdr",
+            activeColorSpaceRawValue: snapshot.activeFormat?.activeColorSpaceRawValue,
+            bitDepth: snapshot.activeFormat?.isTenBit == true ? 10 : 8
+        )
+        return ManualLockProfile(
+            profileID: UUID().uuidString,
+            name: "Actual \(snapshot.identity.remoteDeviceName)",
+            source: .local(deviceID: snapshot.identity.remoteDeviceID,
+                           deviceName: snapshot.identity.remoteDeviceName,
+                           appVersion: snapshot.identity.appVersion,
+                           sourceSnapshotHash: stableHash(of: snapshot)),
+            desired: desired,
+            policy: .strict,
+            actualValidatedSnapshot: snapshot,
+            lastApplyReport: nil
+        )
+    }
+
+    private func selectedFPS(from snapshot: ManualCameraActualSnapshot) -> Double? {
+        guard let minDuration = snapshot.actualFPSMinFrameDurationSeconds,
+              let maxDuration = snapshot.actualFPSMaxFrameDurationSeconds,
+              minDuration > 0,
+              abs(minDuration - maxDuration) <= max(0.000_001, minDuration * 0.0005) else {
+            return nil
+        }
+        return 1.0 / minDuration
+    }
+
+    private func manualCameraParamsSummary() -> String? {
+        guard let snapshot = lastManualActualSnapshot else {
+            return activeManualLockProfile?.name
+        }
+        let format = snapshot.activeFormat.map { "\($0.width)x\($0.height)" } ?? "unknown_format"
+        let fps = selectedFPS(from: snapshot).map { String(format: "%.3f fps", $0) } ?? "variable fps"
+        let iso = snapshot.exposure.map { String(format: "ISO %.0f", $0.iso) } ?? "ISO unknown"
+        return "\(format), \(fps), \(iso)"
+    }
+
+    private func jsonObject<T: Encodable>(_ value: T) -> [String: Any]? {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(value),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dictionary = object as? [String: Any] else {
+            return nil
+        }
+        return dictionary
+    }
+
+    private func stableHash<T: Encodable>(of value: T) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        guard let data = try? encoder.encode(value) else {
+            return "hash_unavailable"
+        }
+
+        var hash: UInt64 = 0xcbf29ce484222325
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash &*= 0x100000001b3
+        }
+        return String(format: "%016llx", hash)
     }
 
     private func runRemotePullVideosJob(_ request: RemotePullVideosRequest) async {

@@ -349,15 +349,23 @@ private struct ManualControlPanel<CameraModel: Camera>: View {
             updateManualState { state in
                 switch control {
                 case .iso:
-                    state.isISOLocked.toggle()
+                    let shouldLock = !state.isISOLocked
+                    state.isISOLocked = shouldLock
+                    state.isShutterLocked = shouldLock
                 case .whiteBalance:
-                    state.isWhiteBalanceLocked.toggle()
+                    let shouldLock = !state.isWhiteBalanceLocked
+                    state.isWhiteBalanceLocked = shouldLock
+                    state.isTintLocked = shouldLock
                 case .fps:
                     state.isFPSLocked.toggle()
                 case .shutter:
-                    state.isShutterLocked.toggle()
+                    let shouldLock = !state.isShutterLocked
+                    state.isISOLocked = shouldLock
+                    state.isShutterLocked = shouldLock
                 case .tint:
-                    state.isTintLocked.toggle()
+                    let shouldLock = !state.isTintLocked
+                    state.isWhiteBalanceLocked = shouldLock
+                    state.isTintLocked = shouldLock
                 case .focus:
                     state.isFocusLocked.toggle()
                 }
@@ -386,6 +394,7 @@ private struct ManualControlPanel<CameraModel: Camera>: View {
 
             if isSupported {
                 slider
+                    .disabled(!isLocked)
                 Text(valueText)
                     .font(.caption2)
                     .foregroundStyle(.secondary)

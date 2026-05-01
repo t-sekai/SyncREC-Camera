@@ -22,4 +22,8 @@ xcuserdata/
 
 ingest/
 
+camera_param_presets/
+
+camera_param_sync_reports/
+
 **/__pycache__/

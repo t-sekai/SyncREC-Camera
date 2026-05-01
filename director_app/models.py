@@ -25,6 +25,10 @@ class DeviceState:
     transfer_job_id: str = ""
     transfer_detail: str = ""
     transfer_updated_unix: float | None = None
+    last_camera_params_summary: str = ""
+    last_camera_params_status: str = ""
+    last_camera_params_report: dict[str, Any] | None = None
+    pending_camera_param_requests: dict[str, str] = field(default_factory=dict)
 
     @property
     def endpoint(self) -> str:

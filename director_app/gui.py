@@ -43,6 +43,7 @@ class DirectorGUI:
         self.tentacle_timecode_var = StringVar(value="Director timecode: --:--:--:--")
         self.pull_status_var = StringVar(value="Pull queue: idle")
         self.upload_endpoint_var = StringVar(value="Upload endpoint: stopped")
+        self.camera_params_var = StringVar(value="Camera params: no preset")
         self._upload_url_for_clients = ""
 
         self._tentacle_anchor_monotonic: float | None = None
@@ -115,6 +116,19 @@ class DirectorGUI:
                    text="Pull Videos (Selected)",
                    command=self.pull_selected_device).pack(side=LEFT, padx=6)
 
+        camera_param_actions = ttk.Frame(self.root, padding=(8, 2))
+        camera_param_actions.pack(side=TOP, fill=X)
+        ttk.Button(camera_param_actions,
+                   text="Copy Params Selected",
+                   command=self.copy_camera_params_selected).pack(side=LEFT, padx=3)
+        ttk.Button(camera_param_actions,
+                   text="Dry Run Sync",
+                   command=self.dry_run_sync_camera_params).pack(side=LEFT, padx=3)
+        ttk.Button(camera_param_actions,
+                   text="Sync Params All",
+                   command=self.sync_camera_params_all).pack(side=LEFT, padx=3)
+        ttk.Label(camera_param_actions, textvariable=self.camera_params_var).pack(side=LEFT, padx=(12, 3))
+
         columns = (
             "name",
             "device_id",
@@ -126,6 +140,7 @@ class DirectorGUI:
             "storage",
             "tentacle",
             "timecode",
+            "camera_params",
             "transfer",
             "last_seen",
             "pending",
@@ -145,6 +160,7 @@ class DirectorGUI:
             "storage": 75,
             "tentacle": 110,
             "timecode": 120,
+            "camera_params": 180,
             "transfer": 180,
             "last_seen": 90,
             "pending": 210,
@@ -166,7 +182,9 @@ class DirectorGUI:
         self.pull_status_label = ttk.Label(bottom, textvariable=self.pull_status_var)
         self.pull_status_label.pack(anchor="w", pady=(0, 2))
         self.upload_endpoint_label = ttk.Label(bottom, textvariable=self.upload_endpoint_var)
-        self.upload_endpoint_label.pack(anchor="w", pady=(0, 6))
+        self.upload_endpoint_label.pack(anchor="w", pady=(0, 2))
+        self.camera_params_label = ttk.Label(bottom, textvariable=self.camera_params_var)
+        self.camera_params_label.pack(anchor="w", pady=(0, 6))
 
         self.log_box = Text(bottom, height=12, wrap="word")
         self.log_box.pack(side=LEFT, fill=BOTH, expand=True)
@@ -194,6 +212,8 @@ class DirectorGUI:
                 self.status_label.configure(text="Server: stopped")
             elif etype == "devices_updated":
                 self._refresh_tree(payload)
+            elif etype == "camera_params_status":
+                self.camera_params_var.set(str(payload))
             elif etype == "tentacle_state":
                 if self._time_source_is_laptop():
                     continue
@@ -295,6 +315,10 @@ class DirectorGUI:
             transfer = transfer_state
             if transfer_detail:
                 transfer = f"{transfer_state} ({transfer_detail})" if transfer_state else transfer_detail
+            camera_params = str(d.get("camera_params_status") or "")
+            camera_params_summary = str(d.get("camera_params_summary") or "")
+            if camera_params_summary:
+                camera_params = f"{camera_params}: {camera_params_summary}" if camera_params else camera_params_summary
 
             item_id = self.tree.insert(
                 "",
@@ -310,6 +334,7 @@ class DirectorGUI:
                     storage,
                     d["tentacle_state"],
                     timecode_text(d["timecode"], d["fps"]),
+                    camera_params,
                     transfer,
                     last_seen,
                     pending,
@@ -450,6 +475,29 @@ class DirectorGUI:
                                       max_files=max_files,
                                       policy="new_only",
                                       upload_url=self._upload_url_for_clients)
+
+    def copy_camera_params_selected(self) -> None:
+        selected = self.tree.selection()
+        if not selected:
+            self._append_log("Select one device row before copying camera params.")
+            return
+
+        values = self.tree.item(selected[0], "values")
+        if not values or len(values) < 2:
+            self._append_log("Unable to read selected row.")
+            return
+
+        device_id = str(values[1])
+        self.camera_params_var.set(f"Camera params: copying from {device_id}")
+        self.server.copy_camera_params(device_id)
+
+    def dry_run_sync_camera_params(self) -> None:
+        self.camera_params_var.set("Camera params: dry run sync started")
+        self.server.sync_camera_params_all(dry_run=True)
+
+    def sync_camera_params_all(self) -> None:
+        self.camera_params_var.set("Camera params: sync started")
+        self.server.sync_camera_params_all(dry_run=False)
 
     def on_close(self) -> None:
         self.tentacle_reader.stop()

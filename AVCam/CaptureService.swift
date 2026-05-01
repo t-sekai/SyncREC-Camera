@@ -80,6 +80,11 @@ actor CaptureService {
 
     // The most recently applied manual control state.
     private var manualControlState = ManualCameraControlState.default
+    // The active deterministic profile, if installed. When present, legacy manual controls must not unlock hardware.
+    private var activeManualLockProfile: ManualLockProfile?
+    private var lastManualLockApplyReport: ManualApplyReport?
+    private var lastManualLockValidationReport: ManualValidationReport?
+    private var lastManualLockActualSnapshot: ManualCameraActualSnapshot?
     // The most recent camera intrinsic matrix observed from video sample-buffer attachments.
     private var latestCameraIntrinsics: [Double]?
     private var latestCameraIntrinsicsTimestamp: Date?
@@ -131,9 +136,10 @@ actor CaptureService {
         // Exit early if not authorized or the session is already running.
         guard await isAuthorized, !captureSession.isRunning else { return }
         // Configure the session and start it.
-        try setUpSession()
+        try await setUpSession()
         shouldRunSession = true
         captureSession.startRunning()
+        await afterPotentialReconfiguration(reason: "start_running")
     }
 
     func stop() {
@@ -150,7 +156,7 @@ actor CaptureService {
     
     // MARK: - Capture setup
     // Performs the initial capture session configuration.
-    private func setUpSession() throws {
+    private func setUpSession() async throws {
         // Return early if already set up.
         guard !isSetUp else { return }
 
@@ -181,7 +187,7 @@ actor CaptureService {
             }
             configureCalibrationVideoDataOutput()
             configureCameraIntrinsicsDelivery()
-            setHDRVideoEnabled(isHDRVideoEnabled)
+            await setHDRVideoEnabled(isHDRVideoEnabled)
             
             // Configure controls to use with the Camera Control.
             configureControls(for: defaultCamera)
@@ -195,6 +201,7 @@ actor CaptureService {
             updateCaptureCapabilities()
             
             isSetUp = true
+            await afterPotentialReconfiguration(reason: "set_up_session")
         } catch {
             throw CameraError.setupFailed
         }
@@ -235,6 +242,10 @@ actor CaptureService {
         guard isSetUp else {
             return ManualCameraControlSnapshot(state: requestedState, capabilities: .unavailable)
         }
+        guard activeManualLockProfile == nil else {
+            return ManualCameraControlSnapshot(state: manualControlState,
+                                              capabilities: manualControlCapabilities(for: currentDevice))
+        }
 
         let device = currentDevice
         let capabilities = manualControlCapabilities(for: device)
@@ -252,9 +263,494 @@ actor CaptureService {
             logger.error("Unable to apply manual camera controls: \(error.localizedDescription, privacy: .public)")
         }
 
+        refreshUnlockedManualControlValues(&resolvedState, device: device)
         manualControlState = resolvedState
         return ManualCameraControlSnapshot(state: resolvedState, capabilities: capabilities)
     }
+
+    func currentManualControlSnapshot() -> ManualCameraControlSnapshot {
+        guard isSetUp else {
+            return ManualCameraControlSnapshot(state: manualControlState, capabilities: .unavailable)
+        }
+
+        let device = currentDevice
+        let capabilities = manualControlCapabilities(for: device)
+        var resolvedState = clampedState(manualControlState, capabilities: capabilities)
+        refreshUnlockedManualControlValues(&resolvedState, device: device)
+        manualControlState = resolvedState
+        return ManualCameraControlSnapshot(state: resolvedState, capabilities: capabilities)
+    }
+
+    func clearManualLockProfile(reason: String) {
+        guard isSetUp else { return }
+        activeManualLockProfile = nil
+        lastManualLockApplyReport = nil
+        lastManualLockValidationReport = nil
+        lastManualLockActualSnapshot = exportActualCameraSnapshot(reason: reason)
+        configureControls(for: currentDevice)
+    }
+
+    func installManualLockProfile(_ profile: ManualLockProfile,
+                                  reason: String,
+                                  requestID: String? = nil,
+                                  dryRun: Bool = false) async -> ManualApplyReport {
+        let startedAt = Self.unixMilliseconds()
+
+        guard isSetUp else {
+            let report = ManualApplyReport(reportID: UUID().uuidString,
+                                           requestID: requestID,
+                                           profileID: profile.profileID,
+                                           reason: reason,
+                                           dryRun: dryRun,
+                                           startedAtUnixMilliseconds: startedAt,
+                                           completedAtUnixMilliseconds: Self.unixMilliseconds(),
+                                           classification: .failed,
+                                           detail: "Capture service is not ready.",
+                                           parameterReports: [
+                                               ManualParameterReport(parameter: "capture_service",
+                                                                     status: .unavailable,
+                                                                     detail: "Capture session is not set up.")
+                                           ],
+                                           actualSnapshot: nil)
+            lastManualLockApplyReport = report
+            return report
+        }
+
+        if dryRun {
+            let compatibility = dryRunManualLockProfile(profile, reason: reason, requestID: requestID)
+            let report = ManualApplyReport(reportID: UUID().uuidString,
+                                           requestID: requestID,
+                                           profileID: profile.profileID,
+                                           reason: reason,
+                                           dryRun: true,
+                                           startedAtUnixMilliseconds: startedAt,
+                                           completedAtUnixMilliseconds: Self.unixMilliseconds(),
+                                           classification: compatibility.classification,
+                                           detail: compatibility.detail,
+                                           parameterReports: compatibility.parameterReports,
+                                           actualSnapshot: compatibility.actualSnapshot)
+            lastManualLockApplyReport = report
+            lastManualLockValidationReport = compatibility
+            lastManualLockActualSnapshot = compatibility.actualSnapshot
+            return report
+        }
+
+        if captureActivity.isRecording && !profile.policy.allowApplyWhileRecording {
+            let snapshot = exportActualCameraSnapshot(reason: reason)
+            let report = ManualApplyReport(reportID: UUID().uuidString,
+                                           requestID: requestID,
+                                           profileID: profile.profileID,
+                                           reason: reason,
+                                           dryRun: false,
+                                           startedAtUnixMilliseconds: startedAt,
+                                           completedAtUnixMilliseconds: Self.unixMilliseconds(),
+                                           classification: .refused,
+                                           detail: "Refused to apply deterministic profile while recording.",
+                                           parameterReports: [
+                                               ManualParameterReport(parameter: "recording_state",
+                                                                     status: .refused,
+                                                                     detail: "Profile policy does not allow hardware mutation while recording.")
+                                           ],
+                                           actualSnapshot: snapshot)
+            lastManualLockApplyReport = report
+            lastManualLockActualSnapshot = snapshot
+            return report
+        }
+
+        activeManualLockProfile = profile
+        if profile.policy.disableCaptureControls {
+            removeCaptureControls()
+        }
+
+        var applyReports = [ManualParameterReport]()
+        do {
+            applyReports.append(contentsOf: try await applyManualLockProfileToHardware(profile))
+        } catch {
+            let snapshot = exportActualCameraSnapshot(reason: reason)
+            applyReports.append(ManualParameterReport(parameter: "profile_apply",
+                                                      status: .incompatible,
+                                                      detail: error.localizedDescription))
+            let report = ManualApplyReport(reportID: UUID().uuidString,
+                                           requestID: requestID,
+                                           profileID: profile.profileID,
+                                           reason: reason,
+                                           dryRun: false,
+                                           startedAtUnixMilliseconds: startedAt,
+                                           completedAtUnixMilliseconds: Self.unixMilliseconds(),
+                                           classification: .failed,
+                                           detail: "Manual profile apply failed: \(error.localizedDescription)",
+                                           parameterReports: applyReports,
+                                           actualSnapshot: snapshot)
+            lastManualLockApplyReport = report
+            lastManualLockActualSnapshot = snapshot
+            var storedProfile = profile
+            storedProfile.lastApplyReport = report
+            storedProfile.actualValidatedSnapshot = snapshot
+            activeManualLockProfile = storedProfile
+            return report
+        }
+
+        let validation = validateManualLockProfile(reason: "\(reason)_post_apply",
+                                                  requestID: requestID,
+                                                  profileOverride: profile)
+        let report = ManualApplyReport(reportID: UUID().uuidString,
+                                       requestID: requestID,
+                                       profileID: profile.profileID,
+                                       reason: reason,
+                                       dryRun: false,
+                                       startedAtUnixMilliseconds: startedAt,
+                                       completedAtUnixMilliseconds: Self.unixMilliseconds(),
+                                       classification: validation.classification,
+                                       detail: validation.detail,
+                                       parameterReports: applyReports + validation.parameterReports,
+                                       actualSnapshot: validation.actualSnapshot)
+        lastManualLockApplyReport = report
+        lastManualLockValidationReport = validation
+        lastManualLockActualSnapshot = validation.actualSnapshot
+        var storedProfile = profile
+        storedProfile.lastApplyReport = report
+        storedProfile.actualValidatedSnapshot = validation.actualSnapshot
+        activeManualLockProfile = storedProfile
+        return report
+    }
+
+    func reapplyManualLockProfile(reason: String,
+                                  requestID: String? = nil) async -> ManualApplyReport {
+        guard let profile = activeManualLockProfile else {
+            let now = Self.unixMilliseconds()
+            return ManualApplyReport(reportID: UUID().uuidString,
+                                     requestID: requestID,
+                                     profileID: nil,
+                                     reason: reason,
+                                     dryRun: false,
+                                     startedAtUnixMilliseconds: now,
+                                     completedAtUnixMilliseconds: now,
+                                     classification: .failed,
+                                     detail: "No active manual lock profile.",
+                                     parameterReports: [
+                                         ManualParameterReport(parameter: "profile",
+                                                               status: .unavailable,
+                                                               detail: "No active profile is installed.")
+                                     ],
+                                     actualSnapshot: exportActualCameraSnapshot(reason: reason))
+        }
+        return await installManualLockProfile(profile, reason: reason, requestID: requestID, dryRun: false)
+    }
+
+    func validateManualLockProfile(reason: String,
+                                   requestID: String? = nil) -> ManualValidationReport {
+        validateManualLockProfile(reason: reason, requestID: requestID, profileOverride: nil)
+    }
+
+    private func validateManualLockProfile(reason: String,
+                                           requestID: String?,
+                                           profileOverride: ManualLockProfile?) -> ManualValidationReport {
+        let snapshot = exportActualCameraSnapshot(reason: reason)
+        guard let profile = profileOverride ?? activeManualLockProfile else {
+            let report = ManualValidationReport(reportID: UUID().uuidString,
+                                                requestID: requestID,
+                                                profileID: nil,
+                                                reason: reason,
+                                                validatedAtUnixMilliseconds: Self.unixMilliseconds(),
+                                                classification: .unknown,
+                                                detail: "No active manual lock profile.",
+                                                parameterReports: [
+                                                    ManualParameterReport(parameter: "profile",
+                                                                          status: .notRequested,
+                                                                          critical: false,
+                                                                          detail: "No active profile is installed.")
+                                                ],
+                                                actualSnapshot: snapshot)
+            lastManualLockValidationReport = report
+            lastManualLockActualSnapshot = snapshot
+            return report
+        }
+
+        let reports = validationReports(for: profile, actual: snapshot)
+        let classification = classification(for: reports, policy: profile.policy)
+        let detail: String
+        switch classification {
+        case .exactMatch:
+            detail = "Actual camera state matches deterministic profile."
+        case .adjustedMatch:
+            detail = "Actual camera state differs only by policy-allowed adjustments."
+        case .incompatible:
+            detail = "Actual camera state is incompatible with deterministic profile."
+        case .drifted:
+            detail = "Actual camera state drifted from deterministic profile."
+        case .refused:
+            detail = "Validation refused."
+        case .failed:
+            detail = "Validation failed."
+        case .unknown:
+            detail = "Validation status is unknown."
+        }
+
+        let report = ManualValidationReport(reportID: UUID().uuidString,
+                                            requestID: requestID,
+                                            profileID: profile.profileID,
+                                            reason: reason,
+                                            validatedAtUnixMilliseconds: Self.unixMilliseconds(),
+                                            classification: classification,
+                                            detail: detail,
+                                            parameterReports: reports,
+                                            actualSnapshot: snapshot)
+        lastManualLockValidationReport = report
+        lastManualLockActualSnapshot = snapshot
+        return report
+    }
+
+    private func dryRunManualLockProfile(_ profile: ManualLockProfile,
+                                         reason: String,
+                                         requestID: String?) -> ManualValidationReport {
+        let snapshot = exportActualCameraSnapshot(reason: reason)
+        var reports = [ManualParameterReport]()
+        let desired = profile.desired
+        let device = currentDevice
+
+        if let descriptor = desired.format {
+            if matchingFormat(for: descriptor, fps: desired.selectedFPS, device: device) != nil {
+                reports.append(ManualParameterReport(parameter: "active_format",
+                                                     status: .exact,
+                                                     requested: formatSummary(descriptor),
+                                                     actual: snapshot.activeFormat.map(formatSummary(_:)),
+                                                     detail: "A compatible activeFormat exists."))
+            } else {
+                reports.append(ManualParameterReport(parameter: "active_format",
+                                                     status: .incompatible,
+                                                     requested: formatSummary(descriptor),
+                                                     actual: snapshot.activeFormat.map(formatSummary(_:)),
+                                                     detail: "No compatible activeFormat exists on this device."))
+            }
+        }
+
+        if let fps = desired.selectedFPS {
+            let ranges = (desired.format.flatMap { matchingFormat(for: $0, fps: nil, device: device) } ?? device.activeFormat)
+                .videoSupportedFrameRateRanges
+            let supported = ranges.contains { $0.minFrameRate <= fps && fps <= $0.maxFrameRate }
+            reports.append(ManualParameterReport(parameter: "fps",
+                                                 status: supported ? .exact : .incompatible,
+                                                 requested: String(format: "%.6f", fps),
+                                                 actual: snapshot.actualFPSMinFrameDurationSeconds.map { String(format: "%.9f", 1.0 / $0) },
+                                                 detail: supported ? "Requested FPS is supported." : "Requested FPS is outside supported ranges."))
+        }
+
+        if let iso = desired.iso {
+            let format = desired.format.flatMap { matchingFormat(for: $0, fps: desired.selectedFPS, device: device) } ?? device.activeFormat
+            let supported = iso >= format.minISO && iso <= format.maxISO
+            reports.append(ManualParameterReport(parameter: "iso",
+                                                 status: supported ? .exact : .incompatible,
+                                                 requested: String(format: "%.3f", iso),
+                                                 actual: snapshot.exposure.map { String(format: "%.3f", $0.iso) },
+                                                 detail: supported ? "Requested ISO is in range." : "Requested ISO is outside active format range."))
+        }
+
+        if let exposureDuration = desired.exposureDurationSeconds {
+            let format = desired.format.flatMap { matchingFormat(for: $0, fps: desired.selectedFPS, device: device) } ?? device.activeFormat
+            let minExposure = finiteSeconds(from: format.minExposureDuration) ?? 0
+            let maxExposure = finiteSeconds(from: format.maxExposureDuration) ?? .greatestFiniteMagnitude
+            let supported = exposureDuration >= minExposure && exposureDuration <= maxExposure
+            reports.append(ManualParameterReport(parameter: "exposure_duration",
+                                                 status: supported ? .exact : .incompatible,
+                                                 requested: String(format: "%.9f", exposureDuration),
+                                                 actual: snapshot.exposure?.exposureDurationSeconds.map { String(format: "%.9f", $0) },
+                                                 detail: supported ? "Requested shutter duration is in range." : "Requested shutter duration is outside active format range."))
+        }
+
+        if desired.whiteBalanceGains != nil || desired.whiteBalanceTemperature != nil || desired.whiteBalanceTint != nil {
+            let supported = device.isWhiteBalanceModeSupported(.locked)
+            reports.append(ManualParameterReport(parameter: "white_balance",
+                                                 status: supported ? .exact : .incompatible,
+                                                 requested: desired.whiteBalanceGains.map(gainsSummary(_:)),
+                                                 actual: snapshot.whiteBalance.map { gainsSummary($0.gains) },
+                                                 detail: supported ? "White balance lock is supported." : "White balance lock is unsupported."))
+        }
+
+        if desired.focusLensPosition != nil {
+            let supported = device.isLockingFocusWithCustomLensPositionSupported
+            reports.append(ManualParameterReport(parameter: "focus_lens_position",
+                                                 status: supported ? .exact : .incompatible,
+                                                 critical: profile.policy.focusIsCritical,
+                                                 requested: desired.focusLensPosition.map { String(format: "%.6f", $0) },
+                                                 actual: snapshot.focus.map { String(format: "%.6f", $0.lensPosition) },
+                                                 detail: supported ? "Focus lock is supported." : "Focus lens-position lock is unsupported."))
+        }
+
+        if let zoom = desired.zoomFactor {
+            let format = desired.format.flatMap { matchingFormat(for: $0, fps: desired.selectedFPS, device: device) } ?? device.activeFormat
+            let supported = zoom >= 1.0 && zoom <= format.videoMaxZoomFactor
+            reports.append(ManualParameterReport(parameter: "zoom_factor",
+                                                 status: supported ? .exact : .incompatible,
+                                                 critical: profile.policy.zoomIsCritical,
+                                                 requested: String(format: "%.6f", zoom),
+                                                 actual: snapshot.zoom.map { String(format: "%.6f", $0.factor) },
+                                                 detail: supported ? "Zoom factor is supported." : "Zoom factor is outside active format range."))
+        }
+
+        if desired.preferredStabilizationModeRawValue != nil {
+            let supported = movieCapture.output.connection(with: .video)?.isVideoStabilizationSupported ?? false
+            reports.append(ManualParameterReport(parameter: "stabilization",
+                                                 status: supported ? .exact : .incompatible,
+                                                 requested: desired.preferredStabilizationMode ?? desired.preferredStabilizationModeRawValue.map(String.init),
+                                                 actual: snapshot.stabilization?.preferredMode,
+                                                 detail: supported ? "Video stabilization preference can be set." : "Video stabilization is unsupported."))
+        }
+
+        if reports.isEmpty {
+            reports.append(ManualParameterReport(parameter: "profile",
+                                                 status: .notRequested,
+                                                 critical: false,
+                                                 detail: "Profile contains no deterministic settings."))
+        }
+
+        let classification = classification(for: reports, policy: profile.policy)
+        return ManualValidationReport(reportID: UUID().uuidString,
+                                      requestID: requestID,
+                                      profileID: profile.profileID,
+                                      reason: reason,
+                                      validatedAtUnixMilliseconds: Self.unixMilliseconds(),
+                                      classification: classification,
+                                      detail: classification == .incompatible ? "Dry run found incompatible parameters." : "Dry run found compatible parameters.",
+                                      parameterReports: reports,
+                                      actualSnapshot: snapshot)
+    }
+
+    private func applyManualLockProfileToHardware(_ profile: ManualLockProfile) async throws -> [ManualParameterReport] {
+        var reports = [ManualParameterReport]()
+        let desired = profile.desired
+        let device = currentDevice
+
+        var selectedFormat: AVCaptureDevice.Format?
+        if let descriptor = desired.format {
+            guard let match = matchingFormat(for: descriptor, fps: desired.selectedFPS, device: device) else {
+                throw NSError(domain: "ManualLockProfile",
+                              code: 100,
+                              userInfo: [NSLocalizedDescriptionKey: "No compatible activeFormat for \(formatSummary(descriptor))."])
+            }
+            selectedFormat = match
+        }
+
+        captureSession.beginConfiguration()
+        if selectedFormat != nil, captureSession.canSetSessionPreset(.inputPriority) {
+            captureSession.sessionPreset = .inputPriority
+        }
+
+        try device.lockForConfiguration()
+        if let selectedFormat, device.activeFormat != selectedFormat {
+            device.activeFormat = selectedFormat
+            reports.append(ManualParameterReport(parameter: "active_format",
+                                                 status: .applied,
+                                                 requested: selectedFormat.mapFormatSummary,
+                                                 detail: "Set activeFormat by deterministic descriptor."))
+        }
+
+        if let fps = desired.selectedFPS {
+            guard let duration = supportedFrameDuration(forFPS: fps, device: device) else {
+                throw NSError(domain: "ManualLockProfile",
+                              code: 101,
+                              userInfo: [NSLocalizedDescriptionKey: "Requested FPS \(fps) is unsupported by the active format."])
+            }
+            device.activeVideoMinFrameDuration = duration
+            device.activeVideoMaxFrameDuration = duration
+            reports.append(ManualParameterReport(parameter: "fps",
+                                                 status: .applied,
+                                                 requested: String(format: "%.6f", fps),
+                                                 detail: "Set active min/max frame durations to requested FPS."))
+        } else {
+            if let minDuration = desired.activeVideoMinFrameDurationSeconds {
+                guard let duration = supportedFrameDuration(forDurationSeconds: minDuration, device: device) else {
+                    throw NSError(domain: "ManualLockProfile",
+                                  code: 102,
+                                  userInfo: [NSLocalizedDescriptionKey: "Requested minimum frame duration \(minDuration) is unsupported by the active format."])
+                }
+                device.activeVideoMinFrameDuration = duration
+            }
+            if let maxDuration = desired.activeVideoMaxFrameDurationSeconds {
+                guard let duration = supportedFrameDuration(forDurationSeconds: maxDuration, device: device) else {
+                    throw NSError(domain: "ManualLockProfile",
+                                  code: 103,
+                                  userInfo: [NSLocalizedDescriptionKey: "Requested maximum frame duration \(maxDuration) is unsupported by the active format."])
+                }
+                device.activeVideoMaxFrameDuration = duration
+            }
+            if desired.activeVideoMinFrameDurationSeconds != nil || desired.activeVideoMaxFrameDurationSeconds != nil {
+                reports.append(ManualParameterReport(parameter: "fps",
+                                                     status: .applied,
+                                                     detail: "Set active min/max frame durations from profile."))
+            }
+        }
+
+        if let zoom = desired.zoomFactor {
+            device.videoZoomFactor = zoom
+            reports.append(ManualParameterReport(parameter: "zoom_factor",
+                                                 status: .applied,
+                                                 critical: profile.policy.zoomIsCritical,
+                                                 requested: String(format: "%.6f", zoom),
+                                                 detail: "Set video zoom factor."))
+        }
+
+        device.isSubjectAreaChangeMonitoringEnabled = false
+        device.unlockForConfiguration()
+        captureSession.commitConfiguration()
+
+        if let rawMode = desired.preferredStabilizationModeRawValue {
+            setPreferredVideoStabilizationMode(rawMode)
+            reports.append(ManualParameterReport(parameter: "stabilization",
+                                                 status: .applied,
+                                                 requested: desired.preferredStabilizationMode ?? String(rawMode),
+                                                 detail: "Set preferred stabilization mode on video connections."))
+        }
+
+        if desired.exposureDurationSeconds != nil || desired.iso != nil {
+            let currentExposure = finiteSeconds(from: device.exposureDuration) ?? desired.exposureDurationSeconds ?? 1.0 / 48.0
+            let duration = CMTime(seconds: desired.exposureDurationSeconds ?? currentExposure,
+                                  preferredTimescale: 1_000_000_000)
+            try await setExposureLocked(device: device, duration: duration, iso: desired.iso ?? device.iso)
+            reports.append(ManualParameterReport(parameter: "exposure",
+                                                 status: .applied,
+                                                 requested: exposureSummary(durationSeconds: desired.exposureDurationSeconds,
+                                                                           iso: desired.iso),
+                                                 detail: "Set custom exposure duration/ISO."))
+        }
+
+        if let gains = desired.whiteBalanceGains {
+            try await setWhiteBalanceLocked(device: device, gains: gains)
+            reports.append(ManualParameterReport(parameter: "white_balance",
+                                                 status: .applied,
+                                                 requested: gainsSummary(gains),
+                                                 detail: "Set locked white balance gains."))
+        } else if desired.whiteBalanceTemperature != nil || desired.whiteBalanceTint != nil {
+            let current = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
+            let target = AVCaptureDevice.WhiteBalanceTemperatureAndTintValues(
+                temperature: desired.whiteBalanceTemperature ?? current.temperature,
+                tint: desired.whiteBalanceTint ?? current.tint
+            )
+            var gains = device.deviceWhiteBalanceGains(for: target)
+            gains = normalizeWhiteBalanceGains(gains, device: device)
+            try await setWhiteBalanceLocked(device: device,
+                                            gains: ManualWhiteBalanceGains(red: gains.redGain,
+                                                                           green: gains.greenGain,
+                                                                           blue: gains.blueGain))
+            let temperatureText = desired.whiteBalanceTemperature.map { String(format: "%.2f", $0) } ?? "current"
+            let tintText = desired.whiteBalanceTint.map { String(format: "%.2f", $0) } ?? "current"
+            reports.append(ManualParameterReport(parameter: "white_balance",
+                                                 status: .applied,
+                                                 requested: "temperature=\(temperatureText), tint=\(tintText)",
+                                                 detail: "Set locked white balance from temperature/tint."))
+        }
+
+        if let focus = desired.focusLensPosition {
+            try await setFocusLocked(device: device, lensPosition: focus)
+            reports.append(ManualParameterReport(parameter: "focus_lens_position",
+                                                 status: .applied,
+                                                 critical: profile.policy.focusIsCritical,
+                                                 requested: String(format: "%.6f", focus),
+                                                 detail: "Set locked focus lens position."))
+        }
+
+        return reports
+    }
+
 
     private func applyFrameRateControl(_ state: inout ManualCameraControlState,
                                        device: AVCaptureDevice,
@@ -263,12 +759,19 @@ actor CaptureService {
 
         state.fps = clamp(state.fps, to: capabilities.fpsRange)
         if state.isFPSLocked {
-            let targetDuration = CMTime(seconds: 1.0 / state.fps, preferredTimescale: 1_000_000_000)
+            let requestedFPS = state.fps
+            guard let targetDuration = supportedFrameDuration(forFPS: requestedFPS, device: device) else {
+                logger.error("Unsupported FPS \(requestedFPS, privacy: .public) for active camera format.")
+                state.isFPSLocked = false
+                state.fps = actualOrDefaultFPS(for: device, fallback: requestedFPS)
+                return
+            }
             device.activeVideoMinFrameDuration = targetDuration
             device.activeVideoMaxFrameDuration = targetDuration
         } else {
             device.activeVideoMinFrameDuration = CMTime.invalid
             device.activeVideoMaxFrameDuration = CMTime.invalid
+            state.fps = actualOrDefaultFPS(for: device, fallback: state.fps)
         }
     }
 
@@ -412,6 +915,97 @@ actor CaptureService {
         return seconds
     }
 
+    private func supportedFrameDuration(forFPS fps: Double, device: AVCaptureDevice) -> CMTime? {
+        guard fps.isFinite, fps > 0 else { return nil }
+
+        let fpsTolerance = max(0.0001, fps * 0.00001)
+        for range in device.activeFormat.videoSupportedFrameRateRanges {
+            guard fps >= range.minFrameRate - fpsTolerance,
+                  fps <= range.maxFrameRate + fpsTolerance else {
+                continue
+            }
+
+            if abs(fps - range.maxFrameRate) <= fpsTolerance {
+                return range.minFrameDuration
+            }
+            if abs(fps - range.minFrameRate) <= fpsTolerance {
+                return range.maxFrameDuration
+            }
+
+            return CMTime(seconds: 1.0 / fps, preferredTimescale: 600_000)
+        }
+
+        return nil
+    }
+
+    private func supportedFrameDuration(forDurationSeconds seconds: Double,
+                                        device: AVCaptureDevice) -> CMTime? {
+        guard seconds.isFinite, seconds > 0 else { return nil }
+
+        let durationTolerance = max(0.000_001, seconds * 0.00001)
+        for range in device.activeFormat.videoSupportedFrameRateRanges {
+            guard let minDurationSeconds = finiteSeconds(from: range.minFrameDuration),
+                  let maxDurationSeconds = finiteSeconds(from: range.maxFrameDuration) else {
+                continue
+            }
+
+            if abs(seconds - minDurationSeconds) <= durationTolerance {
+                return range.minFrameDuration
+            }
+            if abs(seconds - maxDurationSeconds) <= durationTolerance {
+                return range.maxFrameDuration
+            }
+            if seconds >= minDurationSeconds - durationTolerance,
+               seconds <= maxDurationSeconds + durationTolerance {
+                return CMTime(seconds: seconds, preferredTimescale: 600_000)
+            }
+        }
+
+        return nil
+    }
+
+    private func actualOrDefaultFPS(for device: AVCaptureDevice, fallback: Double) -> Double {
+        if let minDuration = finiteSeconds(from: device.activeVideoMinFrameDuration),
+           let maxDuration = finiteSeconds(from: device.activeVideoMaxFrameDuration),
+           nearlyEqual(minDuration, maxDuration, relativeTolerance: 0.0005, absoluteTolerance: 0.000_001) {
+            return 1.0 / minDuration
+        }
+        if let minDuration = finiteSeconds(from: device.activeVideoMinFrameDuration) {
+            return 1.0 / minDuration
+        }
+
+        let maxFPS = device.activeFormat.videoSupportedFrameRateRanges
+            .map(\.maxFrameRate)
+            .filter { $0.isFinite && $0 > 0 }
+            .max()
+        return maxFPS ?? fallback
+    }
+
+    private func refreshUnlockedManualControlValues(_ state: inout ManualCameraControlState,
+                                                    device: AVCaptureDevice) {
+        if !state.isFPSLocked {
+            state.fps = actualOrDefaultFPS(for: device, fallback: state.fps)
+        }
+        if !state.isISOLocked {
+            state.iso = device.iso
+        }
+        if !state.isShutterLocked,
+           let exposureDuration = finiteSeconds(from: device.exposureDuration) {
+            state.shutterSeconds = exposureDuration
+        }
+
+        let whiteBalance = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
+        if !state.isWhiteBalanceLocked, whiteBalance.temperature.isFinite {
+            state.whiteBalanceTemperature = whiteBalance.temperature
+        }
+        if !state.isTintLocked, whiteBalance.tint.isFinite {
+            state.tint = whiteBalance.tint
+        }
+        if !state.isFocusLocked {
+            state.focusLensPosition = device.lensPosition
+        }
+    }
+
     private func clamp<T: Comparable>(_ value: T, to range: ClosedRange<T>) -> T {
         min(max(value, range.lowerBound), range.upperBound)
     }
@@ -479,6 +1073,500 @@ actor CaptureService {
         }
         return String(describing: value)
     }
+
+    func exportActualCameraSnapshot(reason: String,
+                                    identity: ManualSnapshotDeviceIdentity = .unknown) -> ManualCameraActualSnapshot {
+        guard isSetUp, let device = activeVideoInput?.device else {
+            return ManualCameraActualSnapshot(capturedAtUnixMilliseconds: Self.unixMilliseconds(),
+                                              reason: reason,
+                                              identity: identity,
+                                              device: nil,
+                                              activeFormat: nil,
+                                              actualFPSMinFrameDurationSeconds: nil,
+                                              actualFPSMaxFrameDurationSeconds: nil,
+                                              exposure: nil,
+                                              whiteBalance: nil,
+                                              focus: nil,
+                                              zoom: nil,
+                                              stabilization: nil,
+                                              intrinsics: ManualCameraIntrinsicsSnapshot(available: false,
+                                                                                        timestampUnixMilliseconds: nil,
+                                                                                        matrix3x3RowMajor: nil,
+                                                                                        freshnessSeconds: nil,
+                                                                                        missingReason: "capture_service_not_ready"),
+                                              isSubjectAreaChangeMonitoringEnabled: nil)
+        }
+
+        let format = device.activeFormat
+        let whiteBalance = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
+        let intrinsics: ManualCameraIntrinsicsSnapshot
+        if let latestCameraIntrinsics {
+            let timestamp = latestCameraIntrinsicsTimestamp ?? Date()
+            intrinsics = ManualCameraIntrinsicsSnapshot(available: true,
+                                                        timestampUnixMilliseconds: Self.unixMilliseconds(timestamp),
+                                                        matrix3x3RowMajor: latestCameraIntrinsics,
+                                                        freshnessSeconds: Date().timeIntervalSince(timestamp),
+                                                        missingReason: nil)
+        } else {
+            intrinsics = ManualCameraIntrinsicsSnapshot(available: false,
+                                                        timestampUnixMilliseconds: nil,
+                                                        matrix3x3RowMajor: nil,
+                                                        freshnessSeconds: nil,
+                                                        missingReason: "no_intrinsics_sample_buffer_attachment_seen")
+        }
+
+        let snapshot = ManualCameraActualSnapshot(
+            capturedAtUnixMilliseconds: Self.unixMilliseconds(),
+            reason: reason,
+            identity: identity,
+            device: ManualCaptureDeviceDescriptor(
+                localizedName: device.localizedName,
+                uniqueID: device.uniqueID,
+                modelID: device.modelID,
+                deviceType: device.deviceType.rawValue,
+                position: cameraPositionDescription(device.position),
+                isGeometricDistortionCorrectionSupported: device.isGeometricDistortionCorrectionSupported,
+                isGeometricDistortionCorrectionEnabled: device.isGeometricDistortionCorrectionEnabled
+            ),
+            activeFormat: formatDescriptor(for: format, device: device),
+            actualFPSMinFrameDurationSeconds: finiteSeconds(from: device.activeVideoMinFrameDuration),
+            actualFPSMaxFrameDurationSeconds: finiteSeconds(from: device.activeVideoMaxFrameDuration),
+            exposure: ManualExposureSnapshot(
+                exposureDurationSeconds: finiteSeconds(from: device.exposureDuration),
+                iso: device.iso,
+                exposureModeRawValue: device.exposureMode.rawValue,
+                exposureMode: exposureModeName(device.exposureMode)
+            ),
+            whiteBalance: ManualWhiteBalanceSnapshot(
+                gains: ManualWhiteBalanceGains(red: device.deviceWhiteBalanceGains.redGain,
+                                                green: device.deviceWhiteBalanceGains.greenGain,
+                                                blue: device.deviceWhiteBalanceGains.blueGain),
+                temperature: whiteBalance.temperature.isFinite ? whiteBalance.temperature : nil,
+                tint: whiteBalance.tint.isFinite ? whiteBalance.tint : nil,
+                modeRawValue: device.whiteBalanceMode.rawValue,
+                mode: whiteBalanceModeName(device.whiteBalanceMode)
+            ),
+            focus: ManualFocusSnapshot(
+                lensPosition: device.lensPosition,
+                focusModeRawValue: device.focusMode.rawValue,
+                focusMode: focusModeName(device.focusMode)
+            ),
+            zoom: ManualZoomSnapshot(factor: device.videoZoomFactor),
+            stabilization: stabilizationSnapshot(),
+            intrinsics: intrinsics,
+            isSubjectAreaChangeMonitoringEnabled: device.isSubjectAreaChangeMonitoringEnabled
+        )
+        lastManualLockActualSnapshot = snapshot
+        return snapshot
+    }
+
+    private func validationReports(for profile: ManualLockProfile,
+                                   actual: ManualCameraActualSnapshot) -> [ManualParameterReport] {
+        let desired = profile.desired
+        var reports = [ManualParameterReport]()
+
+        if let requested = desired.format {
+            let status: ManualParameterStatus
+            let detail: String?
+            if let actualFormat = actual.activeFormat,
+               requested.width == actualFormat.width,
+               requested.height == actualFormat.height,
+               requested.mediaSubTypeRawValue == actualFormat.mediaSubTypeRawValue,
+               requested.isVideoBinned == actualFormat.isVideoBinned {
+                status = .exact
+                detail = nil
+            } else {
+                status = profile.policy.allowFormatSubstitution ? .adjusted : .incompatible
+                detail = "Active format differs from requested deterministic descriptor."
+            }
+            reports.append(ManualParameterReport(parameter: "active_format",
+                                                 status: status,
+                                                 requested: formatSummary(requested),
+                                                 actual: actual.activeFormat.map(formatSummary(_:)),
+                                                 detail: detail))
+        }
+
+        if let fps = desired.selectedFPS {
+            let requestedDuration = 1.0 / fps
+            let minMatches = actual.actualFPSMinFrameDurationSeconds.map { nearlyEqual($0, requestedDuration, relativeTolerance: 0.0005, absoluteTolerance: 0.000_001) } ?? false
+            let maxMatches = actual.actualFPSMaxFrameDurationSeconds.map { nearlyEqual($0, requestedDuration, relativeTolerance: 0.0005, absoluteTolerance: 0.000_001) } ?? false
+            reports.append(ManualParameterReport(parameter: "fps",
+                                                 status: minMatches && maxMatches ? .exact : .incompatible,
+                                                 requested: String(format: "%.6f", fps),
+                                                 actual: fpsSummary(actual),
+                                                 detail: minMatches && maxMatches ? nil : "Actual frame durations do not match requested FPS."))
+        }
+
+        if let exposureDuration = desired.exposureDurationSeconds {
+            let matches = actual.exposure?.exposureDurationSeconds.map {
+                nearlyEqual($0, exposureDuration, relativeTolerance: 0.001, absoluteTolerance: 0.000_001)
+            } ?? false
+            reports.append(ManualParameterReport(parameter: "exposure_duration",
+                                                 status: matches ? .exact : .incompatible,
+                                                 requested: String(format: "%.9f", exposureDuration),
+                                                 actual: actual.exposure?.exposureDurationSeconds.map { String(format: "%.9f", $0) },
+                                                 detail: matches ? nil : "Actual exposure duration differs from requested shutter."))
+        }
+
+        if let iso = desired.iso {
+            let matches = actual.exposure.map { abs(Double($0.iso - iso)) <= 0.5 } ?? false
+            reports.append(ManualParameterReport(parameter: "iso",
+                                                 status: matches ? .exact : .incompatible,
+                                                 requested: String(format: "%.3f", iso),
+                                                 actual: actual.exposure.map { String(format: "%.3f", $0.iso) },
+                                                 detail: matches ? nil : "Actual ISO differs from requested ISO."))
+        }
+
+        if let gains = desired.whiteBalanceGains {
+            let matches = actual.whiteBalance.map { whiteBalanceGainsNearlyEqual($0.gains, gains) } ?? false
+            reports.append(ManualParameterReport(parameter: "white_balance_gains",
+                                                 status: matches ? .exact : .incompatible,
+                                                 requested: gainsSummary(gains),
+                                                 actual: actual.whiteBalance.map { gainsSummary($0.gains) },
+                                                 detail: matches ? nil : "Actual white-balance gains differ from requested gains."))
+        }
+
+        if let temperature = desired.whiteBalanceTemperature {
+            let matches = actual.whiteBalance?.temperature.map { abs($0 - temperature) <= 50 } ?? false
+            reports.append(ManualParameterReport(parameter: "white_balance_temperature",
+                                                 status: matches ? .exact : .incompatible,
+                                                 requested: String(format: "%.2f", temperature),
+                                                 actual: actual.whiteBalance?.temperature.map { String(format: "%.2f", $0) },
+                                                 detail: matches ? nil : "Actual white-balance temperature differs from requested temperature."))
+        }
+
+        if let tint = desired.whiteBalanceTint {
+            let matches = actual.whiteBalance?.tint.map { abs($0 - tint) <= 2 } ?? false
+            reports.append(ManualParameterReport(parameter: "white_balance_tint",
+                                                 status: matches ? .exact : .incompatible,
+                                                 requested: String(format: "%.2f", tint),
+                                                 actual: actual.whiteBalance?.tint.map { String(format: "%.2f", $0) },
+                                                 detail: matches ? nil : "Actual white-balance tint differs from requested tint."))
+        }
+
+        if let focus = desired.focusLensPosition {
+            let matches = actual.focus.map { abs(Double($0.lensPosition - focus)) <= 0.005 } ?? false
+            reports.append(ManualParameterReport(parameter: "focus_lens_position",
+                                                 status: matches ? .exact : .incompatible,
+                                                 critical: profile.policy.focusIsCritical,
+                                                 requested: String(format: "%.6f", focus),
+                                                 actual: actual.focus.map { String(format: "%.6f", $0.lensPosition) },
+                                                 detail: matches ? nil : "Actual focus lens position differs from requested position."))
+        }
+
+        if let zoom = desired.zoomFactor {
+            let matches = actual.zoom.map { abs(Double($0.factor - zoom)) <= 0.001 } ?? false
+            reports.append(ManualParameterReport(parameter: "zoom_factor",
+                                                 status: matches ? .exact : .incompatible,
+                                                 critical: profile.policy.zoomIsCritical,
+                                                 requested: String(format: "%.6f", zoom),
+                                                 actual: actual.zoom.map { String(format: "%.6f", $0.factor) },
+                                                 detail: matches ? nil : "Actual zoom factor differs from requested zoom."))
+        }
+
+        if let stabilization = desired.preferredStabilizationModeRawValue {
+            let matches = actual.stabilization?.preferredModeRawValue == stabilization
+            reports.append(ManualParameterReport(parameter: "stabilization",
+                                                 status: matches ? .exact : .incompatible,
+                                                 requested: desired.preferredStabilizationMode ?? String(stabilization),
+                                                 actual: actual.stabilization?.preferredMode,
+                                                 detail: matches ? nil : "Preferred stabilization mode differs from profile."))
+        }
+
+        if reports.isEmpty {
+            reports.append(ManualParameterReport(parameter: "profile",
+                                                 status: .notRequested,
+                                                 critical: false,
+                                                 detail: "Profile contains no deterministic settings."))
+        }
+        return reports
+    }
+
+    private func classification(for reports: [ManualParameterReport],
+                                policy: ManualLockProfilePolicy) -> ManualReportClassification {
+        if reports.contains(where: { $0.critical && [.incompatible, .unavailable, .refused, .drifted].contains($0.status) }) {
+            return .incompatible
+        }
+        if reports.contains(where: { $0.critical && $0.status == .adjusted && !policy.allowCriticalValueAdjustment }) {
+            return .incompatible
+        }
+        if reports.contains(where: { $0.status == .adjusted }) {
+            return .adjustedMatch
+        }
+        return .exactMatch
+    }
+
+    private func afterPotentialReconfiguration(reason: String) async {
+        guard let profile = activeManualLockProfile else { return }
+
+        if captureActivity.isRecording {
+            _ = validateManualLockProfile(reason: "\(reason)_recording_validation",
+                                          requestID: nil,
+                                          profileOverride: profile)
+            return
+        }
+
+        let validation = validateManualLockProfile(reason: "\(reason)_validation",
+                                                  requestID: nil,
+                                                  profileOverride: profile)
+        guard validation.classification != .exactMatch,
+              profile.policy.autoReapplyWhenIdle else {
+            return
+        }
+        _ = await installManualLockProfile(profile, reason: "\(reason)_auto_reapply", requestID: nil, dryRun: false)
+    }
+
+    private func matchingFormat(for descriptor: ManualCameraFormatDescriptor,
+                                fps: Double?,
+                                device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+        let matches = device.formats.filter { format in
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            guard Int(dimensions.width) == descriptor.width,
+                  Int(dimensions.height) == descriptor.height else {
+                return false
+            }
+            if let rawValue = descriptor.mediaSubTypeRawValue,
+               format.formatDescription.mediaSubType.rawValue != rawValue {
+                return false
+            }
+            if let isVideoBinned = descriptor.isVideoBinned,
+               format.isVideoBinned != isVideoBinned {
+                return false
+            }
+            if let isTenBit = descriptor.isTenBit,
+               format.isTenBitFormat != isTenBit {
+                return false
+            }
+            if let fps {
+                return format.videoSupportedFrameRateRanges.contains { $0.minFrameRate <= fps && fps <= $0.maxFrameRate }
+            }
+            return true
+        }
+
+        return matches.sorted {
+            let leftMax = $0.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
+            let rightMax = $1.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
+            return leftMax > rightMax
+        }.first
+    }
+
+    private func formatDescriptor(for format: AVCaptureDevice.Format,
+                                  device: AVCaptureDevice) -> ManualCameraFormatDescriptor {
+        let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+        let rawSubType = format.formatDescription.mediaSubType.rawValue
+        let ranges = format.videoSupportedFrameRateRanges.map {
+            ManualFrameRateRange(minFrameRate: $0.minFrameRate, maxFrameRate: $0.maxFrameRate)
+        }
+        return ManualCameraFormatDescriptor(width: Int(dimensions.width),
+                                            height: Int(dimensions.height),
+                                            mediaSubTypeFourCC: fourCCString(rawSubType),
+                                            mediaSubTypeRawValue: rawSubType,
+                                            isVideoBinned: format.isVideoBinned,
+                                            minISO: format.minISO,
+                                            maxISO: format.maxISO,
+                                            minExposureDurationSeconds: finiteSeconds(from: format.minExposureDuration),
+                                            maxExposureDurationSeconds: finiteSeconds(from: format.maxExposureDuration),
+                                            supportedFrameRateRanges: ranges,
+                                            videoMaxZoomFactor: format.videoMaxZoomFactor,
+                                            videoZoomFactorUpscaleThreshold: format.videoZoomFactorUpscaleThreshold,
+                                            videoFieldOfViewDegrees: format.videoFieldOfView,
+                                            geometricDistortionCorrectedVideoFieldOfViewDegrees: format.geometricDistortionCorrectedVideoFieldOfView,
+                                            activeColorSpaceRawValue: device.activeColorSpace.rawValue,
+                                            isTenBit: format.isTenBitFormat,
+                                            hdr10BitSupported: device.activeFormat10BitVariant != nil)
+    }
+
+    private func setPreferredVideoStabilizationMode(_ rawValue: Int) {
+        guard let mode = AVCaptureVideoStabilizationMode(rawValue: rawValue) else { return }
+        for connection in movieCapture.output.connections where connection.isVideoStabilizationSupported {
+            connection.preferredVideoStabilizationMode = mode
+        }
+    }
+
+    private func stabilizationSnapshot() -> ManualStabilizationSnapshot? {
+        guard let connection = movieCapture.output.connection(with: .video) else { return nil }
+        return ManualStabilizationSnapshot(preferredModeRawValue: connection.preferredVideoStabilizationMode.rawValue,
+                                           preferredMode: stabilizationModeName(connection.preferredVideoStabilizationMode),
+                                           activeModeRawValue: connection.activeVideoStabilizationMode.rawValue,
+                                           activeMode: stabilizationModeName(connection.activeVideoStabilizationMode),
+                                           isSupported: connection.isVideoStabilizationSupported)
+    }
+
+    private func setExposureLocked(device: AVCaptureDevice,
+                                   duration: CMTime,
+                                   iso: Float) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            do {
+                try device.lockForConfiguration()
+                device.setExposureModeCustom(duration: duration, iso: iso) { _ in
+                    continuation.resume()
+                }
+                device.unlockForConfiguration()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    private func setWhiteBalanceLocked(device: AVCaptureDevice,
+                                       gains: ManualWhiteBalanceGains) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            do {
+                try device.lockForConfiguration()
+                let requestedGains = AVCaptureDevice.WhiteBalanceGains(redGain: gains.red,
+                                                                       greenGain: gains.green,
+                                                                       blueGain: gains.blue)
+                let normalized = normalizeWhiteBalanceGains(requestedGains, device: device)
+                device.setWhiteBalanceModeLocked(with: normalized) { _ in
+                    continuation.resume()
+                }
+                device.unlockForConfiguration()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    private func setFocusLocked(device: AVCaptureDevice,
+                                lensPosition: Float) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            do {
+                try device.lockForConfiguration()
+                device.isSubjectAreaChangeMonitoringEnabled = false
+                device.setFocusModeLocked(lensPosition: lensPosition) { _ in
+                    continuation.resume()
+                }
+                device.unlockForConfiguration()
+            } catch {
+                continuation.resume(throwing: error)
+            }
+        }
+    }
+
+    private func removeCaptureControls() {
+        guard captureSession.supportsControls else { return }
+        captureSession.beginConfiguration()
+        for control in captureSession.controls {
+            captureSession.removeControl(control)
+        }
+        captureSession.commitConfiguration()
+    }
+
+    private static func unixMilliseconds(_ date: Date = Date()) -> Int64 {
+        Int64(date.timeIntervalSince1970 * 1000)
+    }
+
+    private func nearlyEqual(_ lhs: Double,
+                             _ rhs: Double,
+                             relativeTolerance: Double,
+                             absoluteTolerance: Double) -> Bool {
+        abs(lhs - rhs) <= max(absoluteTolerance, abs(rhs) * relativeTolerance)
+    }
+
+    private func whiteBalanceGainsNearlyEqual(_ lhs: ManualWhiteBalanceGains,
+                                              _ rhs: ManualWhiteBalanceGains) -> Bool {
+        abs(lhs.red - rhs.red) <= 0.01 &&
+        abs(lhs.green - rhs.green) <= 0.01 &&
+        abs(lhs.blue - rhs.blue) <= 0.01
+    }
+
+    private func formatSummary(_ descriptor: ManualCameraFormatDescriptor) -> String {
+        let subtype = descriptor.mediaSubTypeFourCC ?? descriptor.mediaSubTypeRawValue.map(String.init) ?? "unknown"
+        let binned = descriptor.isVideoBinned.map { $0 ? "binned" : "not_binned" } ?? "binned_unknown"
+        return "\(descriptor.width)x\(descriptor.height) \(subtype) \(binned)"
+    }
+
+    private func fpsSummary(_ snapshot: ManualCameraActualSnapshot) -> String? {
+        guard let minDuration = snapshot.actualFPSMinFrameDurationSeconds,
+              let maxDuration = snapshot.actualFPSMaxFrameDurationSeconds else {
+            return nil
+        }
+        return "min=\(String(format: "%.9f", minDuration)), max=\(String(format: "%.9f", maxDuration))"
+    }
+
+    private func gainsSummary(_ gains: ManualWhiteBalanceGains) -> String {
+        "r=\(String(format: "%.4f", gains.red)), g=\(String(format: "%.4f", gains.green)), b=\(String(format: "%.4f", gains.blue))"
+    }
+
+    private func exposureSummary(durationSeconds: Double?, iso: Float?) -> String {
+        let duration = durationSeconds.map { String(format: "%.9f", $0) } ?? "current"
+        let isoText = iso.map { String(format: "%.3f", $0) } ?? "current"
+        return "duration=\(duration), iso=\(isoText)"
+    }
+
+    private func fourCCString(_ value: FourCharCode) -> String {
+        let bytes: [UInt8] = [
+            UInt8((value >> 24) & 0xff),
+            UInt8((value >> 16) & 0xff),
+            UInt8((value >> 8) & 0xff),
+            UInt8(value & 0xff)
+        ]
+        return String(bytes: bytes, encoding: .macOSRoman) ?? "\(value)"
+    }
+
+    private func exposureModeName(_ mode: AVCaptureDevice.ExposureMode) -> String {
+        switch mode {
+        case .locked:
+            return "locked"
+        case .autoExpose:
+            return "auto_expose"
+        case .continuousAutoExposure:
+            return "continuous_auto_exposure"
+        case .custom:
+            return "custom"
+        @unknown default:
+            return "unknown"
+        }
+    }
+
+    private func whiteBalanceModeName(_ mode: AVCaptureDevice.WhiteBalanceMode) -> String {
+        switch mode {
+        case .locked:
+            return "locked"
+        case .autoWhiteBalance:
+            return "auto_white_balance"
+        case .continuousAutoWhiteBalance:
+            return "continuous_auto_white_balance"
+        @unknown default:
+            return "unknown"
+        }
+    }
+
+    private func focusModeName(_ mode: AVCaptureDevice.FocusMode) -> String {
+        switch mode {
+        case .locked:
+            return "locked"
+        case .autoFocus:
+            return "auto_focus"
+        case .continuousAutoFocus:
+            return "continuous_auto_focus"
+        @unknown default:
+            return "unknown"
+        }
+    }
+
+    private func stabilizationModeName(_ mode: AVCaptureVideoStabilizationMode) -> String {
+        switch mode {
+        case .off:
+            return "off"
+        case .standard:
+            return "standard"
+        case .cinematic:
+            return "cinematic"
+        case .cinematicExtended:
+            return "cinematic_extended"
+        case .previewOptimized:
+            return "preview_optimized"
+        case .cinematicExtendedEnhanced:
+            return "cinematic_extended_enhanced"
+        case .lowLatency:
+            return "low_latency"
+        case .auto:
+            return "auto"
+        @unknown default:
+            return "unknown"
+        }
+    }
     
     // MARK: - Capture controls
     
@@ -493,6 +1581,11 @@ actor CaptureService {
         // Remove previously configured controls, if any.
         for control in captureSession.controls {
             captureSession.removeControl(control)
+        }
+
+        if activeManualLockProfile?.policy.disableCaptureControls == true {
+            captureSession.commitConfiguration()
+            return
         }
         
         // Create controls and add them to the capture session.
@@ -550,13 +1643,12 @@ actor CaptureService {
     /// Changes the mode of capture, which can be `photo` or `video`.
     ///
     /// - Parameter `captureMode`: The capture mode to enable.
-    func setCaptureMode(_ captureMode: CaptureMode) throws {
+    func setCaptureMode(_ captureMode: CaptureMode) async throws {
         guard captureMode == .video else { return }
         self.captureMode = .video
         
         // Change the configuration atomically.
         captureSession.beginConfiguration()
-        defer { captureSession.commitConfiguration() }
         
         captureSession.sessionPreset = .high
         if !captureSession.outputs.contains(where: { $0 === movieCapture.output }) {
@@ -571,12 +1663,15 @@ actor CaptureService {
         }
         configureCalibrationVideoDataOutput()
         configureCameraIntrinsicsDelivery()
+        captureSession.commitConfiguration()
+
         if isHDRVideoEnabled {
-            setHDRVideoEnabled(true)
+            await setHDRVideoEnabled(true)
         }
 
         // Update the advertised capabilities after reconfiguration.
         updateCaptureCapabilities()
+        await afterPotentialReconfiguration(reason: "set_capture_mode")
     }
     
     // MARK: - Device selection
@@ -586,7 +1681,7 @@ actor CaptureService {
     /// The app calls this method in response to the user tapping the button in the UI to change cameras.
     /// The implementation switches between the front and back cameras and, in iPadOS,
     /// connected external cameras.
-    func selectNextVideoDevice() {
+    func selectNextVideoDevice() async {
         // The array of available video capture devices.
         let videoDevices = deviceLookup.cameras
 
@@ -601,7 +1696,7 @@ actor CaptureService {
         
         let nextDevice = videoDevices[nextIndex]
         // Change the session's active capture device.
-        changeCaptureDevice(to: nextDevice)
+        await changeCaptureDevice(to: nextDevice, reason: "select_next_video_device")
         
         // The app only calls this method in response to the user requesting to switch cameras.
         // Set the new selection as the user's preferred camera.
@@ -609,13 +1704,12 @@ actor CaptureService {
     }
     
     // Changes the device the service uses for video capture.
-    private func changeCaptureDevice(to device: AVCaptureDevice) {
+    private func changeCaptureDevice(to device: AVCaptureDevice, reason: String) async {
         // The service must have a valid video input prior to calling this method.
         guard let currentInput = activeVideoInput else { fatalError() }
         
         // Bracket the following configuration in a begin/commit configuration pair.
         captureSession.beginConfiguration()
-        defer { captureSession.commitConfiguration() }
         
         // Remove the existing video input before attempting to connect a new one.
         captureSession.removeInput(currentInput)
@@ -636,6 +1730,8 @@ actor CaptureService {
             // Reconnect the existing camera on failure.
             captureSession.addInput(currentInput)
         }
+        captureSession.commitConfiguration()
+        await afterPotentialReconfiguration(reason: reason)
     }
     
     /// Monitors changes to the system's preferred camera selection.
@@ -651,7 +1747,11 @@ actor CaptureService {
                 // If the SPC isn't the currently selected camera, attempt to change to that device.
                 if let camera, currentDevice != camera {
                     logger.debug("Switching camera selection to the system-preferred camera.")
-                    changeCaptureDevice(to: camera)
+                    if activeManualLockProfile?.policy.ignoreSystemPreferredCameraWhileLocked == true {
+                        _ = validateManualLockProfile(reason: "system_preferred_camera_change_ignored")
+                        continue
+                    }
+                    await changeCaptureDevice(to: camera, reason: "system_preferred_camera_change")
                 }
             }
         }
@@ -717,6 +1817,7 @@ actor CaptureService {
     ///
     /// The app calls this method as the result of a person tapping on the preview area.
     func focusAndExpose(at point: CGPoint, adjustExposure: Bool = true) {
+        guard activeManualLockProfile == nil else { return }
         // The point this call receives is in view-space coordinates. Convert this point to device coordinates.
         let devicePoint = videoPreviewLayer.captureDevicePointConverted(fromLayerPoint: point)
         do {
@@ -734,6 +1835,9 @@ actor CaptureService {
         subjectAreaChangeTask = Task {
             // Signal true when this notification occurs.
             for await _ in NotificationCenter.default.notifications(named: AVCaptureDevice.subjectAreaDidChangeNotification, object: device).compactMap({ _ in true }) {
+                if activeManualLockProfile != nil {
+                    continue
+                }
                 // Keep a true manual focus lock fixed at the same distance.
                 if manualControlState.isFocusLocked {
                     continue
@@ -746,6 +1850,7 @@ actor CaptureService {
     private var subjectAreaChangeTask: Task<Void, Never>?
     
     private func focusAndExpose(at devicePoint: CGPoint, isUserInitiated: Bool, adjustExposure: Bool = true) throws {
+        guard activeManualLockProfile == nil else { return }
         if manualControlState.isFocusLocked {
             return
         }
@@ -786,8 +1891,39 @@ actor CaptureService {
     // MARK: - Movie capture
     /// Starts recording video. The video records until the user stops recording,
     /// which calls the following `stopRecording()` method.
-    func startRecording(recordingStartMetadata: RecordingStartTimecodeMetadata?) {
-        movieCapture.startRecording(recordingStartMetadata: recordingStartMetadata)
+    func startRecording(recordingStartMetadata: RecordingStartTimecodeMetadata?) async -> ManualValidationReport? {
+        var validationReport: ManualValidationReport?
+        if let profile = activeManualLockProfile {
+            var validation = validateManualLockProfile(reason: "before_recording_start",
+                                                       requestID: nil,
+                                                       profileOverride: profile)
+            if validation.classification != .exactMatch && !captureActivity.isRecording && profile.policy.autoReapplyWhenIdle {
+                _ = await installManualLockProfile(profile, reason: "before_recording_start_reapply")
+                validation = validateManualLockProfile(reason: "before_recording_start_after_reapply",
+                                                       requestID: nil,
+                                                       profileOverride: profile)
+            }
+            validationReport = validation
+            guard validation.classification == .exactMatch || validation.classification == .adjustedMatch else {
+                return validation
+            }
+        }
+
+        let stabilizationMode: AVCaptureVideoStabilizationMode?
+        if let profile = activeManualLockProfile {
+            stabilizationMode = profile.desired.preferredStabilizationModeRawValue
+                .flatMap(AVCaptureVideoStabilizationMode.init(rawValue:))
+        } else {
+            stabilizationMode = .auto
+        }
+        movieCapture.startRecording(recordingStartMetadata: recordingStartMetadata,
+                                    preferredStabilizationMode: stabilizationMode)
+        if let profile = activeManualLockProfile {
+            validationReport = validateManualLockProfile(reason: "after_recording_start",
+                                                         requestID: nil,
+                                                         profileOverride: profile)
+        }
+        return validationReport
     }
     
     /// Stops the recording and returns the captured movie.
@@ -797,6 +1933,13 @@ actor CaptureService {
 
     /// Captures a JSON snapshot of camera calibration-related state at recording start.
     func recordingCalibrationJSONData() -> Data {
+        let actualSnapshot = exportActualCameraSnapshot(reason: "recording_calibration_sidecar")
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let data = try? encoder.encode(actualSnapshot) {
+            return data
+        }
+
         var payload: [String: Any] = [
             "schemaVersion": 1,
             "capturedAt": Self.calibrationTimestampFormatter.string(from: Date()),
@@ -1000,7 +2143,7 @@ actor CaptureService {
         // CoreMedia commonly stores this as matrix_float3x3 (48 bytes due SIMD padding).
         if data.count == MemoryLayout<matrix_float3x3>.size {
             var matrix = matrix_float3x3()
-            withUnsafeMutableBytes(of: &matrix) { destination in
+            _ = withUnsafeMutableBytes(of: &matrix) { destination in
                 data.copyBytes(to: destination)
             }
             let c0 = matrix.columns.0
@@ -1047,10 +2190,13 @@ actor CaptureService {
     }
 
     /// Sets whether the app captures HDR video.
-    func setHDRVideoEnabled(_ isEnabled: Bool) {
+    func setHDRVideoEnabled(_ isEnabled: Bool) async {
+        if activeManualLockProfile?.policy.ownsHDRAndFormat == true {
+            await afterPotentialReconfiguration(reason: "hdr_toggle_blocked_by_profile")
+            return
+        }
         // Bracket the following configuration in a begin/commit configuration pair.
         captureSession.beginConfiguration()
-        defer { captureSession.commitConfiguration() }
         do {
             // If the current device provides a 10-bit HDR format, enable it for use.
             if isEnabled, let format = currentDevice.activeFormat10BitVariant {
@@ -1065,6 +2211,8 @@ actor CaptureService {
         } catch {
             logger.error("Unable to obtain lock on device and can't enable HDR video capture.")
         }
+        captureSession.commitConfiguration()
+        await afterPotentialReconfiguration(reason: "set_hdr_video_enabled")
     }
     
     // MARK: - Internal state management
@@ -1089,6 +2237,12 @@ actor CaptureService {
     
     /// Observe when capture control enter and exit a fullscreen appearance.
     private func observeCaptureControlsState() {
+        controlsDelegate.onControlsDidBecomeInactive = { [weak self] in
+            guard let self else { return }
+            Task {
+                await self.afterPotentialReconfiguration(reason: "capture_controls_inactive")
+            }
+        }
         controlsDelegate.$isShowingFullscreenControls
             .assign(to: &$isShowingFullscreenControls)
     }
@@ -1108,6 +2262,7 @@ actor CaptureService {
             // Await notification of the end of an interruption.
             for await _ in NotificationCenter.default.notifications(named: AVCaptureSession.interruptionEndedNotification) {
                 isInterrupted = false
+                await afterPotentialReconfiguration(reason: "interruption_ended")
             }
         }
         
@@ -1118,6 +2273,7 @@ actor CaptureService {
                 if error.code == .mediaServicesWereReset {
                     if shouldRunSession, !captureSession.isRunning {
                         captureSession.startRunning()
+                        await afterPotentialReconfiguration(reason: "media_services_were_reset_restart")
                     }
                 }
             }
@@ -1128,6 +2284,7 @@ actor CaptureService {
 class CaptureControlsDelegate: NSObject, AVCaptureSessionControlsDelegate {
     
     @Published private(set) var isShowingFullscreenControls = false
+    var onControlsDidBecomeInactive: (() -> Void)?
 
     func sessionControlsDidBecomeActive(_ session: AVCaptureSession) {
         logger.debug("Capture controls active.")
@@ -1145,6 +2302,7 @@ class CaptureControlsDelegate: NSObject, AVCaptureSessionControlsDelegate {
     
     func sessionControlsDidBecomeInactive(_ session: AVCaptureSession) {
         logger.debug("Capture controls inactive.")
+        onControlsDidBecomeInactive?()
     }
 }
 
@@ -1155,5 +2313,12 @@ private final class CalibrationVideoDataDelegate: NSObject, AVCaptureVideoDataOu
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         onSampleBuffer?(sampleBuffer)
+    }
+}
+
+private extension AVCaptureDevice.Format {
+    var mapFormatSummary: String {
+        let dimensions = CMVideoFormatDescriptionGetDimensions(formatDescription)
+        return "\(dimensions.width)x\(dimensions.height) \(formatDescription.mediaSubType.rawValue)"
     }
 }

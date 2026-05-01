@@ -35,7 +35,8 @@ final class MovieCapture: OutputService {
     // MARK: - Capturing a movie
     
     /// Starts movie recording.
-    func startRecording(recordingStartMetadata: RecordingStartTimecodeMetadata?) {
+    func startRecording(recordingStartMetadata: RecordingStartTimecodeMetadata?,
+                        preferredStabilizationMode: AVCaptureVideoStabilizationMode? = .auto) {
         // Return early if already recording.
         guard !movieOutput.isRecording else { return }
         
@@ -48,9 +49,9 @@ final class MovieCapture: OutputService {
             movieOutput.setOutputSettings([AVVideoCodecKey: AVVideoCodecType.hevc], for: connection)
         }
 
-        // Enable video stabilization if the connection supports it.
-        if connection.isVideoStabilizationSupported {
-            connection.preferredVideoStabilizationMode = .auto
+        // Stabilization is controlled by the caller so deterministic manual profiles can prevent hidden resets.
+        if connection.isVideoStabilizationSupported, let preferredStabilizationMode {
+            connection.preferredVideoStabilizationMode = preferredStabilizationMode
         }
 
         movieOutput.metadata = metadataItems(for: recordingStartMetadata)

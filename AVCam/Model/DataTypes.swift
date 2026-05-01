@@ -265,6 +265,275 @@ struct ManualCameraControlSnapshot: Sendable, Equatable {
                                                           capabilities: .unavailable)
 }
 
+// MARK: - Deterministic manual lock profiles
+
+enum ManualProfileDriftStatus: String, Codable, Sendable, Equatable {
+    case unknown
+    case inSync = "in_sync"
+    case drifted
+    case reapplying
+    case failed
+}
+
+enum ManualParameterStatus: String, Codable, Sendable, Equatable {
+    case exact
+    case applied
+    case adjusted
+    case incompatible
+    case unavailable
+    case refused
+    case drifted
+    case notRequested = "not_requested"
+}
+
+enum ManualReportClassification: String, Codable, Sendable, Equatable {
+    case exactMatch = "exact_match"
+    case adjustedMatch = "adjusted_match"
+    case incompatible
+    case refused
+    case failed
+    case drifted
+    case unknown
+}
+
+struct ManualParameterReport: Codable, Sendable, Equatable {
+    var parameter: String
+    var status: ManualParameterStatus
+    var critical: Bool
+    var requested: String?
+    var actual: String?
+    var detail: String?
+
+    init(parameter: String,
+         status: ManualParameterStatus,
+         critical: Bool = true,
+         requested: String? = nil,
+         actual: String? = nil,
+         detail: String? = nil) {
+        self.parameter = parameter
+        self.status = status
+        self.critical = critical
+        self.requested = requested
+        self.actual = actual
+        self.detail = detail
+    }
+}
+
+struct ManualFrameRateRange: Codable, Sendable, Equatable {
+    var minFrameRate: Double
+    var maxFrameRate: Double
+}
+
+struct ManualWhiteBalanceGains: Codable, Sendable, Equatable {
+    var red: Float
+    var green: Float
+    var blue: Float
+}
+
+struct ManualSnapshotDeviceIdentity: Codable, Sendable, Equatable {
+    var remoteDeviceID: String
+    var remoteDeviceName: String
+    var appVersion: String
+
+    static let unknown = ManualSnapshotDeviceIdentity(remoteDeviceID: "unknown",
+                                                      remoteDeviceName: "unknown",
+                                                      appVersion: "unknown")
+}
+
+struct ManualProfileSourceMetadata: Codable, Sendable, Equatable {
+    var source: String
+    var sourceDeviceID: String?
+    var sourceDeviceName: String?
+    var sourceAppVersion: String?
+    var sourceSnapshotHash: String?
+    var createdAtUnixMilliseconds: Int64
+
+    static func local(deviceID: String?,
+                      deviceName: String?,
+                      appVersion: String?,
+                      sourceSnapshotHash: String?) -> ManualProfileSourceMetadata {
+        ManualProfileSourceMetadata(source: "iphone_actual_snapshot",
+                                    sourceDeviceID: deviceID,
+                                    sourceDeviceName: deviceName,
+                                    sourceAppVersion: appVersion,
+                                    sourceSnapshotHash: sourceSnapshotHash,
+                                    createdAtUnixMilliseconds: Int64(Date().timeIntervalSince1970 * 1000))
+    }
+}
+
+struct ManualLockProfilePolicy: Codable, Sendable, Equatable {
+    var allowFormatSubstitution = false
+    var allowCriticalValueAdjustment = false
+    var focusIsCritical = true
+    var zoomIsCritical = true
+    var allowApplyWhileRecording = false
+    var disableCaptureControls = true
+    var ownsHDRAndFormat = true
+    var ignoreSystemPreferredCameraWhileLocked = true
+    var autoReapplyWhenIdle = true
+
+    static let strict = ManualLockProfilePolicy()
+}
+
+struct ManualCameraFormatDescriptor: Codable, Sendable, Equatable {
+    var width: Int
+    var height: Int
+    var mediaSubTypeFourCC: String?
+    var mediaSubTypeRawValue: UInt32?
+    var isVideoBinned: Bool?
+    var minISO: Float?
+    var maxISO: Float?
+    var minExposureDurationSeconds: Double?
+    var maxExposureDurationSeconds: Double?
+    var supportedFrameRateRanges: [ManualFrameRateRange]
+    var videoMaxZoomFactor: CGFloat?
+    var videoZoomFactorUpscaleThreshold: CGFloat?
+    var videoFieldOfViewDegrees: Float?
+    var geometricDistortionCorrectedVideoFieldOfViewDegrees: Float?
+    var activeColorSpaceRawValue: Int?
+    var isTenBit: Bool?
+    var hdr10BitSupported: Bool?
+}
+
+struct ManualCaptureDeviceDescriptor: Codable, Sendable, Equatable {
+    var localizedName: String
+    var uniqueID: String
+    var modelID: String
+    var deviceType: String
+    var position: String
+    var isGeometricDistortionCorrectionSupported: Bool
+    var isGeometricDistortionCorrectionEnabled: Bool
+}
+
+struct ManualExposureSnapshot: Codable, Sendable, Equatable {
+    var exposureDurationSeconds: Double?
+    var iso: Float
+    var exposureModeRawValue: Int
+    var exposureMode: String
+}
+
+struct ManualWhiteBalanceSnapshot: Codable, Sendable, Equatable {
+    var gains: ManualWhiteBalanceGains
+    var temperature: Float?
+    var tint: Float?
+    var modeRawValue: Int
+    var mode: String
+}
+
+struct ManualFocusSnapshot: Codable, Sendable, Equatable {
+    var lensPosition: Float
+    var focusModeRawValue: Int
+    var focusMode: String
+}
+
+struct ManualZoomSnapshot: Codable, Sendable, Equatable {
+    var factor: CGFloat
+}
+
+struct ManualStabilizationSnapshot: Codable, Sendable, Equatable {
+    var preferredModeRawValue: Int?
+    var preferredMode: String?
+    var activeModeRawValue: Int?
+    var activeMode: String?
+    var isSupported: Bool
+}
+
+struct ManualCameraIntrinsicsSnapshot: Codable, Sendable, Equatable {
+    var available: Bool
+    var timestampUnixMilliseconds: Int64?
+    var matrix3x3RowMajor: [Double]?
+    var freshnessSeconds: Double?
+    var missingReason: String?
+}
+
+struct ManualCameraDesiredSettings: Codable, Sendable, Equatable {
+    var format: ManualCameraFormatDescriptor?
+    var selectedFPS: Double?
+    var activeVideoMinFrameDurationSeconds: Double?
+    var activeVideoMaxFrameDurationSeconds: Double?
+    var exposureDurationSeconds: Double?
+    var iso: Float?
+    var whiteBalanceTemperature: Float?
+    var whiteBalanceTint: Float?
+    var whiteBalanceGains: ManualWhiteBalanceGains?
+    var focusLensPosition: Float?
+    var zoomFactor: CGFloat?
+    var preferredStabilizationModeRawValue: Int?
+    var preferredStabilizationMode: String?
+    var hdrIntent: String?
+    var activeColorSpaceRawValue: Int?
+    var bitDepth: Int?
+}
+
+struct ManualCameraActualSnapshot: Codable, Sendable, Equatable {
+    var schemaVersion: Int = 1
+    var capturedAtUnixMilliseconds: Int64
+    var reason: String
+    var identity: ManualSnapshotDeviceIdentity
+    var device: ManualCaptureDeviceDescriptor?
+    var activeFormat: ManualCameraFormatDescriptor?
+    var actualFPSMinFrameDurationSeconds: Double?
+    var actualFPSMaxFrameDurationSeconds: Double?
+    var exposure: ManualExposureSnapshot?
+    var whiteBalance: ManualWhiteBalanceSnapshot?
+    var focus: ManualFocusSnapshot?
+    var zoom: ManualZoomSnapshot?
+    var stabilization: ManualStabilizationSnapshot?
+    var intrinsics: ManualCameraIntrinsicsSnapshot
+    var isSubjectAreaChangeMonitoringEnabled: Bool?
+}
+
+struct ManualApplyReport: Codable, Sendable, Equatable {
+    var schemaVersion: Int = 1
+    var reportID: String
+    var requestID: String?
+    var profileID: String?
+    var reason: String
+    var dryRun: Bool
+    var startedAtUnixMilliseconds: Int64
+    var completedAtUnixMilliseconds: Int64
+    var classification: ManualReportClassification
+    var detail: String
+    var parameterReports: [ManualParameterReport]
+    var actualSnapshot: ManualCameraActualSnapshot?
+}
+
+struct ManualValidationReport: Codable, Sendable, Equatable {
+    var schemaVersion: Int = 1
+    var reportID: String
+    var requestID: String?
+    var profileID: String?
+    var reason: String
+    var validatedAtUnixMilliseconds: Int64
+    var classification: ManualReportClassification
+    var detail: String
+    var parameterReports: [ManualParameterReport]
+    var actualSnapshot: ManualCameraActualSnapshot?
+}
+
+struct ManualLockProfile: Codable, Sendable, Equatable {
+    var schemaVersion: Int = 1
+    var profileID: String
+    var name: String?
+    var source: ManualProfileSourceMetadata
+    var desired: ManualCameraDesiredSettings
+    var policy: ManualLockProfilePolicy
+    var actualValidatedSnapshot: ManualCameraActualSnapshot?
+    var lastApplyReport: ManualApplyReport?
+
+    var isActive: Bool { true }
+}
+
+struct ManualLockProfileStore: Codable, Sendable, Equatable {
+    var schemaVersion: Int = 1
+    var activeDesiredProfile: ManualLockProfile?
+    var draftProfile: ManualLockProfile?
+    var lastActualSnapshot: ManualCameraActualSnapshot?
+    var lastApplyReport: ManualApplyReport?
+    var lastValidationReport: ManualValidationReport?
+    var driftStatus: ManualProfileDriftStatus = .unknown
+}
+
 /// An enumeration that defines the activity states the capture service supports.
 ///
 /// This type provides feedback to the UI regarding the active status of the `CaptureService` actor.

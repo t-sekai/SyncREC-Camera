@@ -16,6 +16,8 @@ struct RemoteDirectorStatusPayload {
     let tentacleState: String
     let timecode: String
     let fps: Int?
+    let cameraParamsStatus: String?
+    let cameraParamsSummary: String?
 
     static let empty = RemoteDirectorStatusPayload(recording: false,
                                                    armed: false,
@@ -23,7 +25,9 @@ struct RemoteDirectorStatusPayload {
                                                    storageGB: nil,
                                                    tentacleState: "unknown",
                                                    timecode: "",
-                                                   fps: nil)
+                                                   fps: nil,
+                                                   cameraParamsStatus: nil,
+                                                   cameraParamsSummary: nil)
 }
 
 enum RemoteDirectorCommand {
@@ -32,6 +36,9 @@ enum RemoteDirectorCommand {
     case commitStart(sessionID: String, startAtUnixMS: Int64)
     case prepareStop(sessionID: String, stopAtUnixMS: Int64)
     case pullVideos(jobID: String, policy: String, maxFiles: Int, uploadURL: String?)
+    case exportCameraParams
+    case applyCameraParams(profile: ManualLockProfile, dryRun: Bool)
+    case validateCameraParams
 }
 
 struct RemoteDirectorCommandEnvelope {
@@ -42,13 +49,14 @@ struct RemoteDirectorCommandEnvelope {
 struct RemoteDirectorCommandReply {
     let ok: Bool
     let detail: String
+    let payload: [String: Any]?
 
-    static func success(_ detail: String) -> RemoteDirectorCommandReply {
-        .init(ok: true, detail: detail)
+    static func success(_ detail: String, payload: [String: Any]? = nil) -> RemoteDirectorCommandReply {
+        .init(ok: true, detail: detail, payload: payload)
     }
 
-    static func failure(_ detail: String) -> RemoteDirectorCommandReply {
-        .init(ok: false, detail: detail)
+    static func failure(_ detail: String, payload: [String: Any]? = nil) -> RemoteDirectorCommandReply {
+        .init(ok: false, detail: detail, payload: payload)
     }
 }
 
@@ -165,6 +173,12 @@ final class RemoteDirectorClient {
 
     func transferDeviceID() -> String {
         deviceID
+    }
+
+    func manualSnapshotIdentity() -> ManualSnapshotDeviceIdentity {
+        ManualSnapshotDeviceIdentity(remoteDeviceID: deviceID,
+                                     remoteDeviceName: resolvedDeviceName(),
+                                     appVersion: appVersion)
     }
 
     func resolveUploadBaseURL(override uploadURLString: String?) -> URL? {
@@ -347,6 +361,12 @@ final class RemoteDirectorClient {
         if let fps = status.fps {
             message["fps"] = fps
         }
+        if let cameraParamsStatus = status.cameraParamsStatus {
+            message["camera_params_status"] = cameraParamsStatus
+        }
+        if let cameraParamsSummary = status.cameraParamsSummary {
+            message["camera_params_summary"] = cameraParamsSummary
+        }
 
         await sendJSONObject(message)
     }
@@ -495,6 +515,15 @@ final class RemoteDirectorClient {
                                   policy: policy,
                                   maxFiles: maxFiles,
                                   uploadURL: uploadURL)
+        case "export_camera_params":
+            command = .exportCameraParams
+        case "apply_camera_params":
+            guard let presetObject = payload["preset"],
+                  let profile = decodeManualLockProfile(from: presetObject) else { return nil }
+            let dryRun = boolValue(payload["dry_run"]) ?? false
+            command = .applyCameraParams(profile: profile, dryRun: dryRun)
+        case "validate_camera_params":
+            command = .validateCameraParams
         default:
             return nil
         }
@@ -503,13 +532,17 @@ final class RemoteDirectorClient {
     }
 
     private func sendAck(requestID: String, reply: RemoteDirectorCommandReply) async {
-        await sendJSONObject([
+        var object: [String: Any] = [
             "type": "ack",
             "device_id": deviceID,
             "request_id": requestID,
             "ok": reply.ok,
             "detail": reply.detail
-        ])
+        ]
+        if let payload = reply.payload {
+            object["payload"] = payload
+        }
+        await sendJSONObject(object)
     }
 
     private func sendJSONObject(_ object: [String: Any]) async {
@@ -603,6 +636,34 @@ final class RemoteDirectorClient {
             return Int(value.trimmingCharacters(in: .whitespacesAndNewlines))
         }
         return nil
+    }
+
+    private func boolValue(_ value: Any?) -> Bool? {
+        if let value = value as? Bool {
+            return value
+        }
+        if let value = value as? NSNumber {
+            return value.boolValue
+        }
+        if let value = value as? String {
+            switch value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+            case "true", "yes", "1":
+                return true
+            case "false", "no", "0":
+                return false
+            default:
+                return nil
+            }
+        }
+        return nil
+    }
+
+    private func decodeManualLockProfile(from object: Any) -> ManualLockProfile? {
+        guard JSONSerialization.isValidJSONObject(object),
+              let data = try? JSONSerialization.data(withJSONObject: object) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(ManualLockProfile.self, from: data)
     }
 
     private func resolvedDeviceName() -> String {
