@@ -56,6 +56,7 @@ struct StatusOverlayView: View {
 	}
 }
 
+#if DEBUG
 #Preview("Interrupted") {
     CameraView(camera: PreviewCameraModel(status: .interrupted), openLocalVideos: {})
 }
@@ -67,3 +68,4 @@ struct StatusOverlayView: View {
 #Preview("Unauthorized") {
     CameraView(camera: PreviewCameraModel(status: .unauthorized), openLocalVideos: {})
 }
+#endif

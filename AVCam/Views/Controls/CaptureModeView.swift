@@ -46,6 +46,8 @@ struct CaptureModeView<CameraModel: Camera>: View {
     }
 }
 
+#if DEBUG
 #Preview {
     CaptureModeView(camera: PreviewCameraModel(), direction: .constant(.left))
 }
+#endif

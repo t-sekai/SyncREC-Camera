@@ -21,9 +21,10 @@ struct LiveBadge: View {
     }
 }
 
+#if DEBUG
 #Preview {
     LiveBadge()
         .padding()
         .background(.black)
 }
-
+#endif

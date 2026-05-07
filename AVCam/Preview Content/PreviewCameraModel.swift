@@ -8,6 +8,7 @@ A Camera implementation to use when working with SwiftUI previews.
 import Foundation
 import SwiftUI
 
+#if DEBUG
 @Observable
 class PreviewCameraModel: Camera {
     
@@ -128,3 +129,4 @@ class PreviewCameraModel: Camera {
         localVideoURLs.remove(atOffsets: offsets)
     }
 }
+#endif

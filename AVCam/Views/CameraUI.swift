@@ -423,6 +423,8 @@ private struct ManualControlPanel<CameraModel: Camera>: View {
     }
 }
 
+#if DEBUG
 #Preview {
     CameraUI(camera: PreviewCameraModel(), openLocalVideos: {})
 }
+#endif

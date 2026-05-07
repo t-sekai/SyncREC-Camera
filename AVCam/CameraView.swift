@@ -76,9 +76,11 @@ private struct RigLowPowerView: View {
     }
 }
 
+#if DEBUG
 #Preview {
     CameraView(camera: PreviewCameraModel(), openLocalVideos: {})
 }
+#endif
 
 enum SwipeDirection {
     case left

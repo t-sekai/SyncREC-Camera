@@ -53,9 +53,11 @@ extension TimeInterval {
     }
 }
 
+#if DEBUG
 #Preview {
     RecordingTimeView(time: TimeInterval(floatLiteral: 500),
                       tentacleTimecode: "01:02:03",
                       recordingTimecode: "")
         .background(Image("video_mode"))
 }
+#endif

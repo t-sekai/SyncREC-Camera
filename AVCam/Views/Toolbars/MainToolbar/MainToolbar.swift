@@ -38,8 +38,10 @@ struct MainToolbar<CameraModel: Camera>: PlatformView {
     var height: CGFloat? { 80 }
 }
 
+#if DEBUG
 #Preview {
     Group {
         MainToolbar(camera: PreviewCameraModel(), openLocalVideos: {})
     }
 }
+#endif

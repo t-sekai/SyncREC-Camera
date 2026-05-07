@@ -39,9 +39,11 @@ struct CaptureButton<CameraModel: Camera>: View {
     }
 }
 
+#if DEBUG
 #Preview("Video") {
     CaptureButton(camera: PreviewCameraModel())
 }
+#endif
 
 private struct MovieCaptureButton: View {
     
