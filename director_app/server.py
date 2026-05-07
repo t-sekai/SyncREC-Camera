@@ -12,7 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .models import DeviceState, timestamp_now, to_float_or_none
+from .models import DeviceState, timestamp_now, to_float_or_none, to_int_or_none
 
 try:
     import websockets
@@ -339,6 +339,12 @@ class DirectorServer:
                     "armed": d.armed,
                     "battery": d.battery,
                     "storage_gb": d.storage_gb,
+                    "local_video_count": d.local_video_count,
+                    "uploaded_video_count": d.uploaded_video_count,
+                    "pending_upload_video_count": d.pending_upload_video_count,
+                    "local_video_bytes": d.local_video_bytes,
+                    "uploaded_video_bytes": d.uploaded_video_bytes,
+                    "pending_upload_video_bytes": d.pending_upload_video_bytes,
                     "tentacle_state": d.tentacle_state,
                     "timecode": d.timecode,
                     "fps": d.fps,
@@ -580,6 +586,18 @@ class DirectorServer:
             device.armed = bool(msg.get("armed", device.armed))
             device.battery = to_float_or_none(msg.get("battery"))
             device.storage_gb = to_float_or_none(msg.get("storage_gb"))
+            if "local_video_count" in msg:
+                device.local_video_count = to_int_or_none(msg.get("local_video_count"))
+            if "uploaded_video_count" in msg:
+                device.uploaded_video_count = to_int_or_none(msg.get("uploaded_video_count"))
+            if "pending_upload_video_count" in msg:
+                device.pending_upload_video_count = to_int_or_none(msg.get("pending_upload_video_count"))
+            if "local_video_bytes" in msg:
+                device.local_video_bytes = to_int_or_none(msg.get("local_video_bytes"))
+            if "uploaded_video_bytes" in msg:
+                device.uploaded_video_bytes = to_int_or_none(msg.get("uploaded_video_bytes"))
+            if "pending_upload_video_bytes" in msg:
+                device.pending_upload_video_bytes = to_int_or_none(msg.get("pending_upload_video_bytes"))
             if "tentacle_state" in msg:
                 device.tentacle_state = str(msg.get("tentacle_state") or "unknown")
             if "timecode" in msg:
@@ -612,6 +630,23 @@ class DirectorServer:
                     device.last_camera_params_status = "failed"
             if isinstance(payload, dict) and "current_state" in payload:
                 device.rig_state = str(payload.get("current_state") or "")
+            if isinstance(payload, dict):
+                if "battery" in payload:
+                    device.battery = to_float_or_none(payload.get("battery"))
+                if "storage_gb" in payload:
+                    device.storage_gb = to_float_or_none(payload.get("storage_gb"))
+                if "local_video_count" in payload:
+                    device.local_video_count = to_int_or_none(payload.get("local_video_count"))
+                if "uploaded_video_count" in payload:
+                    device.uploaded_video_count = to_int_or_none(payload.get("uploaded_video_count"))
+                if "pending_upload_video_count" in payload:
+                    device.pending_upload_video_count = to_int_or_none(payload.get("pending_upload_video_count"))
+                if "local_video_bytes" in payload:
+                    device.local_video_bytes = to_int_or_none(payload.get("local_video_bytes"))
+                if "uploaded_video_bytes" in payload:
+                    device.uploaded_video_bytes = to_int_or_none(payload.get("uploaded_video_bytes"))
+                if "pending_upload_video_bytes" in payload:
+                    device.pending_upload_video_bytes = to_int_or_none(payload.get("pending_upload_video_bytes"))
             waiter = self._ack_waiters.pop((device.device_id, request_id), None)
             if waiter and not waiter.done():
                 waiter.set_result(msg)

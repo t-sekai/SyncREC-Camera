@@ -6,7 +6,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from tkinter import BOTH, END, LEFT, RIGHT, TOP, X, Y, StringVar, Text, Tk, ttk
+from tkinter import BOTH, END, LEFT, RIGHT, TOP, X, Y, StringVar, Text, Tk, messagebox, ttk
 from typing import Any
 
 from .models import (
@@ -25,7 +25,7 @@ class DirectorGUI:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title("Multi-Cam Director")
-        self.root.geometry("1320x740")
+        self.root.geometry("1460x740")
 
         self.event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.server = DirectorServer(self.event_queue)
@@ -128,6 +128,12 @@ class DirectorGUI:
                    text="Pull Videos (Selected)",
                    command=self.pull_selected_device).pack(side=LEFT, padx=6)
         ttk.Button(transfer_actions,
+                   text="Delete Uploaded (Selected)",
+                   command=self.delete_uploaded_videos_selected).pack(side=LEFT, padx=3)
+        ttk.Button(transfer_actions,
+                   text="Force Delete (Selected)",
+                   command=self.force_delete_videos_selected).pack(side=LEFT, padx=3)
+        ttk.Button(transfer_actions,
                    text="Preview Photo Selected",
                    command=self.preview_photo_selected).pack(side=LEFT, padx=(12, 3))
         ttk.Button(transfer_actions,
@@ -162,6 +168,7 @@ class DirectorGUI:
             "recording",
             "battery",
             "storage",
+            "videos",
             "tentacle",
             "timecode",
             "rig",
@@ -185,6 +192,7 @@ class DirectorGUI:
             "recording": 80,
             "battery": 70,
             "storage": 75,
+            "videos": 150,
             "tentacle": 110,
             "timecode": 120,
             "rig": 120,
@@ -343,6 +351,16 @@ class DirectorGUI:
             pending = ", ".join(d["pending_acks"].values()) if d["pending_acks"] else ""
             battery = f"{d['battery']*100:.0f}%" if isinstance(d["battery"], float) else "-"
             storage = f"{d['storage_gb']:.1f} GB" if isinstance(d["storage_gb"], float) else "-"
+            local_videos = d.get("local_video_count")
+            uploaded_videos = d.get("uploaded_video_count")
+            pending_upload_videos = d.get("pending_upload_video_count")
+            if isinstance(local_videos, int):
+                if isinstance(uploaded_videos, int) and isinstance(pending_upload_videos, int):
+                    videos = f"{local_videos} ({uploaded_videos} up/{pending_upload_videos} pending)"
+                else:
+                    videos = str(local_videos)
+            else:
+                videos = "-"
             age = max(0.0, now - float(d["last_seen_unix"]))
             last_seen = f"{age:.1f}s"
             transfer_state = str(d.get("transfer_state") or "")
@@ -373,6 +391,7 @@ class DirectorGUI:
                     yes_no(d["recording"]),
                     battery,
                     storage,
+                    videos,
                     d["tentacle_state"],
                     timecode_text(d["timecode"], d["fps"]),
                     str(d.get("rig_state") or ""),
@@ -552,6 +571,30 @@ class DirectorGUI:
                                       max_files=max_files,
                                       policy="new_only",
                                       upload_url=self._upload_url_for_clients)
+
+    def delete_uploaded_videos_selected(self) -> None:
+        device_id = self._selected_device_id()
+        if not device_id:
+            self._append_log("Select one device row before deleting uploaded videos.")
+            return
+        if not messagebox.askyesno(
+            "Delete Uploaded Videos",
+            "Delete local videos on the selected iPhone that are marked uploaded? Videos not marked uploaded will remain.",
+        ):
+            return
+        self.server.send_command_to_device(device_id, "delete_uploaded_videos", {})
+
+    def force_delete_videos_selected(self) -> None:
+        device_id = self._selected_device_id()
+        if not device_id:
+            self._append_log("Select one device row before force-deleting videos.")
+            return
+        if not messagebox.askyesno(
+            "Force Delete Videos",
+            "Force-delete all local videos on the selected iPhone, including videos not marked uploaded?",
+        ):
+            return
+        self.server.send_command_to_device(device_id, "force_delete_videos", {})
 
     def preview_photo_selected(self) -> None:
         device_id = self._selected_device_id()

@@ -17,6 +17,12 @@ class DeviceState:
     armed: bool = False
     battery: float | None = None
     storage_gb: float | None = None
+    local_video_count: int | None = None
+    uploaded_video_count: int | None = None
+    pending_upload_video_count: int | None = None
+    local_video_bytes: int | None = None
+    uploaded_video_bytes: int | None = None
+    pending_upload_video_bytes: int | None = None
     tentacle_state: str = "unknown"
     timecode: str = ""
     fps: int | None = None
@@ -77,6 +83,16 @@ def to_float_or_none(value: Any) -> float | None:
         return None
     if isinstance(value, (int, float)):
         return float(value)
+    return None
+
+
+def to_int_or_none(value: Any) -> int | None:
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return max(0, value)
+    if isinstance(value, float):
+        return max(0, int(value))
     return None
 
 

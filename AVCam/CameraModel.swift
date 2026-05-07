@@ -1513,6 +1513,22 @@ final class CameraModel: Camera {
         let sidecarBytes: Int64
     }
 
+    private struct LocalVideoStorageSummary {
+        let totalCount: Int
+        let uploadedCount: Int
+        let pendingUploadCount: Int
+        let totalBytes: Int64
+        let uploadedBytes: Int64
+        let pendingUploadBytes: Int64
+
+        static let empty = LocalVideoStorageSummary(totalCount: 0,
+                                                    uploadedCount: 0,
+                                                    pendingUploadCount: 0,
+                                                    totalBytes: 0,
+                                                    uploadedBytes: 0,
+                                                    pendingUploadBytes: 0)
+    }
+
     private enum RemotePullVideosPolicy {
         case newOnly
         case all
@@ -1531,11 +1547,18 @@ final class CameraModel: Camera {
         updateRigStatusLines()
         let storageGB = FileManager.default.availableStorageGB
         let currentTimecode = currentTentacleTimecode()
+        let localVideoSummary = currentLocalVideoStorageSummary()
         return RemoteDirectorStatusPayload(
             recording: captureActivity.isRecording,
             armed: isRemoteArmed,
             battery: UIDevice.current.batteryLevelNormalized,
             storageGB: storageGB,
+            localVideoCount: localVideoSummary.totalCount,
+            uploadedVideoCount: localVideoSummary.uploadedCount,
+            pendingUploadVideoCount: localVideoSummary.pendingUploadCount,
+            localVideoBytes: localVideoSummary.totalBytes,
+            uploadedVideoBytes: localVideoSummary.uploadedBytes,
+            pendingUploadVideoBytes: localVideoSummary.pendingUploadBytes,
             tentacleState: tentacleConnectionState.remoteControlValue,
             timecode: currentTimecode?.formatted ?? displayedTentacleTimecode,
             fps: currentTimecode?.fps ?? displayedTentacleFPS,
@@ -1772,13 +1795,20 @@ final class CameraModel: Camera {
 
     private func rigStatusPayload(message: String) -> [String: Any] {
         updateRigStatusLines()
+        let localVideoSummary = currentLocalVideoStorageSummary()
         var payload: [String: Any] = [
             "current_state": rigState.rawValue,
             "device_id": remoteDirectorClient.transferDeviceID(),
             "device_name": directorDeviceName,
             "message": message,
             "guided_access_enabled": isRigKioskMode,
-            "director_connection": remoteDirectorClient.connectionStatus
+            "director_connection": remoteDirectorClient.connectionStatus,
+            "local_video_count": localVideoSummary.totalCount,
+            "uploaded_video_count": localVideoSummary.uploadedCount,
+            "pending_upload_video_count": localVideoSummary.pendingUploadCount,
+            "local_video_bytes": localVideoSummary.totalBytes,
+            "uploaded_video_bytes": localVideoSummary.uploadedBytes,
+            "pending_upload_video_bytes": localVideoSummary.pendingUploadBytes
         ]
         if let battery = UIDevice.current.batteryLevelNormalized {
             payload["battery"] = battery
@@ -1907,6 +1937,9 @@ final class CameraModel: Camera {
                 await self.runRemotePullVideosJob(request)
             }
             return rigReply(ok: true, message: "Accepted pull_videos job \(jobID).")
+
+        case .deleteLocalVideos(let policy):
+            return await deleteLocalVideosForRemote(policy: policy)
 
         case .capturePreviewPhoto(let batchID, let uploadURL, let longEdge, let jpegQuality, let uploadJitterSeconds, let attempt):
             guard !captureActivity.isRecording else {
@@ -2308,6 +2341,111 @@ final class CameraModel: Camera {
         return cleaned.isEmpty ? nil : String(cleaned.prefix(80))
     }
 
+    private func currentLocalVideoStorageSummary() -> LocalVideoStorageSummary {
+        guard !localVideoURLs.isEmpty else { return .empty }
+        let uploadedFingerprints = loadUploadedVideoFingerprints()
+        var totalCount = 0
+        var uploadedCount = 0
+        var totalBytes: Int64 = 0
+        var uploadedBytes: Int64 = 0
+
+        for item in localVideoURLs.compactMap(buildRemoteTransferItem(forVideoURL:)) {
+            let itemBytes = item.videoBytes + item.sidecarBytes
+            totalCount += 1
+            totalBytes += itemBytes
+            if uploadedFingerprints.contains(item.fingerprint) {
+                uploadedCount += 1
+                uploadedBytes += itemBytes
+            }
+        }
+
+        return LocalVideoStorageSummary(totalCount: totalCount,
+                                        uploadedCount: uploadedCount,
+                                        pendingUploadCount: max(0, totalCount - uploadedCount),
+                                        totalBytes: totalBytes,
+                                        uploadedBytes: uploadedBytes,
+                                        pendingUploadBytes: max(0, totalBytes - uploadedBytes))
+    }
+
+    private func deleteLocalVideosForRemote(policy: RemoteLocalVideoDeletePolicy) async -> RemoteDirectorCommandReply {
+        guard !captureActivity.isRecording, !(await isCapturePipelineRecording()) else {
+            return rigReply(ok: false,
+                            message: "Refused to delete local videos while recording.",
+                            error: "recording_active")
+        }
+
+        if let remotePullVideosTask, !remotePullVideosTask.isCancelled {
+            return rigReply(ok: false,
+                            message: "Refused to delete local videos while a pull_videos transfer is running.",
+                            error: "busy")
+        }
+
+        localVideoURLs = await localVideoStore.loadStoredVideos()
+        let uploadedFingerprints = loadUploadedVideoFingerprints()
+        let allItems = localVideoURLs.compactMap(buildRemoteTransferItem(forVideoURL:))
+
+        let itemsToDelete: [RemoteTransferItem]
+        switch policy {
+        case .uploadedOnly:
+            itemsToDelete = allItems.filter { uploadedFingerprints.contains($0.fingerprint) }
+        case .forceAll:
+            itemsToDelete = allItems
+        }
+
+        let urlsToDelete = itemsToDelete.map(\.videoURL)
+        localVideoURLs = await localVideoStore.delete(urls: urlsToDelete)
+
+        let remainingPaths = Set(localVideoURLs.map(canonicalLocalVideoPath(for:)))
+        let deletedItems = itemsToDelete.filter { !remainingPaths.contains(canonicalLocalVideoPath(for: $0.videoURL)) }
+        let deletedFingerprints = Set(deletedItems.map(\.fingerprint))
+
+        var remainingFingerprints = uploadedFingerprints
+        remainingFingerprints.subtract(deletedFingerprints)
+        persistUploadedVideoFingerprints(remainingFingerprints)
+
+        let remainingSummary = currentLocalVideoStorageSummary()
+        remoteDirectorClient.sendStatusSoon()
+
+        let skippedUnuploadedCount = max(0, allItems.count - itemsToDelete.count)
+        let failedDeleteCount = max(0, itemsToDelete.count - deletedItems.count)
+        var message: String
+        switch policy {
+        case .uploadedOnly:
+            message = "Deleted \(deletedItems.count) uploaded local video(s); skipped \(skippedUnuploadedCount) not yet uploaded."
+        case .forceAll:
+            message = "Force-deleted \(deletedItems.count) local video(s)."
+        }
+        if failedDeleteCount > 0 {
+            message += " \(failedDeleteCount) could not be removed."
+        }
+
+        let deletePolicyValue: String
+        switch policy {
+        case .uploadedOnly:
+            deletePolicyValue = "uploaded_only"
+        case .forceAll:
+            deletePolicyValue = "force_all"
+        }
+
+        let ok = failedDeleteCount == 0
+        return rigReply(ok: ok,
+                        message: message,
+                        error: ok ? nil : "delete_failed",
+                        extra: [
+                            "deleted_video_count": deletedItems.count,
+                            "skipped_unuploaded_video_count": skippedUnuploadedCount,
+                            "failed_delete_video_count": failedDeleteCount,
+                            "remaining_video_count": remainingSummary.totalCount,
+                            "remaining_uploaded_video_count": remainingSummary.uploadedCount,
+                            "remaining_pending_upload_video_count": remainingSummary.pendingUploadCount,
+                            "delete_policy": deletePolicyValue
+                        ])
+    }
+
+    private func canonicalLocalVideoPath(for url: URL) -> String {
+        url.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+
     private func runRemotePullVideosJob(_ request: RemotePullVideosRequest) async {
         remoteDirectorClient.sendTransferUpdate(jobID: request.jobID,
                                                 state: "starting",
@@ -2321,6 +2459,7 @@ final class CameraModel: Camera {
         }
 
         let allVideos = await localVideoStore.loadStoredVideos()
+        localVideoURLs = allVideos
         var uploadedFingerprints = loadUploadedVideoFingerprints()
 
         var transferItems = allVideos.compactMap(buildRemoteTransferItem(forVideoURL:))
@@ -2377,6 +2516,7 @@ final class CameraModel: Camera {
                 sentBytes += uploadedBytes
                 uploadedFingerprints.insert(item.fingerprint)
                 persistUploadedVideoFingerprints(uploadedFingerprints)
+                remoteDirectorClient.sendStatusSoon()
 
                 remoteDirectorClient.sendTransferUpdate(jobID: request.jobID,
                                                         state: "progress",
@@ -2397,6 +2537,7 @@ final class CameraModel: Camera {
         }
 
         persistUploadedVideoFingerprints(uploadedFingerprints)
+        remoteDirectorClient.sendStatusSoon()
         remoteDirectorClient.sendTransferUpdate(jobID: request.jobID,
                                                 state: "done",
                                                 detail: "Uploaded \(sentFiles) video(s).",

@@ -13,6 +13,12 @@ struct RemoteDirectorStatusPayload {
     let armed: Bool
     let battery: Double?
     let storageGB: Double?
+    let localVideoCount: Int
+    let uploadedVideoCount: Int
+    let pendingUploadVideoCount: Int
+    let localVideoBytes: Int64
+    let uploadedVideoBytes: Int64
+    let pendingUploadVideoBytes: Int64
     let tentacleState: String
     let timecode: String
     let fps: Int?
@@ -25,6 +31,12 @@ struct RemoteDirectorStatusPayload {
                                                    armed: false,
                                                    battery: nil,
                                                    storageGB: nil,
+                                                   localVideoCount: 0,
+                                                   uploadedVideoCount: 0,
+                                                   pendingUploadVideoCount: 0,
+                                                   localVideoBytes: 0,
+                                                   uploadedVideoBytes: 0,
+                                                   pendingUploadVideoBytes: 0,
                                                    tentacleState: "unknown",
                                                    timecode: "",
                                                    fps: nil,
@@ -46,6 +58,7 @@ enum RemoteDirectorCommand {
     case getStatus
     case setBrightness(Double)
     case pullVideos(jobID: String, policy: String, maxFiles: Int, uploadURL: String?)
+    case deleteLocalVideos(policy: RemoteLocalVideoDeletePolicy)
     case capturePreviewPhoto(batchID: String,
                              uploadURL: String?,
                              longEdge: Int,
@@ -55,6 +68,11 @@ enum RemoteDirectorCommand {
     case exportCameraParams
     case applyCameraParams(profile: ManualLockProfile, dryRun: Bool)
     case validateCameraParams
+}
+
+enum RemoteLocalVideoDeletePolicy {
+    case uploadedOnly
+    case forceAll
 }
 
 struct RemoteDirectorCommandEnvelope {
@@ -429,6 +447,12 @@ final class RemoteDirectorClient {
         if let storageGB = status.storageGB {
             message["storage_gb"] = storageGB
         }
+        message["local_video_count"] = status.localVideoCount
+        message["uploaded_video_count"] = status.uploadedVideoCount
+        message["pending_upload_video_count"] = status.pendingUploadVideoCount
+        message["local_video_bytes"] = status.localVideoBytes
+        message["uploaded_video_bytes"] = status.uploadedVideoBytes
+        message["pending_upload_video_bytes"] = status.pendingUploadVideoBytes
         if let fps = status.fps {
             message["fps"] = fps
         }
@@ -604,6 +628,10 @@ final class RemoteDirectorClient {
                                   policy: policy,
                                   maxFiles: maxFiles,
                                   uploadURL: uploadURL)
+        case "delete_uploaded_videos", "delete_uploaded_local_videos", "cleanup_uploaded_videos":
+            command = .deleteLocalVideos(policy: .uploadedOnly)
+        case "force_delete_videos", "force_delete_local_videos", "delete_all_videos":
+            command = .deleteLocalVideos(policy: .forceAll)
         case "capture_preview_photo":
             let batchID = (payload["batch_id"] as? String).flatMap {
                 let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
