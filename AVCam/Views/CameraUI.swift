@@ -34,8 +34,9 @@ struct CameraUI<CameraModel: Camera>: PlatformView {
         }
         .overlay(alignment: .topLeading) {
             VStack(alignment: .leading, spacing: 8) {
+                VideoCaptureModePicker(camera: camera)
                 ManualControlChipRow(camera: camera,
-                                     controls: [.iso, .whiteBalance, .fps],
+                                     controls: [.iso, .whiteBalance],
                                      selectedControl: $selectedManualControl)
                 if let selectedManualControl, selectedManualControl.isTopControl {
                     ManualControlPanel(camera: camera, control: selectedManualControl)
@@ -125,6 +126,59 @@ private enum ManualControlType: Hashable {
         case .shutter, .tint, .focus:
             false
         }
+    }
+}
+
+private struct VideoCaptureModePicker<CameraModel: Camera>: View {
+    let camera: CameraModel
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Menu {
+                ForEach(VideoCaptureModePreset.allCases) { preset in
+                    Button {
+                        camera.selectedVideoCaptureMode = preset
+                    } label: {
+                        Text(preset.displayName)
+                    }
+                    .disabled(!isSupported(preset) || camera.isManualLockActive || camera.captureActivity.isRecording)
+                }
+            } label: {
+                Label(camera.selectedVideoCaptureMode.displayName, systemImage: "video.badge.gearshape")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.white)
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .background(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .fill(Color.black.opacity(0.5))
+                    )
+            }
+            .disabled(camera.isManualLockActive || camera.captureActivity.isRecording)
+
+            Text(actualText)
+                .font(.caption2.monospacedDigit())
+                .foregroundStyle(Color.white.opacity(0.9))
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+        }
+        .padding(10)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+    }
+
+    private var actualText: String {
+        let status = camera.videoCaptureModeStatus
+        guard let width = status.actualWidth,
+              let height = status.actualHeight,
+              let fps = status.actualFPS else {
+            return status.detail ?? "Actual: --"
+        }
+        let fpsText = String(format: "%.0f", fps)
+        return "Actual \(width)x\(height) \(fpsText) fps"
+    }
+
+    private func isSupported(_ preset: VideoCaptureModePreset) -> Bool {
+        camera.videoCaptureModeSupport.first(where: { $0.preset == preset })?.isSupported ?? false
     }
 }
 

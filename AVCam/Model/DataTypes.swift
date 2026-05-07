@@ -269,6 +269,104 @@ struct ManualCameraControlSnapshot: Sendable, Equatable {
                                                           capabilities: .unavailable)
 }
 
+enum VideoCaptureModePreset: String, Identifiable, CaseIterable, Codable, Sendable, Equatable {
+    case hd720p30
+    case hd1080p30
+    case hd1080p60
+    case uhd4k30
+    case uhd4k60
+
+    var id: Self { self }
+
+    var width: Int {
+        switch self {
+        case .hd720p30:
+            return 1280
+        case .hd1080p30, .hd1080p60:
+            return 1920
+        case .uhd4k30, .uhd4k60:
+            return 3840
+        }
+    }
+
+    var height: Int {
+        switch self {
+        case .hd720p30:
+            return 720
+        case .hd1080p30, .hd1080p60:
+            return 1080
+        case .uhd4k30, .uhd4k60:
+            return 2160
+        }
+    }
+
+    var fps: Double {
+        switch self {
+        case .hd720p30, .hd1080p30, .uhd4k30:
+            return 30
+        case .hd1080p60, .uhd4k60:
+            return 60
+        }
+    }
+
+    var displayName: String {
+        switch self {
+        case .hd720p30:
+            return "720p 30"
+        case .hd1080p30:
+            return "1080p 30"
+        case .hd1080p60:
+            return "1080p 60"
+        case .uhd4k30:
+            return "4K 30"
+        case .uhd4k60:
+            return "4K 60"
+        }
+    }
+
+    var summary: String {
+        "\(width)x\(height) @ \(Int(fps.rounded())) fps"
+    }
+}
+
+struct VideoCaptureModeSupport: Sendable, Equatable {
+    var preset: VideoCaptureModePreset
+    var isSupported: Bool
+    var reason: String?
+}
+
+enum VideoCaptureModeApplyClassification: String, Codable, Sendable, Equatable {
+    case exactModeApplied = "exact_mode_applied"
+    case adjustedCompatibleMode = "adjusted_compatible_mode"
+    case unsupportedMode = "unsupported_mode"
+    case failedApply = "failed_apply"
+}
+
+struct VideoCaptureModeStatus: Codable, Sendable, Equatable {
+    var selectedPreset: VideoCaptureModePreset
+    var actualPreset: VideoCaptureModePreset?
+    var actualWidth: Int?
+    var actualHeight: Int?
+    var actualFPS: Double?
+    var supportedPresets: [VideoCaptureModePreset]
+    var detail: String?
+
+    static let unavailable = VideoCaptureModeStatus(selectedPreset: .hd1080p30,
+                                                    actualPreset: nil,
+                                                    actualWidth: nil,
+                                                    actualHeight: nil,
+                                                    actualFPS: nil,
+                                                    supportedPresets: [],
+                                                    detail: "Capture service unavailable.")
+}
+
+struct VideoCaptureModeApplyReport: Codable, Sendable, Equatable {
+    var requestedPreset: VideoCaptureModePreset
+    var classification: VideoCaptureModeApplyClassification
+    var detail: String
+    var status: VideoCaptureModeStatus
+}
+
 // MARK: - Deterministic manual lock profiles
 
 enum ManualProfileDriftStatus: String, Codable, Sendable, Equatable {
@@ -451,6 +549,7 @@ struct ManualCameraIntrinsicsSnapshot: Codable, Sendable, Equatable {
 }
 
 struct ManualCameraDesiredSettings: Codable, Sendable, Equatable {
+    var captureModePreset: VideoCaptureModePreset? = nil
     var format: ManualCameraFormatDescriptor?
     var selectedFPS: Double?
     var activeVideoMinFrameDurationSeconds: Double?
@@ -475,6 +574,9 @@ struct ManualCameraActualSnapshot: Codable, Sendable, Equatable {
     var reason: String
     var identity: ManualSnapshotDeviceIdentity
     var device: ManualCaptureDeviceDescriptor?
+    var selectedCaptureModePreset: VideoCaptureModePreset? = nil
+    var actualCaptureModePreset: VideoCaptureModePreset? = nil
+    var supportedCaptureModePresets: [VideoCaptureModePreset]? = nil
     var activeFormat: ManualCameraFormatDescriptor?
     var actualFPSMinFrameDurationSeconds: Double?
     var actualFPSMaxFrameDurationSeconds: Double?

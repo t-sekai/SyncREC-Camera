@@ -108,6 +108,7 @@ actor CaptureService {
 
     // The most recently applied manual control state.
     private var manualControlState = ManualCameraControlState.default
+    private var selectedVideoCaptureMode = VideoCaptureModePreset.hd1080p30
     // The active deterministic profile, if installed. When present, legacy manual controls must not unlock hardware.
     private var activeManualLockProfile: ManualLockProfile?
     private var lastManualLockApplyReport: ManualApplyReport?
@@ -311,6 +312,86 @@ actor CaptureService {
         refreshUnlockedManualControlValues(&resolvedState, device: device)
         manualControlState = resolvedState
         return ManualCameraControlSnapshot(state: resolvedState, capabilities: capabilities)
+    }
+
+    func currentVideoCaptureModeStatus() -> VideoCaptureModeStatus {
+        guard isSetUp else {
+            return VideoCaptureModeStatus.unavailable
+        }
+        return videoCaptureModeStatus(for: currentDevice)
+    }
+
+    func videoCaptureModeSupport() -> [VideoCaptureModeSupport] {
+        guard isSetUp else {
+            return VideoCaptureModePreset.allCases.map {
+                VideoCaptureModeSupport(preset: $0,
+                                        isSupported: false,
+                                        reason: "Capture service unavailable.")
+            }
+        }
+        return videoCaptureModeSupport(for: currentDevice)
+    }
+
+    func applyVideoCaptureModePreset(_ preset: VideoCaptureModePreset,
+                                     reason: String) async -> VideoCaptureModeApplyReport {
+        guard isSetUp else {
+            let status = VideoCaptureModeStatus.unavailable
+            return VideoCaptureModeApplyReport(requestedPreset: preset,
+                                               classification: .failedApply,
+                                               detail: "Capture service unavailable.",
+                                               status: status)
+        }
+        guard !captureActivity.isRecording else {
+            let status = videoCaptureModeStatus(for: currentDevice)
+            return VideoCaptureModeApplyReport(requestedPreset: preset,
+                                               classification: .failedApply,
+                                               detail: "Refused to change capture mode while recording.",
+                                               status: status)
+        }
+        if activeManualLockProfile?.policy.ownsHDRAndFormat == true {
+            let status = videoCaptureModeStatus(for: currentDevice)
+            return VideoCaptureModeApplyReport(requestedPreset: preset,
+                                               classification: .failedApply,
+                                               detail: "Manual lock profile owns camera format/FPS.",
+                                               status: status)
+        }
+
+        let device = currentDevice
+        guard let format = matchingVideoCaptureModeFormat(for: preset,
+                                                          device: device,
+                                                          preferredDescriptor: nil,
+                                                          preferredFieldOfView: device.activeFormat.videoFieldOfView) else {
+            selectedVideoCaptureMode = preset
+            let status = videoCaptureModeStatus(for: device,
+                                                detail: "\(preset.displayName) is unsupported on this camera.")
+            return VideoCaptureModeApplyReport(requestedPreset: preset,
+                                               classification: .unsupportedMode,
+                                               detail: "\(preset.displayName) is unsupported on this camera.",
+                                               status: status)
+        }
+
+        do {
+            try applyVideoCaptureModePreset(preset, format: format, device: device)
+        } catch {
+            selectedVideoCaptureMode = preset
+            let status = videoCaptureModeStatus(for: device,
+                                                detail: error.localizedDescription)
+            return VideoCaptureModeApplyReport(requestedPreset: preset,
+                                               classification: .failedApply,
+                                               detail: error.localizedDescription,
+                                               status: status)
+        }
+
+        selectedVideoCaptureMode = preset
+        updateCaptureCapabilities()
+        await afterPotentialReconfiguration(reason: reason)
+
+        let status = videoCaptureModeStatus(for: device)
+        let exact = status.actualPreset == preset && actualFPSMatchesPreset(status.actualFPS, preset: preset)
+        return VideoCaptureModeApplyReport(requestedPreset: preset,
+                                           classification: exact ? .exactModeApplied : .failedApply,
+                                           detail: exact ? "Applied \(preset.displayName)." : "Applied format readback did not match \(preset.displayName).",
+                                           status: status)
     }
 
     func clearManualLockProfile(reason: String) {
@@ -539,8 +620,26 @@ actor CaptureService {
         var reports = [ManualParameterReport]()
         let desired = profile.desired
         let device = currentDevice
+        let requestedFormat = requestedFormatForDesiredSettings(desired, device: device)
 
-        if let descriptor = desired.format {
+        if let preset = desired.captureModePreset {
+            let supported = requestedFormat != nil
+            reports.append(ManualParameterReport(parameter: "capture_mode",
+                                                 status: supported ? .exact : .incompatible,
+                                                 requested: preset.rawValue,
+                                                 actual: snapshot.actualCaptureModePreset?.rawValue,
+                                                 detail: supported ? "\(preset.displayName) is supported." : "\(preset.displayName) is unsupported on this device."))
+            if let fps = desired.selectedFPS,
+               !nearlyEqual(fps, preset.fps, relativeTolerance: 0.0005, absoluteTolerance: 0.001) {
+                reports.append(ManualParameterReport(parameter: "fps",
+                                                     status: .incompatible,
+                                                     requested: String(format: "%.6f", fps),
+                                                     actual: String(format: "%.6f", preset.fps),
+                                                     detail: "Profile FPS conflicts with capture mode preset."))
+            }
+        }
+
+        if desired.captureModePreset == nil, let descriptor = desired.format {
             if matchingFormat(for: descriptor, fps: desired.selectedFPS, device: device) != nil {
                 reports.append(ManualParameterReport(parameter: "active_format",
                                                      status: .exact,
@@ -557,7 +656,7 @@ actor CaptureService {
         }
 
         if let fps = desired.selectedFPS {
-            let ranges = (desired.format.flatMap { matchingFormat(for: $0, fps: nil, device: device) } ?? device.activeFormat)
+            let ranges = (requestedFormat ?? device.activeFormat)
                 .videoSupportedFrameRateRanges
             let supported = ranges.contains { $0.minFrameRate <= fps && fps <= $0.maxFrameRate }
             reports.append(ManualParameterReport(parameter: "fps",
@@ -568,7 +667,7 @@ actor CaptureService {
         }
 
         if let iso = desired.iso {
-            let format = desired.format.flatMap { matchingFormat(for: $0, fps: desired.selectedFPS, device: device) } ?? device.activeFormat
+            let format = requestedFormat ?? device.activeFormat
             let supported = iso >= format.minISO && iso <= format.maxISO
             reports.append(ManualParameterReport(parameter: "iso",
                                                  status: supported ? .exact : .incompatible,
@@ -578,7 +677,7 @@ actor CaptureService {
         }
 
         if let exposureDuration = desired.exposureDurationSeconds {
-            let format = desired.format.flatMap { matchingFormat(for: $0, fps: desired.selectedFPS, device: device) } ?? device.activeFormat
+            let format = requestedFormat ?? device.activeFormat
             let minExposure = finiteSeconds(from: format.minExposureDuration) ?? 0
             let maxExposure = finiteSeconds(from: format.maxExposureDuration) ?? .greatestFiniteMagnitude
             let supported = exposureDuration >= minExposure && exposureDuration <= maxExposure
@@ -609,7 +708,7 @@ actor CaptureService {
         }
 
         if let zoom = desired.zoomFactor {
-            let format = desired.format.flatMap { matchingFormat(for: $0, fps: desired.selectedFPS, device: device) } ?? device.activeFormat
+            let format = requestedFormat ?? device.activeFormat
             let supported = zoom >= 1.0 && zoom <= format.videoMaxZoomFactor
             reports.append(ManualParameterReport(parameter: "zoom_factor",
                                                  status: supported ? .exact : .incompatible,
@@ -653,7 +752,23 @@ actor CaptureService {
         let device = currentDevice
 
         var selectedFormat: AVCaptureDevice.Format?
-        if let descriptor = desired.format {
+        if let preset = desired.captureModePreset {
+            guard let match = matchingVideoCaptureModeFormat(for: preset,
+                                                             device: device,
+                                                             preferredDescriptor: desired.format,
+                                                             preferredFieldOfView: desired.format?.videoFieldOfViewDegrees) else {
+                throw NSError(domain: "ManualLockProfile",
+                              code: 99,
+                              userInfo: [NSLocalizedDescriptionKey: "\(preset.displayName) is unsupported on this device."])
+            }
+            if let fps = desired.selectedFPS,
+               !nearlyEqual(fps, preset.fps, relativeTolerance: 0.0005, absoluteTolerance: 0.001) {
+                throw NSError(domain: "ManualLockProfile",
+                              code: 98,
+                              userInfo: [NSLocalizedDescriptionKey: "Profile FPS \(fps) conflicts with capture mode \(preset.rawValue)."])
+            }
+            selectedFormat = match
+        } else if let descriptor = desired.format {
             guard let match = matchingFormat(for: descriptor, fps: desired.selectedFPS, device: device) else {
                 throw NSError(domain: "ManualLockProfile",
                               code: 100,
@@ -676,7 +791,20 @@ actor CaptureService {
                                                  detail: "Set activeFormat by deterministic descriptor."))
         }
 
-        if let fps = desired.selectedFPS {
+        if let preset = desired.captureModePreset {
+            guard let duration = fixedFrameDuration(forFPS: preset.fps, format: device.activeFormat) else {
+                throw NSError(domain: "ManualLockProfile",
+                              code: 97,
+                              userInfo: [NSLocalizedDescriptionKey: "Requested capture mode \(preset.rawValue) is unsupported by the active format."])
+            }
+            device.activeVideoMinFrameDuration = duration
+            device.activeVideoMaxFrameDuration = duration
+            selectedVideoCaptureMode = preset
+            reports.append(ManualParameterReport(parameter: "capture_mode",
+                                                 status: .applied,
+                                                 requested: preset.rawValue,
+                                                 detail: "Set activeFormat and fixed frame duration for \(preset.displayName)."))
+        } else if let fps = desired.selectedFPS {
             guard let duration = supportedFrameDuration(forFPS: fps, device: device) else {
                 throw NSError(domain: "ManualLockProfile",
                               code: 101,
@@ -912,6 +1040,111 @@ actor CaptureService {
         return minFPS...maxFPS
     }
 
+    private func videoCaptureModeSupport(for device: AVCaptureDevice) -> [VideoCaptureModeSupport] {
+        VideoCaptureModePreset.allCases.map { preset in
+            if matchingVideoCaptureModeFormat(for: preset,
+                                              device: device,
+                                              preferredDescriptor: nil,
+                                              preferredFieldOfView: device.activeFormat.videoFieldOfView) != nil {
+                return VideoCaptureModeSupport(preset: preset, isSupported: true, reason: nil)
+            }
+            return VideoCaptureModeSupport(preset: preset,
+                                           isSupported: false,
+                                           reason: "No compatible \(preset.summary) format.")
+        }
+    }
+
+    private func videoCaptureModeStatus(for device: AVCaptureDevice,
+                                        detail: String? = nil) -> VideoCaptureModeStatus {
+        let dimensions = CMVideoFormatDescriptionGetDimensions(device.activeFormat.formatDescription)
+        let actualFPS = actualFPS(for: device)
+        let actualPreset = presetMatching(width: Int(dimensions.width),
+                                          height: Int(dimensions.height),
+                                          fps: actualFPS)
+        let supported = videoCaptureModeSupport(for: device)
+            .filter(\.isSupported)
+            .map(\.preset)
+        return VideoCaptureModeStatus(selectedPreset: selectedVideoCaptureMode,
+                                      actualPreset: actualPreset,
+                                      actualWidth: Int(dimensions.width),
+                                      actualHeight: Int(dimensions.height),
+                                      actualFPS: actualFPS,
+                                      supportedPresets: supported,
+                                      detail: detail)
+    }
+
+    private func actualFPS(for device: AVCaptureDevice) -> Double? {
+        if let minDuration = finiteSeconds(from: device.activeVideoMinFrameDuration),
+           let maxDuration = finiteSeconds(from: device.activeVideoMaxFrameDuration),
+           nearlyEqual(minDuration, maxDuration, relativeTolerance: 0.0005, absoluteTolerance: 0.000_001) {
+            return 1.0 / minDuration
+        }
+        if let minDuration = finiteSeconds(from: device.activeVideoMinFrameDuration) {
+            return 1.0 / minDuration
+        }
+        return nil
+    }
+
+    private func presetMatching(width: Int,
+                                height: Int,
+                                fps: Double?) -> VideoCaptureModePreset? {
+        guard let fps else { return nil }
+        return VideoCaptureModePreset.allCases.first {
+            $0.width == width && $0.height == height && actualFPSMatchesPreset(fps, preset: $0)
+        }
+    }
+
+    private func actualFPSMatchesPreset(_ actualFPS: Double?,
+                                        preset: VideoCaptureModePreset) -> Bool {
+        guard let actualFPS else { return false }
+        return abs(actualFPS - preset.fps) <= 0.25
+    }
+
+    private func fixedFrameDuration(forFPS fps: Double,
+                                    format: AVCaptureDevice.Format) -> CMTime? {
+        guard fps.isFinite, fps > 0 else { return nil }
+        let tolerance = max(0.0001, fps * 0.00001)
+        guard format.videoSupportedFrameRateRanges.contains(where: {
+            fps >= $0.minFrameRate - tolerance && fps <= $0.maxFrameRate + tolerance
+        }) else {
+            return nil
+        }
+        let rounded = fps.rounded()
+        if abs(fps - rounded) <= 0.0001 {
+            return CMTime(value: 1, timescale: CMTimeScale(max(1, Int32(rounded))))
+        }
+        return CMTime(seconds: 1.0 / fps, preferredTimescale: 600_000)
+    }
+
+    private func applyVideoCaptureModePreset(_ preset: VideoCaptureModePreset,
+                                             format: AVCaptureDevice.Format,
+                                             device: AVCaptureDevice) throws {
+        guard let duration = fixedFrameDuration(forFPS: preset.fps, format: format) else {
+            throw NSError(domain: "VideoCaptureMode",
+                          code: 200,
+                          userInfo: [NSLocalizedDescriptionKey: "\(preset.displayName) is unsupported by the selected active format."])
+        }
+
+        captureSession.beginConfiguration()
+        if captureSession.canSetSessionPreset(.inputPriority) {
+            captureSession.sessionPreset = .inputPriority
+        }
+
+        do {
+            try device.lockForConfiguration()
+            if device.activeFormat != format {
+                device.activeFormat = format
+            }
+            device.activeVideoMinFrameDuration = duration
+            device.activeVideoMaxFrameDuration = duration
+            device.unlockForConfiguration()
+            captureSession.commitConfiguration()
+        } catch {
+            captureSession.commitConfiguration()
+            throw error
+        }
+    }
+
     private func clampedState(_ state: ManualCameraControlState,
                               capabilities: ManualCameraControlCapabilities) -> ManualCameraControlState {
         var clamped = state
@@ -1130,6 +1363,7 @@ actor CaptureService {
         }
 
         let format = device.activeFormat
+        let modeStatus = videoCaptureModeStatus(for: device)
         let whiteBalance = device.temperatureAndTintValues(for: device.deviceWhiteBalanceGains)
         let intrinsics: ManualCameraIntrinsicsSnapshot
         if let latestCameraIntrinsics {
@@ -1160,6 +1394,9 @@ actor CaptureService {
                 isGeometricDistortionCorrectionSupported: device.isGeometricDistortionCorrectionSupported,
                 isGeometricDistortionCorrectionEnabled: device.isGeometricDistortionCorrectionEnabled
             ),
+            selectedCaptureModePreset: modeStatus.selectedPreset,
+            actualCaptureModePreset: modeStatus.actualPreset,
+            supportedCaptureModePresets: modeStatus.supportedPresets,
             activeFormat: formatDescriptor(for: format, device: device),
             actualFPSMinFrameDurationSeconds: finiteSeconds(from: device.activeVideoMinFrameDuration),
             actualFPSMaxFrameDurationSeconds: finiteSeconds(from: device.activeVideoMaxFrameDuration),
@@ -1197,7 +1434,17 @@ actor CaptureService {
         let desired = profile.desired
         var reports = [ManualParameterReport]()
 
-        if let requested = desired.format {
+        if let requestedPreset = desired.captureModePreset {
+            let actualPreset = actual.actualCaptureModePreset
+            let exactMode = actualPreset == requestedPreset
+            reports.append(ManualParameterReport(parameter: "capture_mode",
+                                                 status: exactMode ? .exact : .incompatible,
+                                                 requested: requestedPreset.rawValue,
+                                                 actual: actualPreset?.rawValue,
+                                                 detail: exactMode ? nil : "Actual capture mode differs from requested preset."))
+        }
+
+        if desired.captureModePreset == nil, let requested = desired.format {
             let status: ManualParameterStatus
             let detail: String?
             if let actualFormat = actual.activeFormat,
@@ -1357,6 +1604,20 @@ actor CaptureService {
         _ = await installManualLockProfile(profile, reason: "\(reason)_auto_reapply", requestID: nil, dryRun: false)
     }
 
+    private func requestedFormatForDesiredSettings(_ desired: ManualCameraDesiredSettings,
+                                                   device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+        if let preset = desired.captureModePreset {
+            return matchingVideoCaptureModeFormat(for: preset,
+                                                  device: device,
+                                                  preferredDescriptor: desired.format,
+                                                  preferredFieldOfView: desired.format?.videoFieldOfViewDegrees)
+        }
+        if let descriptor = desired.format {
+            return matchingFormat(for: descriptor, fps: desired.selectedFPS, device: device)
+        }
+        return nil
+    }
+
     private func matchingFormat(for descriptor: ManualCameraFormatDescriptor,
                                 fps: Double?,
                                 device: AVCaptureDevice) -> AVCaptureDevice.Format? {
@@ -1389,6 +1650,90 @@ actor CaptureService {
             let rightMax = $1.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
             return leftMax > rightMax
         }.first
+    }
+
+    private func matchingVideoCaptureModeFormat(for preset: VideoCaptureModePreset,
+                                                device: AVCaptureDevice,
+                                                preferredDescriptor: ManualCameraFormatDescriptor?,
+                                                preferredFieldOfView: Float?) -> AVCaptureDevice.Format? {
+        let targetFPS = preset.fps
+        let preferredSubtype = preferredDescriptor?.mediaSubTypeRawValue
+            ?? device.activeFormat.formatDescription.mediaSubType.rawValue
+        let preferredBinned = preferredDescriptor?.isVideoBinned
+        let preferTenBit = preferredDescriptor?.isTenBit ?? isHDRVideoEnabled
+        let fov = preferredFieldOfView ?? preferredDescriptor?.videoFieldOfViewDegrees ?? device.activeFormat.videoFieldOfView
+
+        let matches = device.formats.filter { format in
+            guard CMFormatDescriptionGetMediaType(format.formatDescription) == kCMMediaType_Video else {
+                return false
+            }
+            let dimensions = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            guard Int(dimensions.width) == preset.width,
+                  Int(dimensions.height) == preset.height else {
+                return false
+            }
+            guard isCompatibleVideoSubType(format.formatDescription.mediaSubType.rawValue) else {
+                return false
+            }
+            return format.videoSupportedFrameRateRanges.contains {
+                targetFPS >= $0.minFrameRate - 0.001 && targetFPS <= $0.maxFrameRate + 0.001
+            }
+        }
+
+        return matches.sorted { left, right in
+            let leftTenBitPenalty = tenBitPenalty(format: left, preferTenBit: preferTenBit)
+            let rightTenBitPenalty = tenBitPenalty(format: right, preferTenBit: preferTenBit)
+            if leftTenBitPenalty != rightTenBitPenalty {
+                return leftTenBitPenalty < rightTenBitPenalty
+            }
+
+            let leftSubtypePenalty = subtypePenalty(format: left, preferredSubtype: preferredSubtype)
+            let rightSubtypePenalty = subtypePenalty(format: right, preferredSubtype: preferredSubtype)
+            if leftSubtypePenalty != rightSubtypePenalty {
+                return leftSubtypePenalty < rightSubtypePenalty
+            }
+
+            let leftBinnedPenalty = binnedPenalty(format: left, preferredBinned: preferredBinned)
+            let rightBinnedPenalty = binnedPenalty(format: right, preferredBinned: preferredBinned)
+            if leftBinnedPenalty != rightBinnedPenalty {
+                return leftBinnedPenalty < rightBinnedPenalty
+            }
+
+            let leftFOVDelta = abs(left.videoFieldOfView - fov)
+            let rightFOVDelta = abs(right.videoFieldOfView - fov)
+            if leftFOVDelta != rightFOVDelta {
+                return leftFOVDelta < rightFOVDelta
+            }
+
+            let leftMaxFPS = left.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
+            let rightMaxFPS = right.videoSupportedFrameRateRanges.map(\.maxFrameRate).max() ?? 0
+            return leftMaxFPS < rightMaxFPS
+        }.first
+    }
+
+    private func isCompatibleVideoSubType(_ rawValue: UInt32) -> Bool {
+        rawValue == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+            rawValue == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+            rawValue == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange
+    }
+
+    private func tenBitPenalty(format: AVCaptureDevice.Format,
+                               preferTenBit: Bool) -> Int {
+        format.isTenBitFormat == preferTenBit ? 0 : 1
+    }
+
+    private func subtypePenalty(format: AVCaptureDevice.Format,
+                                preferredSubtype: UInt32?) -> Int {
+        guard let preferredSubtype else { return 0 }
+        return format.formatDescription.mediaSubType.rawValue == preferredSubtype ? 0 : 1
+    }
+
+    private func binnedPenalty(format: AVCaptureDevice.Format,
+                               preferredBinned: Bool?) -> Int {
+        if let preferredBinned, format.isVideoBinned == preferredBinned {
+            return 0
+        }
+        return format.isVideoBinned ? 2 : 1
     }
 
     private func formatDescriptor(for format: AVCaptureDevice.Format,
@@ -1709,6 +2054,9 @@ actor CaptureService {
         if isHDRVideoEnabled {
             await setHDRVideoEnabled(true)
         }
+
+        _ = await applyVideoCaptureModePreset(selectedVideoCaptureMode,
+                                              reason: "set_capture_mode_restore_video_preset")
 
         // Update the advertised capabilities after reconfiguration.
         updateCaptureCapabilities()
@@ -2350,13 +2698,15 @@ actor CaptureService {
                 currentDevice.unlockForConfiguration()
                 isHDRVideoEnabled = true
             } else {
-                captureSession.sessionPreset = .high
                 isHDRVideoEnabled = false
             }
         } catch {
             logger.error("Unable to obtain lock on device and can't enable HDR video capture.")
         }
         captureSession.commitConfiguration()
+        _ = await applyVideoCaptureModePreset(selectedVideoCaptureMode,
+                                              reason: "set_hdr_video_enabled_restore_video_preset")
+        isHDRVideoEnabled = currentDevice.activeFormat.isTenBitFormat
         await afterPotentialReconfiguration(reason: "set_hdr_video_enabled")
     }
     

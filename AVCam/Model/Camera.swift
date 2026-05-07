@@ -56,6 +56,18 @@ protocol Camera: AnyObject, SendableMetatype {
     /// The current capabilities and numeric ranges for manual camera controls.
     var manualControlCapabilities: ManualCameraControlCapabilities { get }
 
+    /// The selected named video capture mode preset.
+    var selectedVideoCaptureMode: VideoCaptureModePreset { get set }
+
+    /// The supported named video capture modes for the active camera device.
+    var videoCaptureModeSupport: [VideoCaptureModeSupport] { get }
+
+    /// The actual applied video capture mode read back from AVFoundation.
+    var videoCaptureModeStatus: VideoCaptureModeStatus { get }
+
+    /// Whether a deterministic manual lock profile currently owns camera format/FPS.
+    var isManualLockActive: Bool { get }
+
     /// The source of video content for a camera preview.
     var previewSource: PreviewSource { get }
     

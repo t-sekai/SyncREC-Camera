@@ -19,6 +19,12 @@ struct RemoteDirectorStatusPayload {
     let localVideoBytes: Int64
     let uploadedVideoBytes: Int64
     let pendingUploadVideoBytes: Int64
+    let selectedCaptureMode: String?
+    let actualVideoWidth: Int?
+    let actualVideoHeight: Int?
+    let actualVideoFPS: Double?
+    let actualCaptureMode: String?
+    let supportedCaptureModes: [String]
     let tentacleState: String
     let timecode: String
     let fps: Int?
@@ -37,6 +43,12 @@ struct RemoteDirectorStatusPayload {
                                                    localVideoBytes: 0,
                                                    uploadedVideoBytes: 0,
                                                    pendingUploadVideoBytes: 0,
+                                                   selectedCaptureMode: nil,
+                                                   actualVideoWidth: nil,
+                                                   actualVideoHeight: nil,
+                                                   actualVideoFPS: nil,
+                                                   actualCaptureMode: nil,
+                                                   supportedCaptureModes: [],
                                                    tentacleState: "unknown",
                                                    timecode: "",
                                                    fps: nil,
@@ -59,6 +71,7 @@ enum RemoteDirectorCommand {
     case setBrightness(Double)
     case pullVideos(jobID: String, policy: String, maxFiles: Int, uploadURL: String?)
     case deleteLocalVideos(policy: RemoteLocalVideoDeletePolicy)
+    case setCaptureMode(VideoCaptureModePreset)
     case capturePreviewPhoto(batchID: String,
                              uploadURL: String?,
                              longEdge: Int,
@@ -453,6 +466,22 @@ final class RemoteDirectorClient {
         message["local_video_bytes"] = status.localVideoBytes
         message["uploaded_video_bytes"] = status.uploadedVideoBytes
         message["pending_upload_video_bytes"] = status.pendingUploadVideoBytes
+        if let selectedCaptureMode = status.selectedCaptureMode {
+            message["capture_mode"] = selectedCaptureMode
+        }
+        if let actualVideoWidth = status.actualVideoWidth {
+            message["actual_video_width"] = actualVideoWidth
+        }
+        if let actualVideoHeight = status.actualVideoHeight {
+            message["actual_video_height"] = actualVideoHeight
+        }
+        if let actualVideoFPS = status.actualVideoFPS {
+            message["actual_video_fps"] = actualVideoFPS
+        }
+        if let actualCaptureMode = status.actualCaptureMode {
+            message["actual_capture_mode"] = actualCaptureMode
+        }
+        message["supported_capture_modes"] = status.supportedCaptureModes
         if let fps = status.fps {
             message["fps"] = fps
         }
@@ -632,6 +661,10 @@ final class RemoteDirectorClient {
             command = .deleteLocalVideos(policy: .uploadedOnly)
         case "force_delete_videos", "force_delete_local_videos", "delete_all_videos":
             command = .deleteLocalVideos(policy: .forceAll)
+        case "set_capture_mode", "apply_capture_mode":
+            let rawMode = (payload["mode"] as? String) ?? (payload["capture_mode"] as? String) ?? ""
+            guard let preset = VideoCaptureModePreset(rawValue: rawMode) else { return nil }
+            command = .setCaptureMode(preset)
         case "capture_preview_photo":
             let batchID = (payload["batch_id"] as? String).flatMap {
                 let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)

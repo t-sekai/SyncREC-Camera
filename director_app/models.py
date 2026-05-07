@@ -23,6 +23,12 @@ class DeviceState:
     local_video_bytes: int | None = None
     uploaded_video_bytes: int | None = None
     pending_upload_video_bytes: int | None = None
+    capture_mode: str = ""
+    actual_capture_mode: str = ""
+    actual_video_width: int | None = None
+    actual_video_height: int | None = None
+    actual_video_fps: float | None = None
+    supported_capture_modes: list[str] = field(default_factory=list)
     tentacle_state: str = "unknown"
     timecode: str = ""
     fps: int | None = None

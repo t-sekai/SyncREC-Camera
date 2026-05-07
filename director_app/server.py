@@ -77,7 +77,7 @@ class DirectorServer:
         self._timecode_anchor_total_frames: int | None = None
         self._timecode_anchor_fps: int | None = None
         self._timecode_anchor_source = "tentacle_sync_e"
-        self._time_source = "tentacle"
+        self._time_source = "laptop"
         self._laptop_timecode_fps = 30
 
         self._camera_param_preset: dict[str, Any] | None = None
@@ -345,6 +345,12 @@ class DirectorServer:
                     "local_video_bytes": d.local_video_bytes,
                     "uploaded_video_bytes": d.uploaded_video_bytes,
                     "pending_upload_video_bytes": d.pending_upload_video_bytes,
+                    "capture_mode": d.capture_mode,
+                    "actual_capture_mode": d.actual_capture_mode,
+                    "actual_video_width": d.actual_video_width,
+                    "actual_video_height": d.actual_video_height,
+                    "actual_video_fps": d.actual_video_fps,
+                    "supported_capture_modes": list(d.supported_capture_modes),
                     "tentacle_state": d.tentacle_state,
                     "timecode": d.timecode,
                     "fps": d.fps,
@@ -598,6 +604,18 @@ class DirectorServer:
                 device.uploaded_video_bytes = to_int_or_none(msg.get("uploaded_video_bytes"))
             if "pending_upload_video_bytes" in msg:
                 device.pending_upload_video_bytes = to_int_or_none(msg.get("pending_upload_video_bytes"))
+            if "capture_mode" in msg:
+                device.capture_mode = str(msg.get("capture_mode") or "")
+            if "actual_capture_mode" in msg:
+                device.actual_capture_mode = str(msg.get("actual_capture_mode") or "")
+            if "actual_video_width" in msg:
+                device.actual_video_width = to_int_or_none(msg.get("actual_video_width"))
+            if "actual_video_height" in msg:
+                device.actual_video_height = to_int_or_none(msg.get("actual_video_height"))
+            if "actual_video_fps" in msg:
+                device.actual_video_fps = to_float_or_none(msg.get("actual_video_fps"))
+            if "supported_capture_modes" in msg and isinstance(msg.get("supported_capture_modes"), list):
+                device.supported_capture_modes = [str(value) for value in msg.get("supported_capture_modes") if value]
             if "tentacle_state" in msg:
                 device.tentacle_state = str(msg.get("tentacle_state") or "unknown")
             if "timecode" in msg:
@@ -647,6 +665,18 @@ class DirectorServer:
                     device.uploaded_video_bytes = to_int_or_none(payload.get("uploaded_video_bytes"))
                 if "pending_upload_video_bytes" in payload:
                     device.pending_upload_video_bytes = to_int_or_none(payload.get("pending_upload_video_bytes"))
+                if "capture_mode" in payload:
+                    device.capture_mode = str(payload.get("capture_mode") or "")
+                if "actual_capture_mode" in payload:
+                    device.actual_capture_mode = str(payload.get("actual_capture_mode") or "")
+                if "actual_video_width" in payload:
+                    device.actual_video_width = to_int_or_none(payload.get("actual_video_width"))
+                if "actual_video_height" in payload:
+                    device.actual_video_height = to_int_or_none(payload.get("actual_video_height"))
+                if "actual_video_fps" in payload:
+                    device.actual_video_fps = to_float_or_none(payload.get("actual_video_fps"))
+                if "supported_capture_modes" in payload and isinstance(payload.get("supported_capture_modes"), list):
+                    device.supported_capture_modes = [str(value) for value in payload.get("supported_capture_modes") if value]
             waiter = self._ack_waiters.pop((device.device_id, request_id), None)
             if waiter and not waiter.done():
                 waiter.set_result(msg)
@@ -1234,12 +1264,13 @@ class DirectorServer:
             height = active_format.get("height")
             if width and height:
                 fmt = f"{width}x{height}"
+        mode = str(candidate.get("actualCaptureModePreset") or candidate.get("actual_capture_mode_preset") or "")
         exposure = candidate.get("exposure")
         iso = ""
         if isinstance(exposure, dict) and isinstance(exposure.get("iso"), (int, float)):
             iso = f"ISO {exposure['iso']:.0f}"
         status = str(payload.get("classification") or payload.get("camera_params_status") or "")
-        return ", ".join(part for part in (status, fmt, iso) if part)
+        return ", ".join(part for part in (status, mode, fmt, iso) if part)
 
     async def _dispatch_next_pull_if_idle(self) -> None:
         while True:

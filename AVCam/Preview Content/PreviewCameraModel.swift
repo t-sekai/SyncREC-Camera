@@ -29,6 +29,18 @@ class PreviewCameraModel: Camera {
     var directorWebSocketURL = RemoteDirectorConfiguration.defaultDirectorWebSocketURL
     var directorDeviceName = "Camera A"
     var manualControlState = ManualCameraControlState.default
+    var selectedVideoCaptureMode = VideoCaptureModePreset.hd1080p30
+    var videoCaptureModeSupport = VideoCaptureModePreset.allCases.map {
+        VideoCaptureModeSupport(preset: $0, isSupported: $0 != .uhd4k60, reason: $0 == .uhd4k60 ? "Preview unsupported" : nil)
+    }
+    var videoCaptureModeStatus = VideoCaptureModeStatus(selectedPreset: .hd1080p30,
+                                                        actualPreset: .hd1080p30,
+                                                        actualWidth: 1920,
+                                                        actualHeight: 1080,
+                                                        actualFPS: 30,
+                                                        supportedPresets: [.hd720p30, .hd1080p30, .hd1080p60, .uhd4k30],
+                                                        detail: nil)
+    var isManualLockActive = false
     let manualControlCapabilities = ManualCameraControlCapabilities(
         isoRange: 25...2000,
         whiteBalanceTemperatureRange: 2000...10000,

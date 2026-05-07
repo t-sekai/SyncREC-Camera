@@ -23,6 +23,7 @@ private enum RemoteTransferConfiguration {
 
 private enum ManualControlConfiguration {
     static let manualControlStateDefaultsKey = "ManualCameraControlState"
+    static let selectedVideoCaptureModeDefaultsKey = "SelectedVideoCaptureModePreset"
     static let manualLockProfileDefaultsKey = "ManualLockProfileStorePath"
     static let manualLockProfileDirectoryName = "ManualCameraParameters"
     static let manualLockProfileFilename = "ManualLockProfileStore.json"
@@ -133,6 +134,23 @@ final class CameraModel: Camera {
     /// The capabilities and supported numeric ranges for manual camera controls.
     private(set) var manualControlCapabilities = ManualCameraControlCapabilities.unavailable
 
+    /// The selected named video capture mode preset.
+    var selectedVideoCaptureMode = VideoCaptureModePreset.hd1080p30 {
+        didSet { handleSelectedVideoCaptureModeChange(from: oldValue) }
+    }
+
+    /// The supported named video capture modes for the active camera.
+    private(set) var videoCaptureModeSupport = VideoCaptureModePreset.allCases.map {
+        VideoCaptureModeSupport(preset: $0,
+                                isSupported: false,
+                                reason: "Camera not running.")
+    }
+
+    /// The actual applied video capture mode read back from AVFoundation.
+    private(set) var videoCaptureModeStatus = VideoCaptureModeStatus.unavailable
+
+    var isManualLockActive: Bool { activeManualLockProfile != nil }
+
     /// Draft and active deterministic camera profiles for copy/sync operation.
     private(set) var draftManualLockProfile: ManualLockProfile?
     private(set) var activeManualLockProfile: ManualLockProfile?
@@ -158,6 +176,9 @@ final class CameraModel: Camera {
 
     /// Tracks whether internal code is setting the capture mode directly.
     private var isApplyingCaptureModeInternally = false
+
+    /// Tracks whether internal code is publishing selected video capture mode readback.
+    private var isApplyingVideoCaptureModeInternally = false
 
     /// Tracks whether internal code is restoring the HDR UI value while a profile owns HDR/format.
     private var isApplyingHDRInternally = false
@@ -306,6 +327,16 @@ final class CameraModel: Camera {
         isUpdatingManualControlState = true
         manualControlState = loadManualControlState()
         isUpdatingManualControlState = false
+        isApplyingVideoCaptureModeInternally = true
+        selectedVideoCaptureMode = loadSelectedVideoCaptureMode()
+        videoCaptureModeStatus = VideoCaptureModeStatus(selectedPreset: selectedVideoCaptureMode,
+                                                        actualPreset: nil,
+                                                        actualWidth: nil,
+                                                        actualHeight: nil,
+                                                        actualFPS: nil,
+                                                        supportedPresets: [],
+                                                        detail: "Camera not running.")
+        isApplyingVideoCaptureModeInternally = false
 
         let manualProfileStore = loadManualLockProfileStore()
         draftManualLockProfile = manualProfileStore.draftProfile
@@ -545,6 +576,26 @@ final class CameraModel: Camera {
         }
     }
 
+    private func handleSelectedVideoCaptureModeChange(from oldValue: VideoCaptureModePreset) {
+        guard !isApplyingVideoCaptureModeInternally else { return }
+        guard selectedVideoCaptureMode != oldValue else { return }
+
+        if activeManualLockProfile != nil {
+            isApplyingVideoCaptureModeInternally = true
+            selectedVideoCaptureMode = oldValue
+            isApplyingVideoCaptureModeInternally = false
+            return
+        }
+
+        persistSelectedVideoCaptureMode(selectedVideoCaptureMode)
+        guard status == .running else { return }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.applySelectedVideoCaptureModeToDevice(reason: "user_selected_capture_mode")
+        }
+    }
+
     private func applyManualControlStateToDevice() async {
         if activeManualLockProfile != nil {
             await reapplyActiveManualLockProfile(reason: "legacy_manual_apply_redirect")
@@ -586,6 +637,43 @@ final class CameraModel: Camera {
         guard capabilities != manualControlCapabilities else { return }
 
         manualControlCapabilities = capabilities
+    }
+
+    private func refreshVideoCaptureModeStateFromDevice() async {
+        videoCaptureModeSupport = await captureService.videoCaptureModeSupport()
+        let status = await captureService.currentVideoCaptureModeStatus()
+        publishVideoCaptureModeStatus(status)
+    }
+
+    private func publishVideoCaptureModeStatus(_ modeStatus: VideoCaptureModeStatus) {
+        isApplyingVideoCaptureModeInternally = true
+        if selectedVideoCaptureMode != modeStatus.selectedPreset {
+            selectedVideoCaptureMode = modeStatus.selectedPreset
+        }
+        videoCaptureModeStatus = modeStatus
+        videoCaptureModeSupport = VideoCaptureModePreset.allCases.map { preset in
+            VideoCaptureModeSupport(preset: preset,
+                                    isSupported: modeStatus.supportedPresets.contains(preset),
+                                    reason: modeStatus.supportedPresets.contains(preset) ? nil : "No compatible format.")
+        }
+        isApplyingVideoCaptureModeInternally = false
+    }
+
+    private func applySelectedVideoCaptureModeToDevice(reason: String) async {
+        guard activeManualLockProfile == nil else { return }
+        let report = await captureService.applyVideoCaptureModePreset(selectedVideoCaptureMode,
+                                                                      reason: reason)
+        publishVideoCaptureModeStatus(report.status)
+        if report.classification == .exactModeApplied || report.classification == .adjustedCompatibleMode {
+            isUpdatingManualControlState = true
+            manualControlState.fps = report.status.actualFPS ?? selectedVideoCaptureMode.fps
+            manualControlState.isFPSLocked = true
+            isUpdatingManualControlState = false
+            persistManualControlState(manualControlState)
+        }
+        await refreshManualControlCapabilitiesFromDevice()
+        await applyManualControlStateToDevice()
+        remoteDirectorClient.sendStatusNow()
     }
 
     private func startManualControlRefreshIfNeeded() {
@@ -634,6 +722,19 @@ final class CameraModel: Camera {
     private func persistManualControlState(_ state: ManualCameraControlState) {
         guard let data = try? JSONEncoder().encode(state) else { return }
         UserDefaults.standard.set(data, forKey: ManualControlConfiguration.manualControlStateDefaultsKey)
+    }
+
+    private func loadSelectedVideoCaptureMode() -> VideoCaptureModePreset {
+        guard let rawValue = UserDefaults.standard.string(forKey: ManualControlConfiguration.selectedVideoCaptureModeDefaultsKey),
+              let preset = VideoCaptureModePreset(rawValue: rawValue) else {
+            return .hd1080p30
+        }
+        return preset
+    }
+
+    private func persistSelectedVideoCaptureMode(_ preset: VideoCaptureModePreset) {
+        UserDefaults.standard.set(preset.rawValue,
+                                  forKey: ManualControlConfiguration.selectedVideoCaptureModeDefaultsKey)
     }
 
     private func installActiveManualLockProfile(reason: String, requestID: String? = nil) async {
@@ -722,6 +823,25 @@ final class CameraModel: Camera {
 
         let desired = profile.desired
         var state = manualControlState
+
+        if let preset = desired.captureModePreset ?? actualSnapshot?.actualCaptureModePreset {
+            isApplyingVideoCaptureModeInternally = true
+            selectedVideoCaptureMode = preset
+            videoCaptureModeStatus = VideoCaptureModeStatus(selectedPreset: preset,
+                                                            actualPreset: actualSnapshot?.actualCaptureModePreset,
+                                                            actualWidth: actualSnapshot?.activeFormat?.width,
+                                                            actualHeight: actualSnapshot?.activeFormat?.height,
+                                                            actualFPS: actualSnapshot.flatMap { selectedFPS(from: $0) },
+                                                            supportedPresets: actualSnapshot?.supportedCaptureModePresets ?? videoCaptureModeStatus.supportedPresets,
+                                                            detail: nil)
+            videoCaptureModeSupport = VideoCaptureModePreset.allCases.map { candidate in
+                VideoCaptureModeSupport(preset: candidate,
+                                        isSupported: videoCaptureModeStatus.supportedPresets.contains(candidate),
+                                        reason: videoCaptureModeStatus.supportedPresets.contains(candidate) ? nil : "No compatible format.")
+            }
+            isApplyingVideoCaptureModeInternally = false
+            persistSelectedVideoCaptureMode(preset)
+        }
 
         if let selectedFPS = desired.selectedFPS {
             state.fps = selectedFPS
@@ -1295,6 +1415,8 @@ final class CameraModel: Camera {
                 try? await captureService.setCaptureMode(captureMode)
                 // Update the persistent state value.
                 cameraState.captureMode = .video
+                await refreshVideoCaptureModeStateFromDevice()
+                await applySelectedVideoCaptureModeToDevice(reason: "set_capture_mode")
                 await applyManualControlStateToDevice()
                 remoteDirectorClient.sendStatusNow()
             }
@@ -1309,6 +1431,8 @@ final class CameraModel: Camera {
         if activeManualLockProfile != nil {
             await reapplyActiveManualLockProfile(reason: "switch_video_devices")
         } else {
+            await refreshVideoCaptureModeStateFromDevice()
+            await applySelectedVideoCaptureModeToDevice(reason: "switch_video_devices_capture_mode")
             await applyManualControlStateToDevice()
         }
     }
@@ -1559,6 +1683,12 @@ final class CameraModel: Camera {
             localVideoBytes: localVideoSummary.totalBytes,
             uploadedVideoBytes: localVideoSummary.uploadedBytes,
             pendingUploadVideoBytes: localVideoSummary.pendingUploadBytes,
+            selectedCaptureMode: videoCaptureModeStatus.selectedPreset.rawValue,
+            actualVideoWidth: videoCaptureModeStatus.actualWidth,
+            actualVideoHeight: videoCaptureModeStatus.actualHeight,
+            actualVideoFPS: videoCaptureModeStatus.actualFPS,
+            actualCaptureMode: videoCaptureModeStatus.actualPreset?.rawValue,
+            supportedCaptureModes: videoCaptureModeStatus.supportedPresets.map(\.rawValue),
             tentacleState: tentacleConnectionState.remoteControlValue,
             timecode: currentTimecode?.formatted ?? displayedTentacleTimecode,
             fps: currentTimecode?.fps ?? displayedTentacleFPS,
@@ -1692,10 +1822,12 @@ final class CameraModel: Camera {
             }
             status = .running
             localVideoURLs = await localVideoStore.loadStoredVideos()
+            await refreshVideoCaptureModeStateFromDevice()
             await refreshManualControlCapabilitiesFromDevice()
             if activeManualLockProfile != nil {
                 await installActiveManualLockProfile(reason: reason)
             } else {
+                await applySelectedVideoCaptureModeToDevice(reason: "\(reason)_capture_mode")
                 await applyManualControlStateToDevice()
             }
             startActiveTimecodeService()
@@ -1808,8 +1940,22 @@ final class CameraModel: Camera {
             "pending_upload_video_count": localVideoSummary.pendingUploadCount,
             "local_video_bytes": localVideoSummary.totalBytes,
             "uploaded_video_bytes": localVideoSummary.uploadedBytes,
-            "pending_upload_video_bytes": localVideoSummary.pendingUploadBytes
+            "pending_upload_video_bytes": localVideoSummary.pendingUploadBytes,
+            "capture_mode": videoCaptureModeStatus.selectedPreset.rawValue,
+            "supported_capture_modes": videoCaptureModeStatus.supportedPresets.map(\.rawValue)
         ]
+        if let actualWidth = videoCaptureModeStatus.actualWidth {
+            payload["actual_video_width"] = actualWidth
+        }
+        if let actualHeight = videoCaptureModeStatus.actualHeight {
+            payload["actual_video_height"] = actualHeight
+        }
+        if let actualFPS = videoCaptureModeStatus.actualFPS {
+            payload["actual_video_fps"] = actualFPS
+        }
+        if let actualMode = videoCaptureModeStatus.actualPreset {
+            payload["actual_capture_mode"] = actualMode.rawValue
+        }
         if let battery = UIDevice.current.batteryLevelNormalized {
             payload["battery"] = battery
         }
@@ -1941,6 +2087,9 @@ final class CameraModel: Camera {
         case .deleteLocalVideos(let policy):
             return await deleteLocalVideosForRemote(policy: policy)
 
+        case .setCaptureMode(let preset):
+            return await applyRemoteCaptureMode(preset)
+
         case .capturePreviewPhoto(let batchID, let uploadURL, let longEdge, let jpegQuality, let uploadJitterSeconds, let attempt):
             guard !captureActivity.isRecording else {
                 return rigReply(ok: false,
@@ -2037,6 +2186,46 @@ final class CameraModel: Camera {
         return report
     }
 
+    private func applyRemoteCaptureMode(_ preset: VideoCaptureModePreset) async -> RemoteDirectorCommandReply {
+        guard !captureActivity.isRecording, !(await isCapturePipelineRecording()) else {
+            return rigReply(ok: false,
+                            message: "Refused to change capture mode while recording.",
+                            error: "recording_active")
+        }
+        guard activeManualLockProfile == nil else {
+            return rigReply(ok: false,
+                            message: "Capture mode is owned by the active camera params profile. Sync camera params to change it.",
+                            error: "manual_lock_active")
+        }
+
+        isApplyingVideoCaptureModeInternally = true
+        selectedVideoCaptureMode = preset
+        isApplyingVideoCaptureModeInternally = false
+        persistSelectedVideoCaptureMode(preset)
+
+        let report = await captureService.applyVideoCaptureModePreset(preset,
+                                                                      reason: "remote_set_capture_mode")
+        publishVideoCaptureModeStatus(report.status)
+        if report.classification == .exactModeApplied || report.classification == .adjustedCompatibleMode {
+            isUpdatingManualControlState = true
+            manualControlState.fps = report.status.actualFPS ?? preset.fps
+            manualControlState.isFPSLocked = true
+            isUpdatingManualControlState = false
+            persistManualControlState(manualControlState)
+            await applyManualControlStateToDevice()
+        }
+        await refreshManualControlCapabilitiesFromDevice()
+        remoteDirectorClient.sendStatusNow()
+
+        let ok = report.classification == .exactModeApplied || report.classification == .adjustedCompatibleMode
+        return rigReply(ok: ok,
+                        message: report.detail,
+                        error: ok ? nil : report.classification.rawValue,
+                        extra: [
+                            "capture_mode_report": jsonObject(report) ?? [:]
+                        ])
+    }
+
     private func exportCameraParamsPayload(requestID: String) async -> [String: Any] {
         let identity = remoteDirectorClient.manualSnapshotIdentity()
         let actualSnapshot = await captureService.exportActualCameraSnapshot(reason: "remote_export_camera_params",
@@ -2083,6 +2272,7 @@ final class CameraModel: Camera {
 
     private func manualLockProfile(from snapshot: ManualCameraActualSnapshot) -> ManualLockProfile {
         let desired = ManualCameraDesiredSettings(
+            captureModePreset: snapshot.actualCaptureModePreset,
             format: snapshot.activeFormat,
             selectedFPS: selectedFPS(from: snapshot),
             activeVideoMinFrameDurationSeconds: snapshot.actualFPSMinFrameDurationSeconds,
@@ -2131,7 +2321,8 @@ final class CameraModel: Camera {
         let format = snapshot.activeFormat.map { "\($0.width)x\($0.height)" } ?? "unknown_format"
         let fps = selectedFPS(from: snapshot).map { String(format: "%.3f fps", $0) } ?? "variable fps"
         let iso = snapshot.exposure.map { String(format: "ISO %.0f", $0.iso) } ?? "ISO unknown"
-        return "\(format), \(fps), \(iso)"
+        let mode = snapshot.actualCaptureModePreset?.rawValue ?? selectedVideoCaptureMode.rawValue
+        return "\(mode), \(format), \(fps), \(iso)"
     }
 
     private func jsonObject<T: Encodable>(_ value: T) -> [String: Any]? {

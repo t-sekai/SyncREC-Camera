@@ -25,7 +25,7 @@ class DirectorGUI:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title("Multi-Cam Director")
-        self.root.geometry("1460x740")
+        self.root.geometry("1600x740")
 
         self.event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.server = DirectorServer(self.event_queue)
@@ -39,9 +39,10 @@ class DirectorGUI:
         self.start_delay_var = StringVar(value="2.0")
         self.stop_delay_var = StringVar(value="2.0")
         self.tentacle_name_var = StringVar(value="NeuROK")
-        self.time_source_var = StringVar(value="tentacle")
+        self.time_source_var = StringVar(value="laptop")
         self.laptop_fps_var = StringVar(value="30")
         self.pull_max_files_var = StringVar(value="0")
+        self.capture_mode_var = StringVar(value="hd1080p30")
         self.tentacle_state_var = StringVar(value="Tentacle: idle")
         self.tentacle_timecode_var = StringVar(value="Director timecode: --:--:--:--")
         self.pull_status_var = StringVar(value="Pull queue: idle")
@@ -157,6 +158,19 @@ class DirectorGUI:
         ttk.Button(camera_param_actions,
                    text="Sync Params All",
                    command=self.sync_camera_params_all).pack(side=LEFT, padx=3)
+        ttk.Label(camera_param_actions, text="Mode:").pack(side=LEFT, padx=(12, 3))
+        mode_menu = ttk.Combobox(camera_param_actions,
+                                 textvariable=self.capture_mode_var,
+                                 width=12,
+                                 values=("hd720p30", "hd1080p30", "hd1080p60", "uhd4k30", "uhd4k60"),
+                                 state="readonly")
+        mode_menu.pack(side=LEFT, padx=(2, 3))
+        ttk.Button(camera_param_actions,
+                   text="Set Mode Selected",
+                   command=self.set_capture_mode_selected).pack(side=LEFT, padx=3)
+        ttk.Button(camera_param_actions,
+                   text="Set Mode All",
+                   command=self.set_capture_mode_all).pack(side=LEFT, padx=3)
         ttk.Label(camera_param_actions, textvariable=self.camera_params_var).pack(side=LEFT, padx=(12, 3))
 
         columns = (
@@ -169,6 +183,8 @@ class DirectorGUI:
             "battery",
             "storage",
             "videos",
+            "mode",
+            "actual_video",
             "tentacle",
             "timecode",
             "rig",
@@ -193,6 +209,8 @@ class DirectorGUI:
             "battery": 70,
             "storage": 75,
             "videos": 150,
+            "mode": 105,
+            "actual_video": 130,
             "tentacle": 110,
             "timecode": 120,
             "rig": 120,
@@ -361,6 +379,14 @@ class DirectorGUI:
                     videos = str(local_videos)
             else:
                 videos = "-"
+            capture_mode = str(d.get("capture_mode") or "")
+            actual_width = d.get("actual_video_width")
+            actual_height = d.get("actual_video_height")
+            actual_fps = d.get("actual_video_fps")
+            if isinstance(actual_width, int) and isinstance(actual_height, int) and isinstance(actual_fps, float):
+                actual_video = f"{actual_width}x{actual_height} {actual_fps:.0f}fps"
+            else:
+                actual_video = ""
             age = max(0.0, now - float(d["last_seen_unix"]))
             last_seen = f"{age:.1f}s"
             transfer_state = str(d.get("transfer_state") or "")
@@ -392,6 +418,8 @@ class DirectorGUI:
                     battery,
                     storage,
                     videos,
+                    capture_mode,
+                    actual_video,
                     d["tentacle_state"],
                     timecode_text(d["timecode"], d["fps"]),
                     str(d.get("rig_state") or ""),
@@ -692,6 +720,20 @@ class DirectorGUI:
     def sync_camera_params_all(self) -> None:
         self.camera_params_var.set("Camera params: sync started")
         self.server.sync_camera_params_all(dry_run=False)
+
+    def set_capture_mode_selected(self) -> None:
+        mode = self.capture_mode_var.get().strip()
+        if not mode:
+            self._append_log("Select a capture mode before sending.")
+            return
+        self._send_selected_command("set_capture_mode", {"mode": mode})
+
+    def set_capture_mode_all(self) -> None:
+        mode = self.capture_mode_var.get().strip()
+        if not mode:
+            self._append_log("Select a capture mode before broadcasting.")
+            return
+        self.server.send_command_all("set_capture_mode", {"mode": mode})
 
     def on_close(self) -> None:
         self.tentacle_reader.stop()
