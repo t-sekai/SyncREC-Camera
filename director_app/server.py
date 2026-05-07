@@ -44,6 +44,9 @@ class PreviewPhotoRequest:
 
 
 class DirectorServer:
+    HEARTBEAT_TIMEOUT_SECONDS = 45.0
+    HEARTBEAT_CHECK_SECONDS = 5.0
+
     def __init__(self, event_queue: queue.Queue[tuple[str, Any]]):
         self.event_queue = event_queue
         self._server = None
@@ -339,6 +342,7 @@ class DirectorServer:
                     "tentacle_state": d.tentacle_state,
                     "timecode": d.timecode,
                     "fps": d.fps,
+                    "rig_state": d.rig_state,
                     "pending_acks": dict(d.pending_acks),
                     "transfer_state": d.transfer_state,
                     "transfer_detail": d.transfer_detail,
@@ -420,8 +424,11 @@ class DirectorServer:
 
     async def _heartbeat_monitor(self) -> None:
         while True:
-            await asyncio.sleep(2.0)
-            cutoff = time.time() - 10.0
+            await asyncio.sleep(self.HEARTBEAT_CHECK_SECONDS)
+            # iPhones in armed_idle intentionally send low-rate status updates to save power.
+            # Keep this comfortably above the app's 5s idle heartbeat so normal Wi-Fi jitter
+            # doesn't look like a disconnected device.
+            cutoff = time.time() - self.HEARTBEAT_TIMEOUT_SECONDS
             stale: list[WebSocketServerProtocol] = []
             with self._lock:
                 for ws, d in self.devices.items():
@@ -583,6 +590,8 @@ class DirectorServer:
                 device.last_camera_params_status = str(msg.get("camera_params_status") or "")
             if "camera_params_summary" in msg:
                 device.last_camera_params_summary = str(msg.get("camera_params_summary") or "")
+            if "rig_state" in msg:
+                device.rig_state = str(msg.get("rig_state") or "")
 
         elif mtype == "ack":
             request_id = str(msg.get("request_id") or "")
@@ -593,13 +602,16 @@ class DirectorServer:
             payload = msg.get("payload")
             if command in {"export_camera_params", "apply_camera_params", "validate_camera_params"}:
                 if isinstance(payload, dict):
-                    device.last_camera_params_report = payload
-                    device.last_camera_params_summary = self._camera_params_summary(payload)
-                    report = payload.get("apply_report") or payload.get("validation_report")
+                    camera_payload = self._camera_params_payload(payload)
+                    device.last_camera_params_report = camera_payload or payload
+                    device.last_camera_params_summary = self._camera_params_summary(camera_payload)
+                    report = camera_payload.get("apply_report") or camera_payload.get("validation_report")
                     if isinstance(report, dict):
                         device.last_camera_params_status = str(report.get("classification") or "")
                 elif not ok:
                     device.last_camera_params_status = "failed"
+            if isinstance(payload, dict) and "current_state" in payload:
+                device.rig_state = str(payload.get("current_state") or "")
             waiter = self._ack_waiters.pop((device.device_id, request_id), None)
             if waiter and not waiter.done():
                 waiter.set_result(msg)
@@ -779,8 +791,8 @@ class DirectorServer:
         payload = {
             "batch_id": batch_id,
             "upload_url": self._preview_upload_url,
-            "long_edge": 1600,
-            "jpeg_quality": 0.8,
+            "long_edge": 1280,
+            "jpeg_quality": 0.65,
             "upload_jitter_seconds": 3.0,
             "attempt": attempt,
         }
@@ -1047,7 +1059,7 @@ class DirectorServer:
             self.log(f"Copy camera params rejected by {device.name}: {ack.get('detail')}")
             return
 
-        payload = ack.get("payload")
+        payload = self._camera_params_payload(ack.get("payload"))
         if not self._valid_export_payload(payload):
             self.log(f"Copy camera params failed for {device.name}: invalid payload schema.")
             return
@@ -1137,7 +1149,8 @@ class DirectorServer:
                                                 "apply_camera_params",
                                                 payload=payload,
                                                 timeout=30.0)
-        ack_payload = ack.get("payload") if isinstance(ack.get("payload"), dict) else {}
+        raw_ack_payload = ack.get("payload") if isinstance(ack.get("payload"), dict) else {}
+        ack_payload = self._camera_params_payload(raw_ack_payload) or raw_ack_payload
         apply_report = ack_payload.get("apply_report") if isinstance(ack_payload, dict) else None
         classification = "incompatible"
         if isinstance(apply_report, dict):
@@ -1154,6 +1167,14 @@ class DirectorServer:
             "detail": str(ack.get("detail") or ""),
             "ack_payload": ack_payload,
         }
+
+    def _camera_params_payload(self, payload: Any) -> dict[str, Any]:
+        if not isinstance(payload, dict):
+            return {}
+        camera_payload = payload.get("camera_params")
+        if isinstance(camera_payload, dict):
+            return camera_payload
+        return payload
 
     def _valid_export_payload(self, payload: Any) -> bool:
         return (

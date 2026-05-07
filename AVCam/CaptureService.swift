@@ -67,7 +67,7 @@ actor CaptureService {
     // A lightweight video-data output used to read camera intrinsics from sample-buffer metadata.
     private let calibrationVideoDataOutput = AVCaptureVideoDataOutput()
     private let calibrationVideoDataDelegate = CalibrationVideoDataDelegate()
-    private let calibrationVideoDataOutputQueue = DispatchQueue(label: "com.example.apple-samplecode.AVCam.calibrationVideoDataOutputQueue")
+    private let calibrationVideoDataOutputQueue = DispatchQueue(label: "com.syncrec.camera.calibrationVideoDataOutputQueue")
     
     // An internal collection of active output services for this video-only build.
     private var outputServices: [any OutputService] { [movieCapture] }
@@ -122,7 +122,7 @@ actor CaptureService {
     private let previewCIContext = CIContext()
     
     // A serial dispatch queue to use for capture control actions.
-    private let sessionQueue = DispatchSerialQueue(label: "com.example.apple-samplecode.AVCam.sessionQueue")
+    private let sessionQueue = DispatchSerialQueue(label: "com.syncrec.camera.sessionQueue")
     
     // Sets the session queue as the actor's executor.
     nonisolated var unownedExecutor: UnownedSerialExecutor {
@@ -1231,7 +1231,7 @@ actor CaptureService {
 
         if let exposureDuration = desired.exposureDurationSeconds {
             let matches = actual.exposure?.exposureDurationSeconds.map {
-                nearlyEqual($0, exposureDuration, relativeTolerance: 0.001, absoluteTolerance: 0.000_001)
+                exposureDurationsMatch(actual: $0, requested: exposureDuration)
             } ?? false
             reports.append(ManualParameterReport(parameter: "exposure_duration",
                                                  status: matches ? .exact : .incompatible,
@@ -1312,6 +1312,15 @@ actor CaptureService {
                                                  detail: "Profile contains no deterministic settings."))
         }
         return reports
+    }
+
+    private func exposureDurationsMatch(actual: Double, requested: Double) -> Bool {
+        // AVCaptureDevice quantizes custom exposure durations to sensor-supported ticks.
+        // Treat sub-frame, sub-percent differences as the same deterministic shutter.
+        nearlyEqual(actual,
+                    requested,
+                    relativeTolerance: 0.005,
+                    absoluteTolerance: 0.000_050)
     }
 
     private func classification(for reports: [ManualParameterReport],
@@ -1936,14 +1945,18 @@ actor CaptureService {
         guard !captureActivity.isRecording else {
             throw PreviewPhotoCaptureError.recordingActive
         }
+        let frameDeadline = Date().addingTimeInterval(2.0)
+        while !hasFreshPreviewFrame(maxAgeSeconds: 1.0), Date() < frameDeadline {
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
         guard let pixelBuffer = latestPreviewPixelBuffer,
               let pixelBufferTimestamp = latestPreviewPixelBufferTimestamp,
-              Date().timeIntervalSince(pixelBufferTimestamp) <= 2.0 else {
+              Date().timeIntervalSince(pixelBufferTimestamp) <= 1.0 else {
             throw PreviewPhotoCaptureError.noRecentVideoFrame
         }
 
-        let clampedLongEdge = min(max(longEdge, 1280), 1920)
-        let clampedQuality = min(max(jpegQuality, 0.75), 0.85)
+        let clampedLongEdge = min(max(longEdge, 960), 1280)
+        let clampedQuality = min(max(jpegQuality, 0.5), 0.7)
         let encoded = try encodePreviewJPEG(from: pixelBuffer,
                                             longEdge: clampedLongEdge,
                                             jpegQuality: clampedQuality)
@@ -2005,6 +2018,14 @@ actor CaptureService {
         }
 
         return (data, outputWidth, outputHeight)
+    }
+
+    private func hasFreshPreviewFrame(maxAgeSeconds: TimeInterval) -> Bool {
+        guard latestPreviewPixelBuffer != nil,
+              let latestPreviewPixelBufferTimestamp else {
+            return false
+        }
+        return Date().timeIntervalSince(latestPreviewPixelBufferTimestamp) <= maxAgeSeconds
     }
     
     // MARK: - Movie capture

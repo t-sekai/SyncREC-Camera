@@ -18,11 +18,14 @@ class PreviewCameraModel: Camera {
     var isHDRVideoSupported = false
     var isHDRVideoEnabled = false
     var tentacleConnectionState = TentacleConnectionState.connected("Tentacle Preview")
+    var rigState = RigState.normalExit
+    var isRigLowPowerUIActive = false
+    var rigStatusLines = ["Rig: normal_exit", "Director: preview"]
     var tentacleTimecode = TentacleTimecode(payload: Data([30, 16, 21, 21, 3, 0x81, 0x21]))
     var displayedTentacleTimecode = "16:21:21:00"
     var displayedRecordingTimecode = "16:21:21.120"
     var displayedTentacleFPS: Int? = 30
-    var directorWebSocketURL = "ws://192.168.1.10:8765"
+    var directorWebSocketURL = RemoteDirectorConfiguration.defaultDirectorWebSocketURL
     var directorDeviceName = "Camera A"
     var manualControlState = ManualCameraControlState.default
     let manualControlCapabilities = ManualCameraControlCapabilities(

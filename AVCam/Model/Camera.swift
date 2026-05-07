@@ -23,6 +23,15 @@ protocol Camera: AnyObject, SendableMetatype {
     /// The current BLE connection state for Tentacle timecode input.
     var tentacleConnectionState: TentacleConnectionState { get }
 
+    /// The current remote rig power/capture state.
+    var rigState: RigState { get }
+
+    /// Whether the UI should switch to its black low-power rig presentation.
+    var isRigLowPowerUIActive: Bool { get }
+
+    /// Compact status lines for the low-power rig presentation.
+    var rigStatusLines: [String] { get }
+
     /// The most recently received Tentacle timecode payload.
     var tentacleTimecode: TentacleTimecode? { get }
 

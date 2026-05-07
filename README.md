@@ -1,8 +1,8 @@
-# AVCam: Building a camera app
+# SyncREC Camera
 Capture photos and record video using the front and rear iPhone and iPad cameras.
 
 ## Overview
-The AVCam sample shows you how to build a basic camera app for iOS. It demonstrates how to use AVFoundation to access device cameras and microphones, configure a capture session, capture photos and videos, and much more. It also shows how to use the [PhotoKit](https://developer.apple.com/documentation/photokit) framework to save your captured media to the Photos library.
+SyncREC Camera is adapted from Apple's AVCam sample for building a camera app on iOS. It demonstrates how to use AVFoundation to access device cameras and microphones, configure a capture session, capture photos and videos, and much more. It also shows how to use the [PhotoKit](https://developer.apple.com/documentation/photokit) framework to save your captured media to the Photos library.
 
 The sample uses SwiftUI and the features of Swift concurrency to build a responsive camera app. The following diagram describes the app’s design:
 
@@ -16,7 +16,32 @@ The key type the app defines is `CaptureService`, an actor that manages the inte
 Because Simulator doesn't have access to device cameras, it isn't suitable for running the app—you'll need to run it on a device. To run this sample, you'll need the following:
 * An iOS device with iOS 18 or later
 
-AVCam adopts the [LockedCameraCapture](https://developer.apple.com/documentation/lockedcameracapture) framework, which makes the app eligible to launch from the Lock Screen, Control Center, Action Button, and the Camera Control. To support this framework, the sample adds a capture extension target and a Control Center extension target in addition to the main app target. Set your signing credentials on each target to build and run the sample.
+SyncREC Camera adopts the [LockedCameraCapture](https://developer.apple.com/documentation/lockedcameracapture) framework, which makes the app eligible to launch from the Lock Screen, Control Center, Action Button, and the Camera Control. To support this framework, the sample adds a capture extension target and a Control Center extension target in addition to the main app target. Set your signing credentials on each target to build and run the sample.
+
+## Remote rig mode
+This project includes a local-network Python director for controlling multiple foregrounded iPhones. The rig mode is intentionally foreground-only: it doesn't use background camera access, screen-lock camera behavior, background modes, silent audio, or private APIs.
+
+For low-power kiosk operation, enable Guided Access on each iPhone after launching the app:
+
+1. Open Settings > Accessibility > Guided Access and turn Guided Access on.
+2. Launch SyncREC Camera and connect it to the director.
+3. Triple-click the side button or home button and start Guided Access for SyncREC Camera.
+
+When `UIAccessibility.isGuidedAccessEnabled` is true, the app treats the phone as being in rig/kiosk mode. In `armed_idle`, it disables the iOS idle timer, dims the screen, shows a mostly black status UI, stops the `AVCaptureSession`, and keeps the lightweight director WebSocket connected at a low heartbeat rate. Outside Guided Access, the app behaves like a normal iOS camera app: idle screens don't force the phone awake, and the app doesn't aggressively dim the display unless explicitly commanded.
+
+Recommended director flow:
+
+1. Launch the app on all iPhones.
+2. Optionally enable Guided Access for always-awake rig/kiosk behavior.
+3. Connect all iPhones to the Python director.
+4. Send `arm_idle`.
+5. Optionally send `capture_preview_photo` to verify framing.
+6. Send `prepare_recording`.
+7. Send `start_recording`.
+8. Send `stop_recording`.
+9. Return to `arm_idle`.
+
+The director can send these commands to all connected devices or to the selected device. Preview photos are downscaled JPEG uploads saved by the director under `director_app/captures/preview_photos/`, with sidecar JSON metadata next to each image. For larger rigs, the director batches and jitters preview requests so many phones don't upload at the same instant.
 
 ## Configure a capture session
 The central object in any capture app is an instance of [AVCaptureSession](https://developer.apple.com/documentation/avfoundation/avcapturesession). A capture session is the central hub to which the app connects inputs from camera and microphone devices, and attaches them to outputs that capture media like photos and video. After configuring the session, the app uses it to control the flow of data through the capture pipeline.

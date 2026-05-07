@@ -78,6 +78,7 @@ class DirectorGUI:
         ttk.Button(controls, text="Start Server", command=self.start_server).pack(side=LEFT, padx=3)
         ttk.Button(controls, text="Stop Server", command=self.stop_server).pack(side=LEFT, padx=3)
         ttk.Button(controls, text="Ping All", command=self.ping_all).pack(side=LEFT, padx=(10, 3))
+        ttk.Button(controls, text="Status All", command=self.get_status_all).pack(side=LEFT, padx=3)
         ttk.Label(controls, text="Time Source:").pack(side=LEFT, padx=(12, 3))
         source_menu = ttk.Combobox(controls,
                                    textvariable=self.time_source_var,
@@ -101,7 +102,8 @@ class DirectorGUI:
         actions = ttk.Frame(self.root, padding=(8, 2))
         actions.pack(side=TOP, fill=X)
 
-        ttk.Button(actions, text="Arm All", command=self.arm_all).pack(side=LEFT, padx=3)
+        ttk.Button(actions, text="Arm Idle All", command=self.arm_all).pack(side=LEFT, padx=3)
+        ttk.Button(actions, text="Arm Idle Selected", command=self.arm_selected).pack(side=LEFT, padx=3)
         ttk.Label(actions, text="Start Delay (s):").pack(side=LEFT, padx=(12, 3))
         ttk.Entry(actions, textvariable=self.start_delay_var, width=8).pack(side=LEFT)
         ttk.Button(actions, text="Prepare + Commit Start", command=self.start_all).pack(side=LEFT, padx=3)
@@ -109,6 +111,12 @@ class DirectorGUI:
         ttk.Label(actions, text="Stop Delay (s):").pack(side=LEFT, padx=(12, 3))
         ttk.Entry(actions, textvariable=self.stop_delay_var, width=8).pack(side=LEFT)
         ttk.Button(actions, text="Prepare Stop", command=self.stop_all).pack(side=LEFT, padx=3)
+        ttk.Button(actions, text="Prepare Rec All", command=self.prepare_recording_all).pack(side=LEFT, padx=(12, 3))
+        ttk.Button(actions, text="Start Rec All", command=self.start_recording_all).pack(side=LEFT, padx=3)
+        ttk.Button(actions, text="Stop Rec All", command=self.stop_recording_all).pack(side=LEFT, padx=3)
+        ttk.Button(actions, text="Prep Sel", command=self.prepare_recording_selected).pack(side=LEFT, padx=(12, 3))
+        ttk.Button(actions, text="Start Sel", command=self.start_recording_selected).pack(side=LEFT, padx=3)
+        ttk.Button(actions, text="Stop Sel", command=self.stop_recording_selected).pack(side=LEFT, padx=3)
 
         ttk.Separator(self.root).pack(fill=X, padx=8, pady=6)
 
@@ -156,6 +164,7 @@ class DirectorGUI:
             "storage",
             "tentacle",
             "timecode",
+            "rig",
             "camera_params",
             "transfer",
             "preview",
@@ -178,6 +187,7 @@ class DirectorGUI:
             "storage": 75,
             "tentacle": 110,
             "timecode": 120,
+            "rig": 120,
             "camera_params": 180,
             "transfer": 180,
             "preview": 170,
@@ -365,6 +375,7 @@ class DirectorGUI:
                     storage,
                     d["tentacle_state"],
                     timecode_text(d["timecode"], d["fps"]),
+                    str(d.get("rig_state") or ""),
                     camera_params,
                     transfer,
                     preview,
@@ -455,6 +466,9 @@ class DirectorGUI:
     def ping_all(self) -> None:
         self.server.send_command_all("ping", {})
 
+    def get_status_all(self) -> None:
+        self.server.send_command_all("get_status", {})
+
     def start_tentacle(self) -> None:
         if self._time_source_is_laptop():
             self._append_log("Time source is set to laptop. Switch to 'tentacle' to connect BLE timecode.")
@@ -471,7 +485,34 @@ class DirectorGUI:
         self.tentacle_timecode_var.set("Director timecode: --:--:--:--")
 
     def arm_all(self) -> None:
-        self.server.send_command_all("arm", {})
+        self.server.send_command_all("arm_idle", {})
+
+    def arm_selected(self) -> None:
+        self._send_selected_command("arm_idle", {})
+
+    def prepare_recording_all(self) -> None:
+        session_id = datetime.utcnow().strftime("session-%Y%m%d-%H%M%S")
+        self.server.send_command_all("prepare_recording", {"session_id": session_id})
+
+    def start_recording_all(self) -> None:
+        session_id = datetime.utcnow().strftime("session-%Y%m%d-%H%M%S")
+        self.server.send_command_all("start_recording", {"session_id": session_id})
+
+    def stop_recording_all(self) -> None:
+        session_id = datetime.utcnow().strftime("session-%Y%m%d-%H%M%S")
+        self.server.send_command_all("stop_recording", {"session_id": session_id})
+
+    def prepare_recording_selected(self) -> None:
+        session_id = datetime.utcnow().strftime("session-%Y%m%d-%H%M%S")
+        self._send_selected_command("prepare_recording", {"session_id": session_id})
+
+    def start_recording_selected(self) -> None:
+        session_id = datetime.utcnow().strftime("session-%Y%m%d-%H%M%S")
+        self._send_selected_command("start_recording", {"session_id": session_id})
+
+    def stop_recording_selected(self) -> None:
+        session_id = datetime.utcnow().strftime("session-%Y%m%d-%H%M%S")
+        self._send_selected_command("stop_recording", {"session_id": session_id})
 
     def start_all(self) -> None:
         delay = parse_delay(self.start_delay_var.get(), fallback=2.0)
@@ -566,6 +607,13 @@ class DirectorGUI:
         if not values or len(values) < 2:
             return ""
         return str(values[1])
+
+    def _send_selected_command(self, command: str, payload: dict[str, Any]) -> None:
+        device_id = self._selected_device_id()
+        if not device_id:
+            self._append_log(f"Select one device row before sending {command}.")
+            return
+        self.server.send_command_to_device(device_id, command, payload)
 
     def _open_path(self, path: Path) -> None:
         try:

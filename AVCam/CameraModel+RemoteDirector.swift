@@ -18,6 +18,8 @@ struct RemoteDirectorStatusPayload {
     let fps: Int?
     let cameraParamsStatus: String?
     let cameraParamsSummary: String?
+    let rigState: RigState
+    let preferredStatusIntervalMS: UInt64
 
     static let empty = RemoteDirectorStatusPayload(recording: false,
                                                    armed: false,
@@ -27,14 +29,22 @@ struct RemoteDirectorStatusPayload {
                                                    timecode: "",
                                                    fps: nil,
                                                    cameraParamsStatus: nil,
-                                                   cameraParamsSummary: nil)
+                                                   cameraParamsSummary: nil,
+                                                   rigState: .normalExit,
+                                                   preferredStatusIntervalMS: 1_000)
 }
 
 enum RemoteDirectorCommand {
     case arm
+    case armIdle
     case prepareStart(sessionID: String, startAtUnixMS: Int64)
     case commitStart(sessionID: String, startAtUnixMS: Int64)
     case prepareStop(sessionID: String, stopAtUnixMS: Int64)
+    case prepareRecording(sessionID: String?)
+    case startRecording(sessionID: String?, startAtUnixMS: Int64?)
+    case stopRecording(sessionID: String?, stopAtUnixMS: Int64?)
+    case getStatus
+    case setBrightness(Double)
     case pullVideos(jobID: String, policy: String, maxFiles: Int, uploadURL: String?)
     case capturePreviewPhoto(batchID: String,
                              uploadURL: String?,
@@ -83,6 +93,7 @@ final class RemoteDirectorClient {
     var commandHandler: CommandHandler?
     var timeSyncHandler: TimeSyncHandler?
     var deviceNameProvider: (() -> String)?
+    private(set) var connectionStatus = "disconnected"
 
     private let session = URLSession(configuration: .default)
     private let deviceID: String
@@ -107,10 +118,12 @@ final class RemoteDirectorClient {
     func start() {
         guard !shouldRun else { return }
         guard directorURL() != nil else {
-            logger.info("Remote director disabled. Set UserDefaults key \(RemoteDirectorConfiguration.directorWebSocketURLDefaultsKey, privacy: .public) to ws://<host>:8765.")
+            logger.info("Remote director URL unavailable. Set UserDefaults key \(RemoteDirectorConfiguration.directorWebSocketURLDefaultsKey, privacy: .public) to ws://<host>:8765.")
+            connectionStatus = "not_configured"
             return
         }
         shouldRun = true
+        connectionStatus = "connecting"
         connectIfNeeded()
     }
 
@@ -129,6 +142,7 @@ final class RemoteDirectorClient {
         isConnecting = false
         clockOffsetSamplesMS.removeAll(keepingCapacity: true)
         estimatedClockOffsetMS = 0
+        connectionStatus = "disconnected"
     }
 
     var hasConfiguredDirectorURL: Bool {
@@ -303,10 +317,12 @@ final class RemoteDirectorClient {
         guard let url = directorURL() else { return }
 
         isConnecting = true
+        connectionStatus = "connecting"
         let task = session.webSocketTask(with: url)
         webSocketTask = task
         task.resume()
         isConnecting = false
+        connectionStatus = "connected"
 
         logger.info("Connected to remote director \(url.absoluteString, privacy: .public)")
 
@@ -354,7 +370,9 @@ final class RemoteDirectorClient {
 
     private func statusLoop() async {
         while shouldRun {
-            try? await Task.sleep(nanoseconds: Self.statusIntervalMS * 1_000_000)
+            let interval = statusProvider?().preferredStatusIntervalMS ?? Self.statusIntervalMS
+            let clampedInterval = min(max(interval, 1_000), 15_000)
+            try? await Task.sleep(nanoseconds: clampedInterval * 1_000_000)
             if Task.isCancelled { return }
             await sendStatus()
         }
@@ -369,6 +387,7 @@ final class RemoteDirectorClient {
         pendingBurstStatusTask = nil
         webSocketTask = nil
         isConnecting = false
+        connectionStatus = "disconnected"
 
         guard shouldRun else { return }
         reconnectTask?.cancel()
@@ -419,6 +438,7 @@ final class RemoteDirectorClient {
         if let cameraParamsSummary = status.cameraParamsSummary {
             message["camera_params_summary"] = cameraParamsSummary
         }
+        message["rig_state"] = status.rigState.rawValue
 
         await sendJSONObject(message)
     }
@@ -543,6 +563,8 @@ final class RemoteDirectorClient {
         switch commandName {
         case "arm":
             command = .arm
+        case "arm_idle", "set_idle":
+            command = .armIdle
         case "prepare_start":
             guard let sessionID = payload["session_id"] as? String,
                   let startAtUnixMS = int64Value(payload["start_at_unix_ms"]) else { return nil }
@@ -555,6 +577,21 @@ final class RemoteDirectorClient {
             let sessionID = payload["session_id"] as? String ?? "unknown-session"
             guard let stopAtUnixMS = int64Value(payload["stop_at_unix_ms"]) else { return nil }
             command = .prepareStop(sessionID: sessionID, stopAtUnixMS: stopAtUnixMS)
+        case "prepare_recording":
+            command = .prepareRecording(sessionID: payload["session_id"] as? String)
+        case "start_recording":
+            command = .startRecording(sessionID: payload["session_id"] as? String,
+                                      startAtUnixMS: int64Value(payload["start_at_unix_ms"]))
+        case "stop_recording":
+            command = .stopRecording(sessionID: payload["session_id"] as? String,
+                                     stopAtUnixMS: int64Value(payload["stop_at_unix_ms"]))
+        case "get_status":
+            command = .getStatus
+        case "set_brightness":
+            guard let brightness = doubleValue(payload["brightness"]) ?? doubleValue(payload["value"]) else {
+                return nil
+            }
+            command = .setBrightness(brightness)
         case "pull_videos":
             let jobID = (payload["job_id"] as? String).flatMap {
                 let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -573,8 +610,8 @@ final class RemoteDirectorClient {
                 return trimmed.isEmpty ? nil : trimmed
             } ?? "preview-\(UUID().uuidString)"
             let uploadURL = payload["upload_url"] as? String
-            let longEdge = intValue(payload["long_edge"]) ?? 1600
-            let jpegQuality = doubleValue(payload["jpeg_quality"]) ?? 0.8
+            let longEdge = intValue(payload["long_edge"]) ?? 1280
+            let jpegQuality = doubleValue(payload["jpeg_quality"]) ?? 0.65
             let uploadJitterSeconds = max(0, doubleValue(payload["upload_jitter_seconds"]) ?? 0)
             let attempt = max(1, intValue(payload["attempt"]) ?? 1)
             command = .capturePreviewPhoto(batchID: batchID,
@@ -652,7 +689,7 @@ final class RemoteDirectorClient {
             return url
         }
 
-        return nil
+        return URL(string: RemoteDirectorConfiguration.defaultDirectorWebSocketURL)
     }
 
     private static func loadOrCreateDeviceID() -> String {

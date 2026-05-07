@@ -2,7 +2,7 @@
 See the LICENSE.txt file for this sample’s licensing information.
 
 Abstract:
-A camera capture intent for AVCam.
+A camera capture intent for SyncREC Camera.
 */
 
 import LockedCameraCapture
@@ -14,12 +14,12 @@ struct AVCamCaptureIntent: CameraCaptureIntent {
     /// The context object for the capture intent.
     typealias AppContext = CameraState
     
-    static let title: LocalizedStringResource = "AVCamCaptureIntent"
-    static let description: IntentDescription = IntentDescription("Capture photos and videos with AVCam.")
+    static let title: LocalizedStringResource = "SyncREC Camera"
+    static let description: IntentDescription = IntentDescription("Capture photos and videos with SyncREC Camera.")
 
     @MainActor
     func perform() async throws -> some IntentResult {
-        os.Logger().debug("AVCam capture intent performed successfully.")
+        os.Logger().debug("SyncREC Camera capture intent performed successfully.")
         // The return type of this intent is None; the success status isn't user-visible.
         return .result()
     }

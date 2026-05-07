@@ -30,7 +30,7 @@ final class MovieCapture: OutputService {
     // active format supports HDR.
     private var isHDRSupported = false
 
-    private static let remuxQueue = DispatchQueue(label: "com.example.apple-samplecode.AVCam.timecodeRemuxQueue")
+    private static let remuxQueue = DispatchQueue(label: "com.syncrec.camera.timecodeRemuxQueue")
     
     // MARK: - Capturing a movie
     

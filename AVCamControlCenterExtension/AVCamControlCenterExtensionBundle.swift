@@ -2,7 +2,7 @@
 See the LICENSE.txt file for this sample’s licensing information.
 
 Abstract:
-A Control Center extension bundle for AVCam.
+A Control Center extension bundle for SyncREC Camera.
 */
 
 import WidgetKit

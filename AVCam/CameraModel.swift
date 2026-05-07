@@ -7,11 +7,13 @@ An object that provides the interface to the features of the camera.
 
 import SwiftUI
 import Combine
+import UIKit
 
 enum RemoteDirectorConfiguration {
     static let directorWebSocketURLDefaultsKey = "DirectorWebSocketURL"
     static let directorWebSocketURLInfoKey = "DirectorWebSocketURL"
     static let directorDeviceNameDefaultsKey = "DirectorDeviceName"
+    static let defaultDirectorWebSocketURL = "ws://192.168.0.20:8765"
 }
 
 private enum RemoteTransferConfiguration {
@@ -142,6 +144,15 @@ final class CameraModel: Camera {
     /// A Boolean value that indicates whether this camera is armed for remote trigger.
     private(set) var isRemoteArmed = false
 
+    /// The current app-level rig state for remote low-power operation.
+    private(set) var rigState: RigState = .normalExit
+
+    /// Whether the UI should present the black low-power rig screen.
+    private(set) var isRigLowPowerUIActive = false
+
+    /// Compact status lines shown in the low-power rig UI.
+    private(set) var rigStatusLines = [String]()
+
     /// Prevents manual-control didSet recursion when updates originate from capture-device sync.
     private var isUpdatingManualControlState = false
 
@@ -210,6 +221,12 @@ final class CameraModel: Camera {
 
     /// Ensures camera state observers are only attached once.
     private var hasAttachedStateObservers = false
+
+    /// Observes Guided Access mode changes so rig power policy can be restored immediately.
+    private var guidedAccessObserver: NSObjectProtocol?
+
+    /// Stores the pre-rig brightness when this app changes brightness for Guided Access rig mode.
+    private var brightnessBeforeRigDim: CGFloat?
     
     /// Persistent state shared between the app and capture extension.
     private var cameraState = CameraState()
@@ -284,6 +301,8 @@ final class CameraModel: Camera {
 
         directorWebSocketURL = currentDirectorWebSocketURL()
         directorDeviceName = currentDirectorDeviceName()
+        observeGuidedAccessChanges()
+        updateRigStatusLines()
         isUpdatingManualControlState = true
         manualControlState = loadManualControlState()
         isUpdatingManualControlState = false
@@ -330,13 +349,15 @@ final class CameraModel: Camera {
     }
 
     private func currentDirectorWebSocketURL() -> String {
-        if let defaultsURL = UserDefaults.standard.string(forKey: RemoteDirectorConfiguration.directorWebSocketURLDefaultsKey) {
+        if let defaultsURL = UserDefaults.standard.string(forKey: RemoteDirectorConfiguration.directorWebSocketURLDefaultsKey),
+           !defaultsURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return defaultsURL
         }
-        if let infoURL = Bundle.main.object(forInfoDictionaryKey: RemoteDirectorConfiguration.directorWebSocketURLInfoKey) as? String {
+        if let infoURL = Bundle.main.object(forInfoDictionaryKey: RemoteDirectorConfiguration.directorWebSocketURLInfoKey) as? String,
+           !infoURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             return infoURL
         }
-        return ""
+        return RemoteDirectorConfiguration.defaultDirectorWebSocketURL
     }
 
     private func handleDirectorDeviceNameChange(from oldValue: String) {
@@ -361,6 +382,82 @@ final class CameraModel: Camera {
             return defaultsValue
         }
         return UIDevice.current.name
+    }
+
+    var isRigKioskMode: Bool {
+        UIAccessibility.isGuidedAccessEnabled
+    }
+
+    private func observeGuidedAccessChanges() {
+        guidedAccessObserver = NotificationCenter.default.addObserver(
+            forName: UIAccessibility.guidedAccessStatusDidChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                await self.handleGuidedAccessStatusChange()
+            }
+        }
+    }
+
+    private func handleGuidedAccessStatusChange() async {
+        logger.info("Guided Access status changed. rigKioskMode=\(self.isRigKioskMode, privacy: .public)")
+        if !isRigKioskMode && rigState == .armedIdle {
+            rigState = .normalExit
+            _ = await ensureCaptureSessionRunningForRig(reason: "guided_access_disabled")
+        }
+        applyRigPowerPolicy()
+        updateRigStatusLines()
+        remoteDirectorClient.sendStatusNow()
+    }
+
+    private func applyRigPowerPolicy() {
+        // Camera/network control in this app is foreground-only. Guided Access can keep the app
+        // onscreen as a rig/kiosk controller, but this code does not rely on background camera
+        // access, screen-lock camera access, background modes, silent audio, or private APIs.
+        let shouldKeepAwake = captureActivity.isRecording || rigState == .recording || rigState == .recordingPrepared || (isRigKioskMode && rigState == .armedIdle)
+        setApplicationIdleTimerDisabled(shouldKeepAwake)
+
+        let shouldDimForRig = isRigKioskMode && (rigState == .armedIdle || rigState == .preview || rigState == .recordingPrepared || rigState == .recording)
+        if shouldDimForRig {
+            if brightnessBeforeRigDim == nil {
+                brightnessBeforeRigDim = UIScreen.main.brightness
+            }
+            UIScreen.main.brightness = 0.01
+        } else if let brightnessBeforeRigDim {
+            UIScreen.main.brightness = brightnessBeforeRigDim
+            self.brightnessBeforeRigDim = nil
+        }
+
+        isRigLowPowerUIActive = isRigKioskMode && rigState == .armedIdle
+    }
+
+    private func setApplicationIdleTimerDisabled(_ disabled: Bool) {
+        guard Bundle.main.bundleURL.pathExtension != "appex" else { return }
+        let selector = NSSelectorFromString("sharedApplication")
+        guard let applicationClass = NSClassFromString("UIApplication") as? NSObject.Type,
+              applicationClass.responds(to: selector),
+              let unmanagedApplication = applicationClass.perform(selector),
+              let application = unmanagedApplication.takeUnretainedValue() as? UIApplication else {
+            return
+        }
+        application.isIdleTimerDisabled = disabled
+    }
+
+    private func updateRigStatusLines() {
+        let batteryText = UIDevice.current.batteryLevelNormalized
+            .map { "\(Int(($0 * 100).rounded()))%" } ?? "unknown"
+        let storageText = FileManager.default.availableStorageGB
+            .map { String(format: "%.1f GB free", $0) } ?? "storage unknown"
+        rigStatusLines = [
+            "Device: \(directorDeviceName)",
+            "ID: \(remoteDirectorClient.transferDeviceID())",
+            "Director: \(remoteDirectorClient.connectionStatus)",
+            "Battery: \(batteryText)",
+            "Storage: \(storageText)",
+            "Rig: \(rigState.rawValue)"
+        ]
     }
 
     private func configuredTimecodeInputModeSetting() -> TimecodeInputModeSetting {
@@ -480,6 +577,17 @@ final class CameraModel: Camera {
         isUpdatingManualControlState = false
     }
 
+    private func refreshManualControlCapabilitiesFromDevice() async {
+        let snapshot = await captureService.currentManualControlSnapshot()
+        let capabilities = snapshot.capabilities
+        guard capabilities.hasAnySupportedControl || manualControlCapabilities == .unavailable else {
+            return
+        }
+        guard capabilities != manualControlCapabilities else { return }
+
+        manualControlCapabilities = capabilities
+    }
+
     private func startManualControlRefreshIfNeeded() {
         guard status == .running, activeManualLockProfile == nil else {
             stopManualControlRefresh()
@@ -540,6 +648,7 @@ final class CameraModel: Camera {
                                                                    reason: reason,
                                                                    requestID: requestID,
                                                                    dryRun: false)
+        await refreshManualControlCapabilitiesFromDevice()
         updateManualLockProfileState(from: report)
         persistManualLockProfileStore()
         remoteDirectorClient.sendStatusNow()
@@ -551,6 +660,7 @@ final class CameraModel: Camera {
         stopManualControlRefresh()
         manualProfileDriftStatus = .reapplying
         let report = await captureService.reapplyManualLockProfile(reason: reason, requestID: requestID)
+        await refreshManualControlCapabilitiesFromDevice()
         updateManualLockProfileState(from: report)
         persistManualLockProfileStore()
         remoteDirectorClient.sendStatusNow()
@@ -1091,32 +1201,19 @@ final class CameraModel: Camera {
     // MARK: - Starting the camera
     /// Start the camera and begin the stream of data.
     func start() async {
-        // Verify that the person authorizes the app to use device cameras and microphones.
-        guard await captureService.isAuthorized else {
-            status = .unauthorized
+        if let failure = await ensureCaptureSessionRunningForRig(reason: "camera_start") {
+            logger.error("Failed to start capture service. \(failure.detail, privacy: .public)")
             return
         }
-        do {
-            // Synchronize the state of the model with the persistent state.
-            await syncState()
-            // Start the capture service to start the flow of data.
-            try await captureService.start(with: cameraState)
-            if !hasAttachedStateObservers {
-                observeState()
-                hasAttachedStateObservers = true
-            }
-            status = .running
-            localVideoURLs = await localVideoStore.loadStoredVideos()
-            if activeManualLockProfile != nil {
-                await installActiveManualLockProfile(reason: "camera_start")
-            } else {
-                await applyManualControlStateToDevice()
-            }
-            remoteDirectorClient.start()
-            startActiveTimecodeService()
-        } catch {
-            logger.error("Failed to start capture service. \(error)")
-            status = .failed
+        if rigState == .shutdown {
+            rigState = .normalExit
+        }
+        remoteDirectorClient.start()
+        if rigState == .armedIdle {
+            _ = await transitionRigState(to: .armedIdle, reason: "camera_start_restore_armed_idle")
+        } else {
+            applyRigPowerPolicy()
+            updateRigStatusLines()
         }
     }
 
@@ -1127,7 +1224,13 @@ final class CameraModel: Camera {
 
         remotePullVideosTask?.cancel()
         remotePullVideosTask = nil
+        remotePreviewPhotoTask?.cancel()
+        remotePreviewPhotoTask = nil
         await captureService.stop()
+        rigState = .normalExit
+        isRemoteArmed = false
+        applyRigPowerPolicy()
+        updateRigStatusLines()
         stopAllTimecodeServices()
         remoteDirectorClient.stop()
         stopRecordingClock()
@@ -1296,6 +1399,9 @@ final class CameraModel: Camera {
                 localVideoURLs = await localVideoStore.loadStoredVideos()
                 recordingStartTimecodeMetadata = nil
                 stopRecordingClock()
+                rigState = isRemoteArmed ? .recordingPrepared : .normalExit
+                applyRigPowerPolicy()
+                updateRigStatusLines()
             } catch {
                 logger.error("Failed to persist local video: \(error.localizedDescription, privacy: .public)")
                 self.error = error
@@ -1311,12 +1417,16 @@ final class CameraModel: Camera {
                 persistManualLockProfileStore()
                 guard validation.classification == .exactMatch || validation.classification == .adjustedMatch else {
                     recordingStartTimecodeMetadata = nil
+                    applyRigPowerPolicy()
                     remoteDirectorClient.sendStatusNow()
                     return
                 }
             }
             pendingRecordingCalibrationJSON = calibrationJSON
             startRecordingClock(seedTimecode: recordingSeedTimecode)
+            rigState = .recording
+            applyRigPowerPolicy()
+            updateRigStatusLines()
         }
     }
     
@@ -1343,6 +1453,11 @@ final class CameraModel: Camera {
                     if !activity.isRecording, recordingClockAnchor != nil {
                         stopRecordingClock()
                     }
+                    if activity.isRecording {
+                        rigState = .recording
+                    }
+                    applyRigPowerPolicy()
+                    updateRigStatusLines()
                     remoteDirectorClient.sendStatusNow()
                 }
             }
@@ -1413,6 +1528,7 @@ final class CameraModel: Camera {
     }
 
     private func remoteStatusPayload() -> RemoteDirectorStatusPayload {
+        updateRigStatusLines()
         let storageGB = FileManager.default.availableStorageGB
         let currentTimecode = currentTentacleTimecode()
         return RemoteDirectorStatusPayload(
@@ -1424,24 +1540,278 @@ final class CameraModel: Camera {
             timecode: currentTimecode?.formatted ?? displayedTentacleTimecode,
             fps: currentTimecode?.fps ?? displayedTentacleFPS,
             cameraParamsStatus: activeManualLockProfile == nil ? "none" : manualProfileDriftStatus.rawValue,
-            cameraParamsSummary: manualCameraParamsSummary()
+            cameraParamsSummary: manualCameraParamsSummary(),
+            rigState: rigState,
+            preferredStatusIntervalMS: rigState == .armedIdle ? 5_000 : 1_000
         )
+    }
+
+    private func transitionRigState(to targetState: RigState,
+                                    reason: String,
+                                    stopRecordingIfNeeded: Bool = false) async -> RemoteDirectorCommandReply {
+        logger.info("Rig transition \(self.rigState.rawValue, privacy: .public) -> \(targetState.rawValue, privacy: .public), reason=\(reason, privacy: .public)")
+        let isRecording = await isCapturePipelineRecording()
+
+        switch targetState {
+        case .armedIdle:
+            if isRecording {
+                guard stopRecordingIfNeeded else {
+                    return rigReply(ok: false,
+                                    message: "Refused to enter armed idle while recording.",
+                                    error: "recording_active")
+                }
+                let stopReply = await stopRigRecording(reason: reason)
+                guard stopReply.ok else { return stopReply }
+            }
+
+            remoteStartTask?.cancel()
+            remoteStopTask?.cancel()
+            pendingRemoteStart = nil
+            isRemoteArmed = true
+            stopManualControlRefresh()
+            await refreshManualControlCapabilitiesFromDevice()
+            await captureService.stop()
+            rigState = .armedIdle
+            applyRigPowerPolicy()
+            updateRigStatusLines()
+            remoteDirectorClient.sendStatusNow()
+            return rigReply(ok: true, message: "Entered armed idle.")
+
+        case .preview:
+            if isRecording {
+                return rigReply(ok: false,
+                                message: "Refused preview while recording.",
+                                error: "recording_active")
+            }
+            if let failure = await ensureCaptureSessionRunningForRig(reason: reason) {
+                return failure
+            }
+            rigState = .preview
+            applyRigPowerPolicy()
+            updateRigStatusLines()
+            remoteDirectorClient.sendStatusNow()
+            return rigReply(ok: true, message: "Preview session ready.")
+
+        case .recordingPrepared:
+            if isRecording {
+                rigState = .recording
+                applyRigPowerPolicy()
+                return rigReply(ok: true, message: "Already recording.")
+            }
+            if rigState == .recordingPrepared {
+                applyRigPowerPolicy()
+                return rigReply(ok: true, message: "Recording already prepared.")
+            }
+            if let failure = await ensureCaptureSessionRunningForRig(reason: reason) {
+                return failure
+            }
+            isRemoteArmed = true
+            rigState = .recordingPrepared
+            applyRigPowerPolicy()
+            updateRigStatusLines()
+            remoteDirectorClient.sendStatusNow()
+            return rigReply(ok: true, message: "Recording prepared.")
+
+        case .recording:
+            if isRecording {
+                rigState = .recording
+                applyRigPowerPolicy()
+                return rigReply(ok: true, message: "Already recording.")
+            }
+            if rigState != .recordingPrepared {
+                let prepareReply = await transitionRigState(to: .recordingPrepared, reason: "\(reason)_prepare")
+                guard prepareReply.ok else { return prepareReply }
+            }
+            return await startRigRecording(reason: reason)
+
+        case .shutdown, .normalExit:
+            if isRecording {
+                guard stopRecordingIfNeeded else {
+                    return rigReply(ok: false,
+                                    message: "Refused normal exit while recording.",
+                                    error: "recording_active")
+                }
+                let stopReply = await stopRigRecording(reason: reason)
+                guard stopReply.ok else { return stopReply }
+            }
+            remoteStartTask?.cancel()
+            remoteStopTask?.cancel()
+            stopManualControlRefresh()
+            await captureService.stop()
+            rigState = targetState
+            isRemoteArmed = false
+            applyRigPowerPolicy()
+            updateRigStatusLines()
+            remoteDirectorClient.sendStatusNow()
+            return rigReply(ok: true, message: "Exited rig mode.")
+        }
+    }
+
+    private func isCapturePipelineRecording() async -> Bool {
+        let serviceCaptureActivity = await captureService.captureActivity
+        return captureActivity.isRecording || serviceCaptureActivity.isRecording
+    }
+
+    private func ensureCaptureSessionRunningForRig(reason: String) async -> RemoteDirectorCommandReply? {
+        guard await captureService.isAuthorized else {
+            status = .unauthorized
+            return rigReply(ok: false,
+                            message: "Camera authorization is unavailable.",
+                            error: "unauthorized")
+        }
+
+        do {
+            await syncState()
+            try await captureService.start(with: cameraState)
+            if !hasAttachedStateObservers {
+                observeState()
+                hasAttachedStateObservers = true
+            }
+            status = .running
+            localVideoURLs = await localVideoStore.loadStoredVideos()
+            await refreshManualControlCapabilitiesFromDevice()
+            if activeManualLockProfile != nil {
+                await installActiveManualLockProfile(reason: reason)
+            } else {
+                await applyManualControlStateToDevice()
+            }
+            startActiveTimecodeService()
+            return nil
+        } catch {
+            status = .failed
+            logger.error("Failed to start capture session for rig transition: \(error.localizedDescription, privacy: .public)")
+            return rigReply(ok: false,
+                            message: "Failed to start capture session: \(error.localizedDescription)",
+                            error: "capture_session_failed")
+        }
+    }
+
+    private func startRigRecording(reason: String) async -> RemoteDirectorCommandReply {
+        let recordingSeedTimecode = recordingSeedTentacleTimecode()
+        recordingStartTimecodeMetadata = currentRecordingStartMetadata()
+        let calibrationJSON = await captureService.recordingCalibrationJSONData()
+        let validation = await captureService.startRecording(recordingStartMetadata: recordingStartTimecodeMetadata)
+        if let validation {
+            updateManualLockProfileState(from: validation)
+            persistManualLockProfileStore()
+            guard validation.classification == .exactMatch || validation.classification == .adjustedMatch else {
+                recordingStartTimecodeMetadata = nil
+                rigState = .recordingPrepared
+                applyRigPowerPolicy()
+                remoteDirectorClient.sendStatusNow()
+                return rigReply(ok: false,
+                                message: validation.detail,
+                                error: "manual_lock_validation_failed",
+                                extra: ["validation_report": jsonObject(validation) ?? [:]])
+            }
+        }
+        pendingRecordingCalibrationJSON = calibrationJSON
+        startRecordingClock(seedTimecode: recordingSeedTimecode)
+        rigState = .recording
+        applyRigPowerPolicy()
+        updateRigStatusLines()
+        remoteDirectorClient.sendStatusNow()
+        return rigReply(ok: true, message: "Recording started.")
+    }
+
+    private func stopRigRecording(reason: String) async -> RemoteDirectorCommandReply {
+        guard await isCapturePipelineRecording() else {
+            return rigReply(ok: false,
+                            message: "Not recording.",
+                            error: "not_recording")
+        }
+
+        let calibrationJSON = pendingRecordingCalibrationJSON
+        pendingRecordingCalibrationJSON = nil
+        do {
+            let movie = try await captureService.stopRecording()
+            _ = try await localVideoStore.store(movie: movie, calibrationJSON: calibrationJSON)
+            localVideoURLs = await localVideoStore.loadStoredVideos()
+            recordingStartTimecodeMetadata = nil
+            stopRecordingClock()
+            rigState = .recordingPrepared
+            applyRigPowerPolicy()
+            updateRigStatusLines()
+            remoteDirectorClient.sendStatusNow()
+            return rigReply(ok: true, message: "Recording stopped.")
+        } catch {
+            logger.error("Failed to stop rig recording: \(error.localizedDescription, privacy: .public)")
+            self.error = error
+            applyRigPowerPolicy()
+            return rigReply(ok: false,
+                            message: "Failed to stop recording: \(error.localizedDescription)",
+                            error: "stop_recording_failed")
+        }
+    }
+
+    private func setRigBrightness(_ brightness: Double) -> RemoteDirectorCommandReply {
+        let clamped = min(max(brightness, 0.01), 1.0)
+        if brightnessBeforeRigDim == nil {
+            brightnessBeforeRigDim = UIScreen.main.brightness
+        }
+        UIScreen.main.brightness = clamped
+        updateRigStatusLines()
+        return rigReply(ok: true,
+                        message: String(format: "Brightness set to %.2f.", clamped),
+                        extra: ["brightness": clamped])
+    }
+
+    private func rigReply(ok: Bool,
+                          message: String,
+                          error: String? = nil,
+                          extra: [String: Any] = [:]) -> RemoteDirectorCommandReply {
+        var payload = rigStatusPayload(message: message)
+        if let error {
+            payload["error"] = error
+        }
+        for (key, value) in extra {
+            payload[key] = value
+        }
+        return ok ? .success(message, payload: payload) : .failure(message, payload: payload)
+    }
+
+    private func rigStatusPayload(message: String) -> [String: Any] {
+        updateRigStatusLines()
+        var payload: [String: Any] = [
+            "current_state": rigState.rawValue,
+            "device_id": remoteDirectorClient.transferDeviceID(),
+            "device_name": directorDeviceName,
+            "message": message,
+            "guided_access_enabled": isRigKioskMode,
+            "director_connection": remoteDirectorClient.connectionStatus
+        ]
+        if let battery = UIDevice.current.batteryLevelNormalized {
+            payload["battery"] = battery
+        }
+        if let storageGB = FileManager.default.availableStorageGB {
+            payload["storage_gb"] = storageGB
+        }
+        return payload
     }
 
     private func handleRemoteDirectorCommand(_ command: RemoteDirectorCommandEnvelope) async -> RemoteDirectorCommandReply {
         switch command.command {
         case .arm:
             isRemoteArmed = true
-            return .success("Armed.")
+            applyRigPowerPolicy()
+            return rigReply(ok: true, message: "Armed.")
+
+        case .armIdle:
+            return await transitionRigState(to: .armedIdle, reason: "remote_arm_idle")
 
         case .prepareStart(let sessionID, let startAtUnixMS):
+            let prepareReply = await transitionRigState(to: .recordingPrepared,
+                                                        reason: "remote_prepare_start")
+            guard prepareReply.ok else { return prepareReply }
             pendingRemoteStart = PreparedRemoteStart(sessionID: sessionID, startAtUnixMS: startAtUnixMS)
             isRemoteArmed = true
-            return .success("Prepared start for session \(sessionID).")
+            return rigReply(ok: true, message: "Prepared start for session \(sessionID).")
 
         case .commitStart(let sessionID, let startAtUnixMS):
             guard let prepared = pendingRemoteStart, prepared.sessionID == sessionID else {
-                return .failure("Missing matching prepare_start for session \(sessionID).")
+                return rigReply(ok: false,
+                                message: "Missing matching prepare_start for session \(sessionID).",
+                                error: "missing_prepare")
             }
 
             let targetUnixMS = max(prepared.startAtUnixMS, startAtUnixMS)
@@ -1450,11 +1820,12 @@ final class CameraModel: Camera {
                 guard let self else { return }
                 await self.waitUntil(unixMilliseconds: targetUnixMS)
                 guard !Task.isCancelled else { return }
-                await self.performRemoteStart()
+                _ = await self.transitionRigState(to: .recording,
+                                                  reason: "remote_commit_start")
                 self.pendingRemoteStart = nil
                 self.remoteDirectorClient.sendStatusNow()
             }
-            return .success("Commit accepted for session \(sessionID).")
+            return rigReply(ok: true, message: "Commit accepted for session \(sessionID).")
 
         case .prepareStop(_, let stopAtUnixMS):
             remoteStopTask?.cancel()
@@ -1462,14 +1833,67 @@ final class CameraModel: Camera {
                 guard let self else { return }
                 await self.waitUntil(unixMilliseconds: stopAtUnixMS)
                 guard !Task.isCancelled else { return }
-                await self.performRemoteStop()
+                _ = await self.transitionRigState(to: .armedIdle,
+                                                  reason: "remote_prepare_stop",
+                                                  stopRecordingIfNeeded: true)
                 self.remoteDirectorClient.sendStatusNow()
             }
-            return .success("Prepared stop.")
+            return rigReply(ok: true, message: "Prepared stop.")
+
+        case .prepareRecording:
+            return await transitionRigState(to: .recordingPrepared,
+                                            reason: "remote_prepare_recording")
+
+        case .startRecording(_, let startAtUnixMS):
+            if let startAtUnixMS {
+                remoteStartTask?.cancel()
+                remoteStartTask = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.waitUntil(unixMilliseconds: startAtUnixMS)
+                    guard !Task.isCancelled else { return }
+                    _ = await self.transitionRigState(to: .recording,
+                                                      reason: "remote_start_recording_scheduled")
+                }
+                return rigReply(ok: true, message: "Scheduled recording start.")
+            }
+            return await transitionRigState(to: .recording,
+                                            reason: "remote_start_recording")
+
+        case .stopRecording(_, let stopAtUnixMS):
+            if let stopAtUnixMS {
+                remoteStopTask?.cancel()
+                remoteStopTask = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    await self.waitUntil(unixMilliseconds: stopAtUnixMS)
+                    guard !Task.isCancelled else { return }
+                    _ = await self.transitionRigState(to: .armedIdle,
+                                                      reason: "remote_stop_recording_scheduled",
+                                                      stopRecordingIfNeeded: true)
+                }
+                return rigReply(ok: true, message: "Scheduled recording stop.")
+            }
+            guard await isCapturePipelineRecording() else {
+                _ = await transitionRigState(to: .armedIdle,
+                                             reason: "remote_stop_recording_not_recording")
+                return rigReply(ok: false,
+                                message: "Not recording. Entered armed idle.",
+                                error: "not_recording")
+            }
+            return await transitionRigState(to: .armedIdle,
+                                            reason: "remote_stop_recording",
+                                            stopRecordingIfNeeded: true)
+
+        case .getStatus:
+            return rigReply(ok: true, message: "Status.")
+
+        case .setBrightness(let brightness):
+            return setRigBrightness(brightness)
 
         case .pullVideos(let jobID, let policyRawValue, let maxFiles, let uploadURL):
             if let remotePullVideosTask, !remotePullVideosTask.isCancelled {
-                return .failure("A pull_videos transfer is already running.")
+                return rigReply(ok: false,
+                                message: "A pull_videos transfer is already running.",
+                                error: "busy")
             }
 
             let request = RemotePullVideosRequest(jobID: jobID,
@@ -1482,22 +1906,26 @@ final class CameraModel: Camera {
                 defer { self.remotePullVideosTask = nil }
                 await self.runRemotePullVideosJob(request)
             }
-            return .success("Accepted pull_videos job \(jobID).")
+            return rigReply(ok: true, message: "Accepted pull_videos job \(jobID).")
 
         case .capturePreviewPhoto(let batchID, let uploadURL, let longEdge, let jpegQuality, let uploadJitterSeconds, let attempt):
-            guard status == .running else {
-                return .failure("Camera is not running.", payload: ["status": "capture_failed"])
-            }
             guard !captureActivity.isRecording else {
-                return .failure("Refused to capture preview photo while recording.",
-                                payload: ["status": "recording_active"])
+                return rigReply(ok: false,
+                                message: "Refused to capture preview photo while recording.",
+                                error: "recording_active",
+                                extra: ["status": "recording_active"])
             }
             guard remoteDirectorClient.resolveUploadBaseURL(override: uploadURL) != nil else {
-                return .failure("Unable to resolve upload URL.", payload: ["status": "upload_failed"])
+                return rigReply(ok: false,
+                                message: "Unable to resolve upload URL.",
+                                error: "upload_failed",
+                                extra: ["status": "upload_failed"])
             }
             if let remotePreviewPhotoTask, !remotePreviewPhotoTask.isCancelled {
-                return .failure("A preview photo capture is already running.",
-                                payload: ["status": "busy"])
+                return rigReply(ok: false,
+                                message: "A preview photo capture is already running.",
+                                error: "busy",
+                                extra: ["status": "busy"])
             }
 
             let request = RemotePreviewPhotoRequest(requestID: command.requestID,
@@ -1512,8 +1940,9 @@ final class CameraModel: Camera {
                 defer { self.remotePreviewPhotoTask = nil }
                 await self.runRemotePreviewPhotoJob(request)
             }
-            return .success("Accepted preview photo request.",
-                            payload: [
+            return rigReply(ok: true,
+                            message: "Accepted preview photo request.",
+                            extra: [
                                 "status": "accepted",
                                 "capture_source": "video_data_output",
                                 "batch_id": batchID,
@@ -1522,7 +1951,9 @@ final class CameraModel: Camera {
 
         case .exportCameraParams:
             let payload = await exportCameraParamsPayload(requestID: command.requestID)
-            return .success("Exported camera parameters.", payload: payload)
+            var replyPayload = rigStatusPayload(message: "Exported camera parameters.")
+            replyPayload["camera_params"] = payload
+            return .success("Exported camera parameters.", payload: replyPayload)
 
         case .applyCameraParams(let profile, let dryRun):
             let report = await applyRemoteCameraParams(profile,
@@ -1530,7 +1961,9 @@ final class CameraModel: Camera {
                                                        dryRun: dryRun)
             let payload = cameraParamsReportPayload(applyReport: report)
             let ok = report.classification == .exactMatch || report.classification == .adjustedMatch
-            return ok ? .success(report.detail, payload: payload) : .failure(report.detail, payload: payload)
+            var replyPayload = rigStatusPayload(message: report.detail)
+            replyPayload["camera_params"] = payload
+            return ok ? .success(report.detail, payload: replyPayload) : .failure(report.detail, payload: replyPayload)
 
         case .validateCameraParams:
             guard let report = await validateActiveManualLockProfile(reason: "remote_validate_camera_params",
@@ -1539,7 +1972,9 @@ final class CameraModel: Camera {
             }
             let payload = cameraParamsReportPayload(validationReport: report)
             let ok = report.classification == .exactMatch || report.classification == .adjustedMatch
-            return ok ? .success(report.detail, payload: payload) : .failure(report.detail, payload: payload)
+            var replyPayload = rigStatusPayload(message: report.detail)
+            replyPayload["camera_params"] = payload
+            return ok ? .success(report.detail, payload: replyPayload) : .failure(report.detail, payload: replyPayload)
         }
     }
 
@@ -1562,6 +1997,7 @@ final class CameraModel: Camera {
                                                                    reason: "remote_apply_camera_params",
                                                                    requestID: requestID,
                                                                    dryRun: false)
+        await refreshManualControlCapabilitiesFromDevice()
         updateManualLockProfileState(from: report)
         persistManualLockProfileStore()
         remoteDirectorClient.sendStatusNow()
@@ -1707,6 +2143,16 @@ final class CameraModel: Camera {
         }
         guard !Task.isCancelled else { return }
 
+        let previewReply = await transitionRigState(to: .preview,
+                                                    reason: "remote_capture_preview_photo")
+        guard previewReply.ok else {
+            remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
+                                                        state: "failed",
+                                                        detail: previewReply.detail,
+                                                        failureReason: "capture_failed")
+            return
+        }
+
         remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
                                                     state: "capturing",
                                                     detail: "Capturing preview frame.")
@@ -1718,6 +2164,8 @@ final class CameraModel: Camera {
                                                                    longEdge: request.longEdge,
                                                                    jpegQuality: request.jpegQuality)
         } catch {
+            _ = await transitionRigState(to: .armedIdle,
+                                         reason: "remote_capture_preview_photo_failed")
             remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
                                                         state: "failed",
                                                         detail: error.localizedDescription,
@@ -1735,12 +2183,16 @@ final class CameraModel: Camera {
             try await uploadPreviewCaptureWithRetry(capture,
                                                     uploadBaseURL: uploadBaseURL,
                                                     request: request)
+            _ = await transitionRigState(to: .armedIdle,
+                                         reason: "remote_capture_preview_photo_done")
             remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
                                                         state: "done",
                                                         detail: "Preview photo uploaded.",
                                                         imageBytes: capture.jpegData.count,
                                                         metadataBytes: capture.metadataJSONData.count)
         } catch {
+            _ = await transitionRigState(to: .armedIdle,
+                                         reason: "remote_capture_preview_photo_upload_failed")
             remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
                                                         state: "failed",
                                                         detail: "Preview upload failed: \(error.localizedDescription)",

@@ -15,9 +15,9 @@
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "C4F82C98285ADDA2005D427A"
-               BuildableName = "AVCam.app"
-               BlueprintName = "AVCam"
-               ReferencedContainer = "container:AVCam.xcodeproj">
+               BuildableName = "SyncREC Camera.app"
+               BlueprintName = "SyncREC Camera"
+               ReferencedContainer = "container:SyncREC Camera.xcodeproj">
             </BuildableReference>
          </BuildActionEntry>
       </BuildActionEntries>
@@ -30,14 +30,13 @@
       <Testables>
          <TestableReference
             skipped = "NO"
-            parallelizable = "YES"
-            useTestSelectionWhitelist = "NO">
+            parallelizable = "YES">
             <BuildableReference
                BuildableIdentifier = "primary"
                BlueprintIdentifier = "C4A11A1528A447FA00670F08"
                BuildableName = "AVCamTests.xctest"
                BlueprintName = "AVCamTests"
-               ReferencedContainer = "container:AVCam.xcodeproj">
+               ReferencedContainer = "container:SyncREC Camera.xcodeproj">
             </BuildableReference>
          </TestableReference>
       </Testables>
@@ -57,9 +56,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "C4F82C98285ADDA2005D427A"
-            BuildableName = "AVCam.app"
-            BlueprintName = "AVCam"
-            ReferencedContainer = "container:AVCam.xcodeproj">
+            BuildableName = "SyncREC Camera.app"
+            BlueprintName = "SyncREC Camera"
+            ReferencedContainer = "container:SyncREC Camera.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
       <EnvironmentVariables>
@@ -81,9 +80,9 @@
          <BuildableReference
             BuildableIdentifier = "primary"
             BlueprintIdentifier = "C4F82C98285ADDA2005D427A"
-            BuildableName = "AVCam.app"
-            BlueprintName = "AVCam"
-            ReferencedContainer = "container:AVCam.xcodeproj">
+            BuildableName = "SyncREC Camera.app"
+            BlueprintName = "SyncREC Camera"
+            ReferencedContainer = "container:SyncREC Camera.xcodeproj">
          </BuildableReference>
       </BuildableProductRunnable>
    </ProfileAction>

@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>SyncREC Camera</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -11,7 +13,7 @@
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>$(PRODUCT_NAME)</string>
+	<string>SyncREC Camera</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
@@ -19,28 +21,37 @@
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>DirectorWebSocketURL</key>
-	<string></string>
+	<string>ws://192.168.0.20:8765</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.photography</string>
-	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>AVCam uses Bluetooth to connect to external timecode generators.</string>
-	<key>NSBluetoothPeripheralUsageDescription</key>
-	<string>AVCam uses Bluetooth to connect to external timecode generators.</string>
-	<key>NSCameraUsageDescription</key>
-	<string>To capture photos and videos.</string>
-	<key>NSLocalNetworkUsageDescription</key>
-	<string>AVCam uses your local network to receive remote recording commands from a director app.</string>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>AVCam uses your location to tag where photos and videos are taken.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>To record audio for Live Photos and videos.</string>
+	<key>LSSupportsOpeningDocumentsInPlace</key>
+	<true/>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>SyncREC Camera uses Bluetooth to connect to external timecode generators.</string>
+	<key>NSBluetoothPeripheralUsageDescription</key>
+	<string>SyncREC Camera uses Bluetooth to connect to external timecode generators.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>To capture photos and videos.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>SyncREC Camera uses your local network to receive remote recording commands from a director app.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>SyncREC Camera uses your location to tag where photos and videos are taken.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>To record audio for Live Photos and videos.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>To save captured photos and videos.</string>
+	<key>UIFileSharingEnabled</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict>
+		<key>UILaunchScreen</key>
+		<dict/>
+	</dict>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
@@ -54,14 +65,5 @@
 	</array>
 	<key>UIUserInterfaceStyle</key>
 	<string>Dark</string>
-	<key>UILaunchScreen</key>
-	<dict>
-		<key>UILaunchScreen</key>
-		<dict/>
-	</dict>
-	<key>LSSupportsOpeningDocumentsInPlace</key>
-	<true/>
-	<key>UIFileSharingEnabled</key>
-	<true/>
 </dict>
 </plist>

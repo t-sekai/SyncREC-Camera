@@ -292,9 +292,9 @@ class UploadIngestServer:
         id_part = _safe_component(device_id, fallback="unknown-device")
         short_id = id_part[:8] if id_part else "unknown"
         if device_part and device_part.lower() not in {"unknown-name", "unknown"}:
-            stem = f"{device_part}_{short_id}"
+            stem = f"{target_dir.name}_{device_part}_{short_id}"
         else:
-            stem = short_id or Path(fallback_filename).stem or "preview"
+            stem = f"{target_dir.name}_{short_id or Path(fallback_filename).stem or 'preview'}"
         suffix = ".jpg" if kind == "preview_photo" else ".json"
         return target_dir / f"{stem}{suffix}"
 

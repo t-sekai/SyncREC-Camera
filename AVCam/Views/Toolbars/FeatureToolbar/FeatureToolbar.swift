@@ -120,11 +120,11 @@ struct FeaturesToolbar<CameraModel: Camera>: PlatformView {
                         .foregroundStyle(.secondary)
                 }
                 Section("Laptop Director") {
-                    TextField("ws://192.168.1.50:8765", text: $draftDirectorWebSocketURL)
+                    TextField(RemoteDirectorConfiguration.defaultDirectorWebSocketURL, text: $draftDirectorWebSocketURL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
-                    Text("Leave blank to disable remote control.")
+                    Text("Leave blank to use the default director address.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

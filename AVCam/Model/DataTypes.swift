@@ -242,6 +242,10 @@ struct ManualCameraControlCapabilities: Sendable, Equatable {
     var supportsFrameRateControl: Bool
     var supportsFocusLock: Bool
 
+    var hasAnySupportedControl: Bool {
+        supportsManualExposure || supportsWhiteBalanceLock || supportsFrameRateControl || supportsFocusLock
+    }
+
     static let unavailable = ManualCameraControlCapabilities(
         isoRange: 25...2000,
         whiteBalanceTemperatureRange: 2000...10000,
@@ -589,6 +593,15 @@ enum CaptureMode: String, Identifiable, CaseIterable, Codable {
             "video.fill"
         }
     }
+}
+
+enum RigState: String, Codable, Sendable, Equatable {
+    case armedIdle = "armed_idle"
+    case preview
+    case recordingPrepared = "recording_prepared"
+    case recording
+    case shutdown
+    case normalExit = "normal_exit"
 }
 
 /// A structure that represents a captured photo.

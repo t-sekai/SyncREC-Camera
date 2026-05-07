@@ -2,7 +2,7 @@
 See the LICENSE.txt file for this sample’s licensing information.
 
 Abstract:
-A Control Center extension for AVCam.
+A Control Center extension for SyncREC Camera.
 */
 
 import SwiftUI
@@ -11,14 +11,14 @@ import AppIntents
 
 struct AVCamControlCenterExtension: ControlWidget {
     
-    static var kind = "com.example.apple-samplecode.AVCam.AVCamControlCenterExtension.ControlButton"
-    static var displayName: LocalizedStringResource = "Open AVCam"
-    static var description: LocalizedStringResource = "Launch AVCam app."
+    static var kind = "com.syncrec.camera.AVCamControlCenterExtension.ControlButton"
+    static var displayName: LocalizedStringResource = "Open SyncREC"
+    static var description: LocalizedStringResource = "Launch SyncREC Camera."
     
     var body: some ControlWidgetConfiguration {
         StaticControlConfiguration(kind: AVCamControlCenterExtension.kind) {
             ControlWidgetButton(action: AVCamCaptureIntent()) {
-                Label("Open AVCam", systemImage: "curlybraces")
+                Label("Open SyncREC", systemImage: "curlybraces")
             }
         }
         .displayName(AVCamControlCenterExtension.displayName)

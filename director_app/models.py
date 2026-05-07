@@ -20,6 +20,7 @@ class DeviceState:
     tentacle_state: str = "unknown"
     timecode: str = ""
     fps: int | None = None
+    rig_state: str = ""
     pending_acks: dict[str, str] = field(default_factory=dict)
     transfer_state: str = ""
     transfer_job_id: str = ""
