@@ -141,7 +141,7 @@ private struct VideoCaptureModePicker<CameraModel: Camera>: View {
                     } label: {
                         Text(preset.displayName)
                     }
-                    .disabled(!isSupported(preset) || camera.isManualLockActive || camera.captureActivity.isRecording)
+                    .disabled(!isSupported(preset) || camera.captureActivity.isRecording)
                 }
             } label: {
                 Label(camera.selectedVideoCaptureMode.displayName, systemImage: "video.badge.gearshape")
@@ -154,7 +154,7 @@ private struct VideoCaptureModePicker<CameraModel: Camera>: View {
                             .fill(Color.black.opacity(0.5))
                     )
             }
-            .disabled(camera.isManualLockActive || camera.captureActivity.isRecording)
+            .disabled(camera.captureActivity.isRecording)
 
             Text(actualText)
                 .font(.caption2.monospacedDigit())

@@ -580,19 +580,16 @@ final class CameraModel: Camera {
         guard !isApplyingVideoCaptureModeInternally else { return }
         guard selectedVideoCaptureMode != oldValue else { return }
 
-        if activeManualLockProfile != nil {
-            isApplyingVideoCaptureModeInternally = true
-            selectedVideoCaptureMode = oldValue
-            isApplyingVideoCaptureModeInternally = false
-            return
-        }
-
         persistSelectedVideoCaptureMode(selectedVideoCaptureMode)
         guard status == .running else { return }
 
         Task { @MainActor [weak self] in
             guard let self else { return }
-            await self.applySelectedVideoCaptureModeToDevice(reason: "user_selected_capture_mode")
+            if self.activeManualLockProfile != nil {
+                _ = await self.applySelectedVideoCaptureModeToActiveProfile(reason: "user_selected_capture_mode")
+            } else {
+                await self.applySelectedVideoCaptureModeToDevice(reason: "user_selected_capture_mode")
+            }
         }
     }
 
@@ -674,6 +671,63 @@ final class CameraModel: Camera {
         await refreshManualControlCapabilitiesFromDevice()
         await applyManualControlStateToDevice()
         remoteDirectorClient.sendStatusNow()
+    }
+
+    private func applySelectedVideoCaptureModeToActiveProfile(reason: String,
+                                                             requestID: String? = nil) async -> ManualApplyReport? {
+        guard let profile = activeManualLockProfile else { return nil }
+        guard !captureActivity.isRecording, !(await isCapturePipelineRecording()) else {
+            remoteDirectorClient.sendStatusNow()
+            return nil
+        }
+
+        let updatedProfile = profileWithCaptureMode(selectedVideoCaptureMode, basedOn: profile)
+        stopManualControlRefresh()
+        manualProfileDriftStatus = .reapplying
+
+        let compatibility = await captureService.installManualLockProfile(updatedProfile,
+                                                                         reason: "\(reason)_capture_mode_dry_run",
+                                                                         requestID: requestID,
+                                                                         dryRun: true)
+        guard isSuccessfulManualReport(compatibility) else {
+            lastManualApplyReport = compatibility
+            lastManualActualSnapshot = compatibility.actualSnapshot
+            manualProfileDriftStatus = .failed
+            await refreshVideoCaptureModeStateFromDevice()
+            persistSelectedVideoCaptureMode(selectedVideoCaptureMode)
+            persistManualLockProfileStore()
+            remoteDirectorClient.sendStatusNow()
+            return compatibility
+        }
+
+        activeManualLockProfile = updatedProfile
+        let report = await captureService.installManualLockProfile(updatedProfile,
+                                                                   reason: reason,
+                                                                   requestID: requestID,
+                                                                   dryRun: false)
+        await refreshManualControlCapabilitiesFromDevice()
+        await refreshVideoCaptureModeStateFromDevice()
+        updateManualLockProfileState(from: report)
+        persistManualLockProfileStore()
+        remoteDirectorClient.sendStatusNow()
+        return report
+    }
+
+    private func profileWithCaptureMode(_ preset: VideoCaptureModePreset,
+                                        basedOn profile: ManualLockProfile) -> ManualLockProfile {
+        var updated = profile
+        updated.desired.captureModePreset = preset
+        updated.desired.selectedFPS = preset.fps
+        let duration = 1.0 / preset.fps
+        updated.desired.activeVideoMinFrameDurationSeconds = duration
+        updated.desired.activeVideoMaxFrameDurationSeconds = duration
+        updated.actualValidatedSnapshot = nil
+        updated.lastApplyReport = nil
+        return updated
+    }
+
+    private func isSuccessfulManualReport(_ report: ManualApplyReport) -> Bool {
+        report.classification == .exactMatch || report.classification == .adjustedMatch
     }
 
     private func startManualControlRefreshIfNeeded() {
@@ -783,6 +837,15 @@ final class CameraModel: Camera {
         if var profile = activeManualLockProfile {
             profile.lastApplyReport = report
             profile.actualValidatedSnapshot = report.actualSnapshot
+            if isSuccessfulManualReport(report),
+               let actualSnapshot = report.actualSnapshot,
+               let preset = actualSnapshot.actualCaptureModePreset {
+                profile.desired.captureModePreset = preset
+                profile.desired.selectedFPS = selectedFPS(from: actualSnapshot)
+                profile.desired.activeVideoMinFrameDurationSeconds = actualSnapshot.actualFPSMinFrameDurationSeconds
+                profile.desired.activeVideoMaxFrameDurationSeconds = actualSnapshot.actualFPSMaxFrameDurationSeconds
+                profile.desired.format = actualSnapshot.activeFormat
+            }
             activeManualLockProfile = profile
         }
 
@@ -2192,16 +2255,27 @@ final class CameraModel: Camera {
                             message: "Refused to change capture mode while recording.",
                             error: "recording_active")
         }
-        guard activeManualLockProfile == nil else {
-            return rigReply(ok: false,
-                            message: "Capture mode is owned by the active camera params profile. Sync camera params to change it.",
-                            error: "manual_lock_active")
-        }
-
         isApplyingVideoCaptureModeInternally = true
         selectedVideoCaptureMode = preset
         isApplyingVideoCaptureModeInternally = false
         persistSelectedVideoCaptureMode(preset)
+
+        if activeManualLockProfile != nil {
+            guard let report = await applySelectedVideoCaptureModeToActiveProfile(reason: "remote_set_capture_mode",
+                                                                                 requestID: nil) else {
+                return rigReply(ok: false,
+                                message: "Unable to update active camera params profile with capture mode.",
+                                error: "failed_apply")
+            }
+            let ok = report.classification == .exactMatch || report.classification == .adjustedMatch
+            return rigReply(ok: ok,
+                            message: report.detail,
+                            error: ok ? nil : report.classification.rawValue,
+                            extra: [
+                                "capture_mode": preset.rawValue,
+                                "camera_params_apply_report": jsonObject(report) ?? [:]
+                            ])
+        }
 
         let report = await captureService.applyVideoCaptureModePreset(preset,
                                                                       reason: "remote_set_capture_mode")
