@@ -81,6 +81,9 @@ enum RemoteDirectorCommand {
     case exportCameraParams
     case applyCameraParams(profile: ManualLockProfile, dryRun: Bool)
     case validateCameraParams
+    case setFocusMode(String)
+    case releaseCameraParamLocks(preserveFocus: Bool)
+    case toggleCameraParamLocks(preserveFocus: Bool)
 }
 
 enum RemoteLocalVideoDeletePolicy {
@@ -690,6 +693,28 @@ final class RemoteDirectorClient {
             command = .applyCameraParams(profile: profile, dryRun: dryRun)
         case "validate_camera_params":
             command = .validateCameraParams
+        case "set_focus_mode", "set_autofocus", "enable_auto_focus":
+            let rawMode = ((payload["mode"] as? String)
+                           ?? (payload["focus_mode"] as? String)
+                           ?? ((boolValue(payload["enabled"]) ?? true) ? "continuous_auto_focus" : ""))
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            let normalizedMode: String
+            switch rawMode {
+            case "continuous_auto_focus", "continuousautofocus", "continuous", "auto_focus", "autofocus", "auto":
+                normalizedMode = "continuous_auto_focus"
+            default:
+                return nil
+            }
+            command = .setFocusMode(normalizedMode)
+        case "toggle_focus_mode", "toggle_auto_focus":
+            command = .setFocusMode("toggle_auto_focus")
+        case "release_camera_param_locks", "release_camera_params", "unlock_camera_params":
+            let preserveFocus = boolValue(payload["preserve_focus"]) ?? true
+            command = .releaseCameraParamLocks(preserveFocus: preserveFocus)
+        case "toggle_camera_param_locks", "toggle_camera_params", "toggle_camera_locks":
+            let preserveFocus = boolValue(payload["preserve_focus"]) ?? true
+            command = .toggleCameraParamLocks(preserveFocus: preserveFocus)
         default:
             return nil
         }

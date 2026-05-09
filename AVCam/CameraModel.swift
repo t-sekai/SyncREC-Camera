@@ -2220,6 +2220,16 @@ final class CameraModel: Camera {
             var replyPayload = rigStatusPayload(message: report.detail)
             replyPayload["camera_params"] = payload
             return ok ? .success(report.detail, payload: replyPayload) : .failure(report.detail, payload: replyPayload)
+
+        case .setFocusMode(let mode):
+            return await applyRemoteFocusMode(mode)
+
+        case .releaseCameraParamLocks(let preserveFocus):
+            return await releaseRemoteCameraParamLocks(preserveFocus: preserveFocus)
+
+        case .toggleCameraParamLocks(let preserveFocus):
+            return await toggleRemoteCameraParamLocks(preserveFocus: preserveFocus,
+                                                      requestID: command.requestID)
         }
     }
 
@@ -2247,6 +2257,165 @@ final class CameraModel: Camera {
         persistManualLockProfileStore()
         remoteDirectorClient.sendStatusNow()
         return report
+    }
+
+    private func applyRemoteFocusMode(_ mode: String) async -> RemoteDirectorCommandReply {
+        guard mode == "continuous_auto_focus" || mode == "toggle_auto_focus" else {
+            return rigReply(ok: false,
+                            message: "Unsupported focus mode \(mode).",
+                            error: "unsupported_focus_mode")
+        }
+
+        do {
+            let snapshot: ManualCameraActualSnapshot
+            let isAutoFocusEnabled: Bool
+            if mode == "toggle_auto_focus" {
+                let result = try await captureService.toggleContinuousAutoFocus(reason: "remote_toggle_focus_mode")
+                snapshot = result.snapshot
+                isAutoFocusEnabled = result.isAutoFocusEnabled
+            } else {
+                snapshot = try await captureService.setContinuousAutoFocus(reason: "remote_set_focus_mode")
+                isAutoFocusEnabled = true
+            }
+
+            if var profile = activeManualLockProfile {
+                if isAutoFocusEnabled {
+                    profile.desired.focusLensPosition = nil
+                } else if let lensPosition = snapshot.focus?.lensPosition {
+                    profile.desired.focusLensPosition = lensPosition
+                }
+                profile.actualValidatedSnapshot = nil
+                profile.lastApplyReport = nil
+                activeManualLockProfile = profile
+                persistManualLockProfileStore()
+            }
+
+            isUpdatingManualControlState = true
+            manualControlState.isFocusLocked = !isAutoFocusEnabled
+            if let lensPosition = snapshot.focus?.lensPosition {
+                manualControlState.focusLensPosition = lensPosition
+            }
+            isUpdatingManualControlState = false
+            persistManualControlState(manualControlState)
+
+            lastManualActualSnapshot = snapshot
+            await refreshManualControlCapabilitiesFromDevice()
+            remoteDirectorClient.sendStatusNow()
+
+            var extra: [String: Any] = [
+                "focus_mode": snapshot.focus?.focusMode ?? (isAutoFocusEnabled ? "continuous_auto_focus" : "locked"),
+                "auto_focus_enabled": isAutoFocusEnabled
+            ]
+            if let lensPosition = snapshot.focus?.lensPosition {
+                extra["lens_position"] = Double(lensPosition)
+            }
+            return rigReply(ok: true,
+                            message: isAutoFocusEnabled ? "Enabled autofocus." : "Locked focus at current lens position.",
+                            extra: extra)
+        } catch {
+            return rigReply(ok: false,
+                            message: "Unable to update autofocus: \(error.localizedDescription)",
+                            error: "focus_mode_failed")
+        }
+    }
+
+    private func releaseRemoteCameraParamLocks(preserveFocus: Bool) async -> RemoteDirectorCommandReply {
+        do {
+            let snapshot = try await captureService.releaseManualLocks(preserveFocus: preserveFocus,
+                                                                       reason: "remote_release_camera_param_locks")
+            activeManualLockProfile = nil
+            manualProfileDriftStatus = .unknown
+            lastManualActualSnapshot = snapshot
+            lastManualApplyReport = nil
+            lastManualValidationReport = nil
+
+            let manualSnapshot = await captureService.currentManualControlSnapshot()
+            isUpdatingManualControlState = true
+            manualControlCapabilities = manualSnapshot.capabilities
+            manualControlState = manualSnapshot.state
+            isUpdatingManualControlState = false
+
+            persistManualControlState(manualSnapshot.state)
+            persistManualLockProfileStore()
+            startManualControlRefreshIfNeeded()
+            remoteDirectorClient.sendStatusNow()
+
+            var extra: [String: Any] = [
+                "preserved_focus": preserveFocus,
+                "focus_mode": snapshot.focus?.focusMode ?? "",
+                "camera_params_status": "released"
+            ]
+            if let lensPosition = snapshot.focus?.lensPosition {
+                extra["lens_position"] = Double(lensPosition)
+            }
+            return rigReply(ok: true,
+                            message: "Released camera parameter locks.",
+                            extra: extra)
+        } catch {
+            return rigReply(ok: false,
+                            message: "Unable to release camera parameter locks: \(error.localizedDescription)",
+                            error: "release_locks_failed")
+        }
+    }
+
+    private func toggleRemoteCameraParamLocks(preserveFocus: Bool,
+                                              requestID: String) async -> RemoteDirectorCommandReply {
+        if hasActiveNonFocusCameraParamLocks {
+            return await releaseRemoteCameraParamLocks(preserveFocus: preserveFocus)
+        }
+
+        return await lockCurrentCameraParamsExceptFocus(requestID: requestID)
+    }
+
+    private var hasActiveNonFocusCameraParamLocks: Bool {
+        if let desired = activeManualLockProfile?.desired {
+            return desired.captureModePreset != nil ||
+                desired.format != nil ||
+                desired.selectedFPS != nil ||
+                desired.activeVideoMinFrameDurationSeconds != nil ||
+                desired.activeVideoMaxFrameDurationSeconds != nil ||
+                desired.exposureDurationSeconds != nil ||
+                desired.iso != nil ||
+                desired.whiteBalanceTemperature != nil ||
+                desired.whiteBalanceTint != nil ||
+                desired.whiteBalanceGains != nil ||
+                desired.zoomFactor != nil ||
+                desired.preferredStabilizationModeRawValue != nil ||
+                desired.preferredStabilizationMode != nil ||
+                desired.hdrIntent != nil ||
+                desired.activeColorSpaceRawValue != nil ||
+                desired.bitDepth != nil
+        }
+
+        return manualControlState.isFPSLocked ||
+            manualControlState.isISOLocked ||
+            manualControlState.isShutterLocked ||
+            manualControlState.isWhiteBalanceLocked ||
+            manualControlState.isTintLocked
+    }
+
+    private func lockCurrentCameraParamsExceptFocus(requestID: String) async -> RemoteDirectorCommandReply {
+        let identity = remoteDirectorClient.manualSnapshotIdentity()
+        let actualSnapshot = await captureService.exportActualCameraSnapshot(reason: "remote_toggle_camera_param_locks",
+                                                                             identity: identity)
+        lastManualActualSnapshot = actualSnapshot
+        var profile = manualLockProfile(from: actualSnapshot)
+        profile.name = "Remote Locks \(actualSnapshot.identity.remoteDeviceName)"
+        profile.desired.focusLensPosition = nil
+        profile.actualValidatedSnapshot = nil
+        profile.lastApplyReport = nil
+
+        let report = await applyRemoteCameraParams(profile,
+                                                   requestID: requestID,
+                                                   dryRun: false)
+        let payload = cameraParamsReportPayload(applyReport: report)
+        let ok = report.classification == .exactMatch || report.classification == .adjustedMatch
+        var replyPayload = rigStatusPayload(message: report.detail)
+        replyPayload["camera_params"] = payload
+        replyPayload["camera_params_status"] = ok ? "locked" : report.classification.rawValue
+        replyPayload["focus_lens_position_synced"] = false
+        return ok ? .success("Locked current camera parameters.", payload: replyPayload)
+            : .failure(report.detail, payload: replyPayload)
     }
 
     private func applyRemoteCaptureMode(_ preset: VideoCaptureModePreset) async -> RemoteDirectorCommandReply {

@@ -482,11 +482,13 @@ class DirectorGUI:
                 ("Copy Params Selected", self.copy_camera_params_selected),
                 ("Dry Run Sync", self.dry_run_sync_camera_params),
                 ("Sync Params All", self.sync_camera_params_all),
+                ("Toggle Auto-Focus Selected", self.toggle_auto_focus_selected),
+                ("Toggle Locks Selected", self.toggle_camera_param_locks_selected),
             ),
             columns=1,
         )
         self.camera_params_label = ttk.Label(params, textvariable=self.camera_params_var, style="Muted.TLabel", wraplength=380)
-        self.camera_params_label.grid(row=3, column=0, sticky="w", pady=(12, 0))
+        self.camera_params_label.grid(row=5, column=0, sticky="w", pady=(12, 0))
 
         mode = ttk.LabelFrame(tab, text="Capture Mode", padding=10, style="Panel.TLabelframe")
         mode.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -1188,6 +1190,12 @@ class DirectorGUI:
     def sync_camera_params_all(self) -> None:
         self.camera_params_var.set("Camera params: sync started")
         self.server.sync_camera_params_all(dry_run=False)
+
+    def toggle_auto_focus_selected(self) -> None:
+        self._send_selected_command("toggle_focus_mode", {})
+
+    def toggle_camera_param_locks_selected(self) -> None:
+        self._send_selected_command("toggle_camera_param_locks", {"preserve_focus": True})
 
     def set_capture_mode_selected(self) -> None:
         mode = self.capture_mode_var.get().strip()

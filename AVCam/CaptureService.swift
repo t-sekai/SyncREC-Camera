@@ -314,6 +314,126 @@ actor CaptureService {
         return ManualCameraControlSnapshot(state: resolvedState, capabilities: capabilities)
     }
 
+    func setContinuousAutoFocus(reason: String) throws -> ManualCameraActualSnapshot {
+        guard isSetUp else {
+            throw NSError(domain: "ManualFocusControl",
+                          code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Capture service is not ready."])
+        }
+
+        let device = currentDevice
+        let focusMode: AVCaptureDevice.FocusMode
+        if device.isFocusModeSupported(.continuousAutoFocus) {
+            focusMode = .continuousAutoFocus
+        } else if device.isFocusModeSupported(.autoFocus) {
+            focusMode = .autoFocus
+        } else {
+            throw NSError(domain: "ManualFocusControl",
+                          code: 2,
+                          userInfo: [NSLocalizedDescriptionKey: "Autofocus is not supported on this camera."])
+        }
+
+        try device.lockForConfiguration()
+        do {
+            defer { device.unlockForConfiguration() }
+            device.focusMode = focusMode
+            device.isSubjectAreaChangeMonitoringEnabled = true
+        }
+
+        manualControlState.isFocusLocked = false
+        manualControlState.focusLensPosition = device.lensPosition
+        if var profile = activeManualLockProfile {
+            profile.desired.focusLensPosition = nil
+            activeManualLockProfile = profile
+        }
+
+        let snapshot = exportActualCameraSnapshot(reason: reason)
+        lastManualLockActualSnapshot = snapshot
+        return snapshot
+    }
+
+    func setFocusLockedAtCurrentPosition(reason: String) async throws -> ManualCameraActualSnapshot {
+        guard isSetUp else {
+            throw NSError(domain: "ManualFocusControl",
+                          code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Capture service is not ready."])
+        }
+
+        let device = currentDevice
+        let lensPosition = device.lensPosition
+        try await setFocusLocked(device: device, lensPosition: lensPosition)
+
+        manualControlState.isFocusLocked = true
+        manualControlState.focusLensPosition = lensPosition
+        if var profile = activeManualLockProfile {
+            profile.desired.focusLensPosition = lensPosition
+            activeManualLockProfile = profile
+        }
+
+        let snapshot = exportActualCameraSnapshot(reason: reason)
+        lastManualLockActualSnapshot = snapshot
+        return snapshot
+    }
+
+    func toggleContinuousAutoFocus(reason: String) async throws -> (snapshot: ManualCameraActualSnapshot, isAutoFocusEnabled: Bool) {
+        if manualControlState.isFocusLocked ||
+            activeManualLockProfile?.desired.focusLensPosition != nil ||
+            currentDevice.focusMode == .locked {
+            let snapshot = try setContinuousAutoFocus(reason: reason)
+            return (snapshot, true)
+        }
+
+        let snapshot = try await setFocusLockedAtCurrentPosition(reason: reason)
+        return (snapshot, false)
+    }
+
+    func releaseManualLocks(preserveFocus: Bool, reason: String) throws -> ManualCameraActualSnapshot {
+        guard isSetUp else {
+            throw NSError(domain: "ManualLockProfile",
+                          code: 1,
+                          userInfo: [NSLocalizedDescriptionKey: "Capture service is not ready."])
+        }
+
+        let device = currentDevice
+        let capabilities = manualControlCapabilities(for: device)
+        let preservedFocusLock = preserveFocus && (
+            manualControlState.isFocusLocked || activeManualLockProfile?.desired.focusLensPosition != nil
+        )
+        let preservedFocusLensPosition = activeManualLockProfile?.desired.focusLensPosition
+            ?? manualControlState.focusLensPosition
+
+        activeManualLockProfile = nil
+        lastManualLockApplyReport = nil
+        lastManualLockValidationReport = nil
+
+        var state = manualControlState
+        state.isFPSLocked = false
+        state.isISOLocked = false
+        state.isShutterLocked = false
+        state.isWhiteBalanceLocked = false
+        state.isTintLocked = false
+        state.isFocusLocked = preservedFocusLock
+        state.focusLensPosition = preservedFocusLensPosition
+        state = clampedState(state, capabilities: capabilities)
+
+        try device.lockForConfiguration()
+        do {
+            defer { device.unlockForConfiguration() }
+            applyFrameRateControl(&state, device: device, capabilities: capabilities)
+            applyExposureControl(&state, device: device, capabilities: capabilities)
+            applyWhiteBalanceControl(&state, device: device, capabilities: capabilities)
+            applyFocusControl(&state, device: device, capabilities: capabilities)
+        }
+
+        refreshUnlockedManualControlValues(&state, device: device)
+        manualControlState = state
+        configureControls(for: device)
+
+        let snapshot = exportActualCameraSnapshot(reason: reason)
+        lastManualLockActualSnapshot = snapshot
+        return snapshot
+    }
+
     func currentVideoCaptureModeStatus() -> VideoCaptureModeStatus {
         guard isSetUp else {
             return VideoCaptureModeStatus.unavailable
@@ -849,7 +969,9 @@ actor CaptureService {
                                                  detail: "Set video zoom factor."))
         }
 
-        device.isSubjectAreaChangeMonitoringEnabled = false
+        if desired.focusLensPosition != nil {
+            device.isSubjectAreaChangeMonitoringEnabled = false
+        }
         device.unlockForConfiguration()
         captureSession.commitConfiguration()
 

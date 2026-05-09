@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import queue
 import threading
@@ -585,6 +586,23 @@ class DirectorServer:
             device.device_id = str(msg.get("device_id") or device.device_id)
             device.name = str(msg.get("name") or device.name)
             device.app_version = str(msg.get("app_version") or "")
+            replaced: list[DeviceState] = []
+            with self._lock:
+                for other_ws, other_device in list(self.devices.items()):
+                    if other_ws is websocket:
+                        continue
+                    if other_device.device_id == device.device_id:
+                        replaced.append(other_device)
+                        self.devices.pop(other_ws, None)
+            for old_device in replaced:
+                try:
+                    await old_device.websocket.close(code=1001, reason="Superseded by reconnect")
+                except Exception:
+                    pass
+                self.log(
+                    f"Replaced stale connection for {old_device.name} "
+                    f"({old_device.device_id}) with latest reconnect."
+                )
             self.log(f"HELLO from {device.name} ({device.device_id})")
 
         elif mtype == "status":
@@ -636,7 +654,12 @@ class DirectorServer:
             command = device.pending_acks.pop(request_id, "unknown")
             device.pending_camera_param_requests.pop(request_id, None)
             payload = msg.get("payload")
-            if command in {"export_camera_params", "apply_camera_params", "validate_camera_params"}:
+            if command in {
+                "export_camera_params",
+                "apply_camera_params",
+                "validate_camera_params",
+                "toggle_camera_param_locks",
+            }:
                 if isinstance(payload, dict):
                     camera_payload = self._camera_params_payload(payload)
                     device.last_camera_params_report = camera_payload or payload
@@ -677,6 +700,10 @@ class DirectorServer:
                     device.actual_video_fps = to_float_or_none(payload.get("actual_video_fps"))
                 if "supported_capture_modes" in payload and isinstance(payload.get("supported_capture_modes"), list):
                     device.supported_capture_modes = [str(value) for value in payload.get("supported_capture_modes") if value]
+                if "camera_params_status" in payload:
+                    device.last_camera_params_status = str(payload.get("camera_params_status") or "")
+                if "camera_params_summary" in payload:
+                    device.last_camera_params_summary = str(payload.get("camera_params_summary") or "")
             waiter = self._ack_waiters.pop((device.device_id, request_id), None)
             if waiter and not waiter.done():
                 waiter.set_result(msg)
@@ -1161,7 +1188,8 @@ class DirectorServer:
             return
 
         started = datetime.utcnow()
-        request_payload = {"preset": requested_profile, "dry_run": dry_run}
+        sync_profile = self._profile_without_focus_lens_position(requested_profile)
+        request_payload = {"preset": sync_profile, "dry_run": dry_run}
         self.log(f"{'Dry run' if dry_run else 'Sync'} camera params to {len(devices)} device(s).")
 
         tasks = [
@@ -1193,8 +1221,9 @@ class DirectorServer:
             "started_at_utc": started.isoformat(timespec="milliseconds") + "Z",
             "completed_at_utc": datetime.utcnow().isoformat(timespec="milliseconds") + "Z",
             "dry_run": dry_run,
+            "focus_lens_position_synced": False,
             "source_snapshot_hash": preset.get("source_snapshot_hash"),
-            "source_profile_id": requested_profile.get("profileID") or requested_profile.get("profile_id"),
+            "source_profile_id": sync_profile.get("profileID") or sync_profile.get("profile_id"),
             "preset_path": str(self._camera_param_preset_path or ""),
             "devices": per_device,
         }
@@ -1240,6 +1269,14 @@ class DirectorServer:
         if isinstance(camera_payload, dict):
             return camera_payload
         return payload
+
+    def _profile_without_focus_lens_position(self, profile: dict[str, Any]) -> dict[str, Any]:
+        sanitized = copy.deepcopy(profile)
+        desired = sanitized.get("desired")
+        if isinstance(desired, dict):
+            desired.pop("focusLensPosition", None)
+            desired.pop("focus_lens_position", None)
+        return sanitized
 
     def _valid_export_payload(self, payload: Any) -> bool:
         return (
