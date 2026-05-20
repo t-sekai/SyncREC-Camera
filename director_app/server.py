@@ -334,6 +334,8 @@ class DirectorServer:
                     "device_id": d.device_id,
                     "name": d.name,
                     "app_version": d.app_version,
+                    "app_build": d.app_build,
+                    "app_display_version": d.app_display_version,
                     "endpoint": d.endpoint,
                     "last_seen_unix": d.last_seen_unix,
                     "recording": d.recording,
@@ -586,6 +588,7 @@ class DirectorServer:
             device.device_id = str(msg.get("device_id") or device.device_id)
             device.name = str(msg.get("name") or device.name)
             device.app_version = str(msg.get("app_version") or "")
+            device.app_build = str(msg.get("app_build") or "")
             replaced: list[DeviceState] = []
             with self._lock:
                 for other_ws, other_device in list(self.devices.items()):
@@ -606,6 +609,10 @@ class DirectorServer:
             self.log(f"HELLO from {device.name} ({device.device_id})")
 
         elif mtype == "status":
+            if "app_version" in msg:
+                device.app_version = str(msg.get("app_version") or "")
+            if "app_build" in msg:
+                device.app_build = str(msg.get("app_build") or "")
             device.recording = bool(msg.get("recording", device.recording))
             device.armed = bool(msg.get("armed", device.armed))
             device.battery = to_float_or_none(msg.get("battery"))

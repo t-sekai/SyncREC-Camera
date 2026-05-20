@@ -132,6 +132,8 @@ final class RemoteDirectorClient {
     private let session = URLSession(configuration: .default)
     private let deviceID: String
     private let appVersion: String
+    private let appBuild: String
+    private let appDisplayVersion: String
 
     private var webSocketTask: URLSessionWebSocketTask?
     private var receiveTask: Task<Void, Never>?
@@ -145,7 +147,9 @@ final class RemoteDirectorClient {
 
     init() {
         deviceID = Self.loadOrCreateDeviceID()
-        appVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        appVersion = Self.bundleInfoString(forKey: "CFBundleShortVersionString")
+        appBuild = Self.bundleInfoString(forKey: "CFBundleVersion")
+        appDisplayVersion = Self.formatAppDisplayVersion(version: appVersion, build: appBuild)
         UIDevice.current.isBatteryMonitoringEnabled = true
     }
 
@@ -249,7 +253,7 @@ final class RemoteDirectorClient {
     func manualSnapshotIdentity() -> ManualSnapshotDeviceIdentity {
         ManualSnapshotDeviceIdentity(remoteDeviceID: deviceID,
                                      remoteDeviceName: resolvedDeviceName(),
-                                     appVersion: appVersion)
+                                     appVersion: appDisplayVersion)
     }
 
     func resolveUploadBaseURL(override uploadURLString: String?) -> URL? {
@@ -438,7 +442,8 @@ final class RemoteDirectorClient {
             "type": "hello",
             "device_id": deviceID,
             "name": resolvedDeviceName(),
-            "app_version": appVersion
+            "app_version": appVersion,
+            "app_build": appBuild
         ]
         await sendJSONObject(message)
     }
@@ -451,6 +456,8 @@ final class RemoteDirectorClient {
             "type": "status",
             "device_id": deviceID,
             "name": resolvedDeviceName(),
+            "app_version": appVersion,
+            "app_build": appBuild,
             "recording": status.recording,
             "armed": status.armed,
             "tentacle_state": status.tentacleState,
@@ -785,6 +792,27 @@ final class RemoteDirectorClient {
         let generated = UUID().uuidString
         UserDefaults.standard.set(generated, forKey: deviceIDDefaultsKey)
         return generated
+    }
+
+    private static func bundleInfoString(forKey key: String) -> String {
+        guard let value = Bundle.main.object(forInfoDictionaryKey: key) as? String else {
+            return "unknown"
+        }
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "unknown" : trimmed
+    }
+
+    private static func formatAppDisplayVersion(version: String, build: String) -> String {
+        switch (version == "unknown", build == "unknown") {
+        case (false, false):
+            return build == version ? version : "\(version) (\(build))"
+        case (false, true):
+            return version
+        case (true, false):
+            return "build \(build)"
+        case (true, true):
+            return "unknown"
+        }
     }
 
     private static func unixNowMS() -> Int64 {

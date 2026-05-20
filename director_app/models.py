@@ -12,6 +12,7 @@ class DeviceState:
     device_id: str
     name: str
     app_version: str = ""
+    app_build: str = ""
     last_seen_unix: float = field(default_factory=time.time)
     recording: bool = False
     armed: bool = False
@@ -58,6 +59,18 @@ class DeviceState:
         if isinstance(addr, tuple) and len(addr) >= 2:
             return f"{addr[0]}:{addr[1]}"
         return str(addr)
+
+    @property
+    def app_display_version(self) -> str:
+        version = self.app_version.strip()
+        build = self.app_build.strip()
+        if version and build:
+            return version if version == build else f"{version} ({build})"
+        if version:
+            return version
+        if build:
+            return f"build {build}"
+        return ""
 
 
 def parse_delay(value: str, fallback: float) -> float:

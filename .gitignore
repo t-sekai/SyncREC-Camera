@@ -29,3 +29,5 @@ camera_param_sync_reports/
 **/__pycache__/
 
 director_app/captures/
+
+syncrec_v0

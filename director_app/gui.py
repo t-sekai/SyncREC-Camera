@@ -92,7 +92,7 @@ DEVICE_WIDTHS = {
     "name": 150,
     "device_id": 135,
     "endpoint": 150,
-    "app": 80,
+    "app": 110,
     "armed": 70,
     "recording": 92,
     "battery": 76,
@@ -149,6 +149,7 @@ class DirectorGUI:
         self.selected_device_var = StringVar(value="No camera selected")
         self._upload_url_for_clients = ""
         self._latest_devices_by_id: dict[str, dict[str, Any]] = {}
+        self.workspace: ttk.PanedWindow | None = None
 
         self._tentacle_anchor_monotonic: float | None = None
         self._tentacle_anchor_total_frames: int | None = None
@@ -176,11 +177,31 @@ class DirectorGUI:
         self._build_header(shell).grid(row=0, column=0, sticky="ew")
 
         workspace = ttk.PanedWindow(shell, orient="horizontal")
+        self.workspace = workspace
         workspace.grid(row=1, column=0, sticky="nsew", pady=(10, 10))
-        workspace.add(self._build_devices_panel(workspace), weight=5)
+        workspace.add(self._build_devices_panel(workspace), weight=3)
         workspace.add(self._build_operations_panel(workspace), weight=2)
+        self.root.after_idle(self._set_initial_workspace_layout)
 
         self._build_log_panel(shell).grid(row=2, column=0, sticky="ew")
+
+    def _set_initial_workspace_layout(self, attempt: int = 0) -> None:
+        workspace = self.workspace
+        if workspace is None:
+            return
+
+        width = workspace.winfo_width()
+        if width <= 1:
+            if attempt < 10:
+                self.root.after(50, lambda: self._set_initial_workspace_layout(attempt + 1))
+            return
+
+        right_width = min(max(520, int(width * 0.34)), max(360, width - 620))
+        left_width = max(420, width - right_width)
+        try:
+            workspace.sashpos(0, left_width)
+        except Exception:
+            pass
 
     def _configure_styles(self) -> None:
         self.root.configure(bg="#f4f6f8")
@@ -585,18 +606,25 @@ class DirectorGUI:
             )
 
     def _schedule_pump(self) -> None:
-        self._pump_events()
-        self.root.after(100, self._schedule_pump)
+        had_more = self._pump_events()
+        self.root.after(10 if had_more else 100, self._schedule_pump)
 
-    def _pump_events(self) -> None:
-        while True:
+    def _pump_events(self) -> bool:
+        max_events = 40
+        processed = 0
+        latest_devices: list[dict[str, Any]] | None = None
+        latest_tentacle_packet: dict[str, Any] | None = None
+        log_lines: list[str] = []
+
+        while processed < max_events:
             try:
                 etype, payload = self.event_queue.get_nowait()
             except queue.Empty:
                 break
+            processed += 1
 
             if etype == "log":
-                self._append_log(str(payload))
+                log_lines.append(str(payload))
             elif etype == "server_started":
                 self.server_status_var.set(f"Server: running on ws://{payload['host']}:{payload['port']}")
                 self.server_summary_var.set("Running")
@@ -604,7 +632,7 @@ class DirectorGUI:
                 self.server_status_var.set("Server: stopped")
                 self.server_summary_var.set("Stopped")
             elif etype == "devices_updated":
-                self._refresh_tree(payload)
+                latest_devices = payload
             elif etype == "preview_upload_received":
                 if isinstance(payload, dict):
                     self.server.handle_preview_upload_received(payload)
@@ -621,8 +649,17 @@ class DirectorGUI:
                 if self._time_source_is_laptop():
                     continue
                 if isinstance(payload, dict):
-                    self._set_tentacle_anchor_from_packet(payload)
-                    self.server.update_timecode_anchor(payload)
+                    latest_tentacle_packet = payload
+
+        if log_lines:
+            self._append_log_lines(log_lines)
+        if latest_devices is not None:
+            self._refresh_tree(latest_devices)
+        if latest_tentacle_packet is not None:
+            self._set_tentacle_anchor_from_packet(latest_tentacle_packet)
+            self.server.update_timecode_anchor(latest_tentacle_packet)
+
+        return not self.event_queue.empty()
 
     def _schedule_status_refresh(self) -> None:
         self._refresh_tree(self.server.snapshot_devices())
@@ -644,7 +681,7 @@ class DirectorGUI:
 
     def _schedule_tentacle_clock(self) -> None:
         self._tick_tentacle_clock()
-        self.root.after(50, self._schedule_tentacle_clock)
+        self.root.after(200, self._schedule_tentacle_clock)
 
     def _set_tentacle_anchor_from_packet(self, packet: dict[str, Any]) -> None:
         fps = packet.get("fps")
@@ -693,9 +730,7 @@ class DirectorGUI:
         selected_device_id = ""
         selected_items = self.tree.selection()
         if selected_items:
-            selected_values = self.tree.item(selected_items[0], "values")
-            if selected_values and len(selected_values) >= 2:
-                selected_device_id = str(selected_values[1])
+            selected_device_id = str(selected_items[0])
 
         self._latest_devices_by_id = {
             str(d.get("device_id") or ""): d
@@ -704,10 +739,14 @@ class DirectorGUI:
         }
         self._update_device_summary(devices)
 
-        self.tree.delete(*self.tree.get_children())
+        existing_row_ids = set(self.tree.get_children())
+        updated_row_ids: set[str] = set()
         now = time.time()
-        selected_row_id = ""
         for d in devices:
+            device_id = str(d.get("device_id") or "")
+            if not device_id:
+                continue
+            updated_row_ids.add(device_id)
             pending_acks = d.get("pending_acks") or {}
             pending = ", ".join(pending_acks.values()) if pending_acks else ""
             battery_value = d.get("battery")
@@ -759,45 +798,49 @@ class DirectorGUI:
             if pending:
                 tags.append("pending")
 
-            item_id = self.tree.insert(
-                "",
-                END,
-                tags=tuple(tags),
-                values=(
-                    d["name"],
-                    d["device_id"],
-                    d["endpoint"],
-                    d["app_version"],
-                    yes_no(d["armed"]),
-                    yes_no(d["recording"]),
-                    battery,
-                    storage,
-                    videos,
-                    capture_mode,
-                    actual_video,
-                    d["tentacle_state"],
-                    timecode_text(d["timecode"], d["fps"]),
-                    str(d.get("rig_state") or ""),
-                    camera_params,
-                    transfer,
-                    preview,
-                    preview_path,
-                    last_seen,
-                    pending,
-                ),
+            values = (
+                d["name"],
+                d["device_id"],
+                d["endpoint"],
+                d.get("app_display_version") or d.get("app_version") or "",
+                yes_no(d["armed"]),
+                yes_no(d["recording"]),
+                battery,
+                storage,
+                videos,
+                capture_mode,
+                actual_video,
+                d["tentacle_state"],
+                timecode_text(d["timecode"], d["fps"]),
+                str(d.get("rig_state") or ""),
+                camera_params,
+                transfer,
+                preview,
+                preview_path,
+                last_seen,
+                pending,
             )
-            if selected_device_id and str(d["device_id"]) == selected_device_id:
-                selected_row_id = item_id
+            if device_id in existing_row_ids:
+                self.tree.item(device_id, tags=tuple(tags), values=values)
+            else:
+                self.tree.insert("", END, iid=device_id, tags=tuple(tags), values=values)
 
-        if selected_row_id:
-            self.tree.selection_set(selected_row_id)
-            self.tree.focus(selected_row_id)
-            self.tree.see(selected_row_id)
+        for stale_row_id in existing_row_ids - updated_row_ids:
+            self.tree.delete(stale_row_id)
+
+        if selected_device_id and selected_device_id in updated_row_ids:
+            self.tree.selection_set(selected_device_id)
+            self.tree.focus(selected_device_id)
         self._update_selected_device_detail()
 
     def _append_log(self, line: str) -> None:
+        self._append_log_lines([line])
+
+    def _append_log_lines(self, lines: list[str]) -> None:
+        if not lines:
+            return
         self.log_box.configure(state="normal")
-        self.log_box.insert(END, line + "\n")
+        self.log_box.insert(END, "\n".join(lines) + "\n")
         self.log_box.see(END)
         self.log_box.configure(state="disabled")
 
@@ -841,7 +884,7 @@ class DirectorGUI:
             camera_params = f"{camera_params}: {camera_params_summary}" if camera_params else camera_params_summary
 
         lines = [
-            f"Endpoint: {device.get('endpoint') or '-'}    App: {device.get('app_version') or '-'}",
+            f"Endpoint: {device.get('endpoint') or '-'}    App: {device.get('app_display_version') or device.get('app_version') or '-'}",
             (
                 f"State: recording={yes_no(bool(device.get('recording')))}  "
                 f"armed={yes_no(bool(device.get('armed')))}  "
@@ -915,7 +958,8 @@ class DirectorGUI:
         except ValueError:
             fps = 30
         fps = 60 if fps == 60 else 30
-        self.laptop_fps_var.set(str(fps))
+        if self.laptop_fps_var.get() != str(fps):
+            self.laptop_fps_var.set(str(fps))
         return fps
 
     def _apply_time_source_settings(self) -> None:
@@ -936,6 +980,24 @@ class DirectorGUI:
 
     def _on_time_source_changed(self, _event: Any | None = None) -> None:
         self._apply_time_source_settings()
+
+    def _capture_mode_fps(self, mode: str) -> int | None:
+        normalized = mode.strip().lower()
+        if normalized.endswith("60"):
+            return 60
+        if normalized.endswith("30"):
+            return 30
+        return None
+
+    def _sync_laptop_fps_to_capture_mode(self, mode: str) -> None:
+        fps = self._capture_mode_fps(mode)
+        if fps is None:
+            return
+        self.laptop_fps_var.set(str(fps))
+        if self._time_source_is_laptop():
+            self.server.configure_time_source(source="laptop", fps=fps)
+            self._tick_tentacle_clock()
+            self._append_log(f"Laptop timecode FPS set to {fps} for capture mode {mode}.")
 
     def start_server(self) -> None:
         host = self.host_var.get().strip() or "0.0.0.0"
@@ -1054,12 +1116,7 @@ class DirectorGUI:
             self._append_log("Select one device row before pulling videos.")
             return
 
-        values = self.tree.item(selected[0], "values")
-        if not values or len(values) < 2:
-            self._append_log("Unable to read selected row.")
-            return
-
-        device_id = str(values[1])
+        device_id = str(selected[0])
         max_files = parse_nonnegative_int(self.pull_max_files_var.get(), fallback=0)
         if not self.upload_server.is_running or not self._upload_url_for_clients:
             self._append_log("Upload endpoint is not running. Start server first.")
@@ -1144,10 +1201,7 @@ class DirectorGUI:
         selected = self.tree.selection()
         if not selected:
             return ""
-        values = self.tree.item(selected[0], "values")
-        if not values or len(values) < 2:
-            return ""
-        return str(values[1])
+        return str(selected[0])
 
     def _send_selected_command(self, command: str, payload: dict[str, Any]) -> None:
         device_id = self._selected_device_id()
@@ -1174,12 +1228,7 @@ class DirectorGUI:
             self._append_log("Select one device row before copying camera params.")
             return
 
-        values = self.tree.item(selected[0], "values")
-        if not values or len(values) < 2:
-            self._append_log("Unable to read selected row.")
-            return
-
-        device_id = str(values[1])
+        device_id = str(selected[0])
         self.camera_params_var.set(f"Camera params: copying from {device_id}")
         self.server.copy_camera_params(device_id)
 
@@ -1202,6 +1251,7 @@ class DirectorGUI:
         if not mode:
             self._append_log("Select a capture mode before sending.")
             return
+        self._sync_laptop_fps_to_capture_mode(mode)
         self._send_selected_command("set_capture_mode", {"mode": mode})
 
     def set_capture_mode_all(self) -> None:
@@ -1209,6 +1259,7 @@ class DirectorGUI:
         if not mode:
             self._append_log("Select a capture mode before broadcasting.")
             return
+        self._sync_laptop_fps_to_capture_mode(mode)
         self.server.send_command_all("set_capture_mode", {"mode": mode})
 
     def on_close(self) -> None:
