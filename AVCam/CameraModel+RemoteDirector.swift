@@ -83,6 +83,7 @@ enum RemoteDirectorCommand {
     case validateCameraParams
     case setFocusMode(String)
     case releaseCameraParamLocks(preserveFocus: Bool)
+    case lockCameraParamLocks
     case toggleCameraParamLocks(preserveFocus: Bool)
 }
 
@@ -703,22 +704,28 @@ final class RemoteDirectorClient {
         case "set_focus_mode", "set_autofocus", "enable_auto_focus":
             let rawMode = ((payload["mode"] as? String)
                            ?? (payload["focus_mode"] as? String)
-                           ?? ((boolValue(payload["enabled"]) ?? true) ? "continuous_auto_focus" : ""))
+                           ?? ((boolValue(payload["enabled"]) ?? true) ? "continuous_auto_focus" : "locked"))
                 .trimmingCharacters(in: .whitespacesAndNewlines)
                 .lowercased()
             let normalizedMode: String
             switch rawMode {
             case "continuous_auto_focus", "continuousautofocus", "continuous", "auto_focus", "autofocus", "auto":
                 normalizedMode = "continuous_auto_focus"
+            case "locked", "lock", "focus_locked", "manual", "manual_focus":
+                normalizedMode = "locked"
             default:
                 return nil
             }
             command = .setFocusMode(normalizedMode)
+        case "lock_focus", "disable_auto_focus":
+            command = .setFocusMode("locked")
         case "toggle_focus_mode", "toggle_auto_focus":
             command = .setFocusMode("toggle_auto_focus")
         case "release_camera_param_locks", "release_camera_params", "unlock_camera_params":
             let preserveFocus = boolValue(payload["preserve_focus"]) ?? true
             command = .releaseCameraParamLocks(preserveFocus: preserveFocus)
+        case "lock_camera_param_locks", "lock_camera_params":
+            command = .lockCameraParamLocks
         case "toggle_camera_param_locks", "toggle_camera_params", "toggle_camera_locks":
             let preserveFocus = boolValue(payload["preserve_focus"]) ?? true
             command = .toggleCameraParamLocks(preserveFocus: preserveFocus)

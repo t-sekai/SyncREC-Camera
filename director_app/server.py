@@ -665,6 +665,8 @@ class DirectorServer:
                 "export_camera_params",
                 "apply_camera_params",
                 "validate_camera_params",
+                "lock_camera_param_locks",
+                "release_camera_param_locks",
                 "toggle_camera_param_locks",
             }:
                 if isinstance(payload, dict):

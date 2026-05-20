@@ -2072,9 +2072,9 @@ final class CameraModel: Camera {
                 guard let self else { return }
                 await self.waitUntil(unixMilliseconds: stopAtUnixMS)
                 guard !Task.isCancelled else { return }
-                _ = await self.transitionRigState(to: .armedIdle,
-                                                  reason: "remote_prepare_stop",
-                                                  stopRecordingIfNeeded: true)
+                if await self.isCapturePipelineRecording() {
+                    _ = await self.stopRigRecording(reason: "remote_prepare_stop")
+                }
                 self.remoteDirectorClient.sendStatusNow()
             }
             return rigReply(ok: true, message: "Prepared stop.")
@@ -2105,22 +2105,19 @@ final class CameraModel: Camera {
                     guard let self else { return }
                     await self.waitUntil(unixMilliseconds: stopAtUnixMS)
                     guard !Task.isCancelled else { return }
-                    _ = await self.transitionRigState(to: .armedIdle,
-                                                      reason: "remote_stop_recording_scheduled",
-                                                      stopRecordingIfNeeded: true)
+                    if await self.isCapturePipelineRecording() {
+                        _ = await self.stopRigRecording(reason: "remote_stop_recording_scheduled")
+                    }
+                    self.remoteDirectorClient.sendStatusNow()
                 }
                 return rigReply(ok: true, message: "Scheduled recording stop.")
             }
             guard await isCapturePipelineRecording() else {
-                _ = await transitionRigState(to: .armedIdle,
-                                             reason: "remote_stop_recording_not_recording")
                 return rigReply(ok: false,
-                                message: "Not recording. Entered armed idle.",
+                                message: "Not recording.",
                                 error: "not_recording")
             }
-            return await transitionRigState(to: .armedIdle,
-                                            reason: "remote_stop_recording",
-                                            stopRecordingIfNeeded: true)
+            return await stopRigRecording(reason: "remote_stop_recording")
 
         case .getStatus:
             return rigReply(ok: true, message: "Status.")
@@ -2227,6 +2224,9 @@ final class CameraModel: Camera {
         case .releaseCameraParamLocks(let preserveFocus):
             return await releaseRemoteCameraParamLocks(preserveFocus: preserveFocus)
 
+        case .lockCameraParamLocks:
+            return await lockCurrentCameraParamsExceptFocus(requestID: command.requestID)
+
         case .toggleCameraParamLocks(let preserveFocus):
             return await toggleRemoteCameraParamLocks(preserveFocus: preserveFocus,
                                                       requestID: command.requestID)
@@ -2260,7 +2260,7 @@ final class CameraModel: Camera {
     }
 
     private func applyRemoteFocusMode(_ mode: String) async -> RemoteDirectorCommandReply {
-        guard mode == "continuous_auto_focus" || mode == "toggle_auto_focus" else {
+        guard mode == "continuous_auto_focus" || mode == "locked" || mode == "toggle_auto_focus" else {
             return rigReply(ok: false,
                             message: "Unsupported focus mode \(mode).",
                             error: "unsupported_focus_mode")
@@ -2274,8 +2274,13 @@ final class CameraModel: Camera {
                 snapshot = result.snapshot
                 isAutoFocusEnabled = result.isAutoFocusEnabled
             } else {
-                snapshot = try await captureService.setContinuousAutoFocus(reason: "remote_set_focus_mode")
-                isAutoFocusEnabled = true
+                if mode == "locked" {
+                    snapshot = try await captureService.setFocusLockedAtCurrentPosition(reason: "remote_lock_focus_mode")
+                    isAutoFocusEnabled = false
+                } else {
+                    snapshot = try await captureService.setContinuousAutoFocus(reason: "remote_set_focus_mode")
+                    isAutoFocusEnabled = true
+                }
             }
 
             if var profile = activeManualLockProfile {
@@ -2610,6 +2615,7 @@ final class CameraModel: Camera {
         }
         guard !Task.isCancelled else { return }
 
+        let previousRigState = rigState
         let previewReply = await transitionRigState(to: .preview,
                                                     reason: "remote_capture_preview_photo")
         guard previewReply.ok else {
@@ -2631,8 +2637,8 @@ final class CameraModel: Camera {
                                                                    longEdge: request.longEdge,
                                                                    jpegQuality: request.jpegQuality)
         } catch {
-            _ = await transitionRigState(to: .armedIdle,
-                                         reason: "remote_capture_preview_photo_failed")
+            await restoreRigStateAfterPreview(previousRigState,
+                                              reason: "remote_capture_preview_photo_failed")
             remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
                                                         state: "failed",
                                                         detail: error.localizedDescription,
@@ -2650,22 +2656,39 @@ final class CameraModel: Camera {
             try await uploadPreviewCaptureWithRetry(capture,
                                                     uploadBaseURL: uploadBaseURL,
                                                     request: request)
-            _ = await transitionRigState(to: .armedIdle,
-                                         reason: "remote_capture_preview_photo_done")
+            await restoreRigStateAfterPreview(previousRigState,
+                                              reason: "remote_capture_preview_photo_done")
             remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
                                                         state: "done",
                                                         detail: "Preview photo uploaded.",
                                                         imageBytes: capture.jpegData.count,
                                                         metadataBytes: capture.metadataJSONData.count)
         } catch {
-            _ = await transitionRigState(to: .armedIdle,
-                                         reason: "remote_capture_preview_photo_upload_failed")
+            await restoreRigStateAfterPreview(previousRigState,
+                                              reason: "remote_capture_preview_photo_upload_failed")
             remoteDirectorClient.sendPreviewPhotoUpdate(requestID: request.requestID,
                                                         state: "failed",
                                                         detail: "Preview upload failed: \(error.localizedDescription)",
                                                         imageBytes: capture.jpegData.count,
                                                         metadataBytes: capture.metadataJSONData.count,
                                                         failureReason: "upload_failed")
+        }
+    }
+
+    private func restoreRigStateAfterPreview(_ previousRigState: RigState, reason: String) async {
+        switch previousRigState {
+        case .armedIdle:
+            _ = await transitionRigState(to: .armedIdle, reason: reason)
+        case .recordingPrepared:
+            _ = await transitionRigState(to: .recordingPrepared, reason: reason)
+        case .normalExit:
+            _ = await transitionRigState(to: .normalExit, reason: reason)
+        case .shutdown:
+            _ = await transitionRigState(to: .shutdown, reason: reason)
+        case .preview:
+            remoteDirectorClient.sendStatusNow()
+        case .recording:
+            _ = await transitionRigState(to: .recordingPrepared, reason: reason)
         }
     }
 

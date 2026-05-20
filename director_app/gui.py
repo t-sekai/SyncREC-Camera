@@ -497,19 +497,31 @@ class DirectorGUI:
 
         params = ttk.LabelFrame(tab, text="Camera Parameters", padding=10, style="Panel.TLabelframe")
         params.grid(row=0, column=0, sticky="ew")
-        self._button_grid(
-            params,
-            (
-                ("Copy Params Selected", self.copy_camera_params_selected),
-                ("Dry Run Sync", self.dry_run_sync_camera_params),
-                ("Sync Params All", self.sync_camera_params_all),
-                ("Toggle Auto-Focus Selected", self.toggle_auto_focus_selected),
-                ("Toggle Locks Selected", self.toggle_camera_param_locks_selected),
-            ),
-            columns=1,
+        params.columnconfigure(0, weight=1)
+        params.columnconfigure(1, weight=1)
+        ttk.Button(params, text="Copy Params Selected", command=self.copy_camera_params_selected).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6)
+        )
+        ttk.Button(params, text="Dry Run Sync", command=self.dry_run_sync_camera_params).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0)
+        )
+        ttk.Button(params, text="Sync Params All", command=self.sync_camera_params_all).grid(
+            row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0)
+        )
+        ttk.Button(params, text="Lock Focus", command=self.lock_focus_selected).grid(
+            row=2, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
+        )
+        ttk.Button(params, text="Unlock Focus", command=self.enable_auto_focus_selected).grid(
+            row=2, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
+        )
+        ttk.Button(params, text="Lock Camera Params", command=self.lock_camera_param_locks_selected).grid(
+            row=3, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
+        )
+        ttk.Button(params, text="Unlock Camera Params", command=self.unlock_camera_param_locks_selected).grid(
+            row=3, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
         )
         self.camera_params_label = ttk.Label(params, textvariable=self.camera_params_var, style="Muted.TLabel", wraplength=380)
-        self.camera_params_label.grid(row=5, column=0, sticky="w", pady=(12, 0))
+        self.camera_params_label.grid(row=4, column=0, columnspan=2, sticky="w", pady=(12, 0))
 
         mode = ttk.LabelFrame(tab, text="Capture Mode", padding=10, style="Panel.TLabelframe")
         mode.grid(row=1, column=0, sticky="ew", pady=(12, 0))
@@ -1240,11 +1252,17 @@ class DirectorGUI:
         self.camera_params_var.set("Camera params: sync started")
         self.server.sync_camera_params_all(dry_run=False)
 
-    def toggle_auto_focus_selected(self) -> None:
-        self._send_selected_command("toggle_focus_mode", {})
+    def enable_auto_focus_selected(self) -> None:
+        self._send_selected_command("set_focus_mode", {"mode": "continuous_auto_focus"})
 
-    def toggle_camera_param_locks_selected(self) -> None:
-        self._send_selected_command("toggle_camera_param_locks", {"preserve_focus": True})
+    def lock_focus_selected(self) -> None:
+        self._send_selected_command("lock_focus", {"mode": "locked"})
+
+    def lock_camera_param_locks_selected(self) -> None:
+        self._send_selected_command("lock_camera_param_locks", {})
+
+    def unlock_camera_param_locks_selected(self) -> None:
+        self._send_selected_command("release_camera_param_locks", {"preserve_focus": True})
 
     def set_capture_mode_selected(self) -> None:
         mode = self.capture_mode_var.get().strip()
