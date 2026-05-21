@@ -36,6 +36,7 @@ final class MovieCapture: OutputService {
     
     /// Starts movie recording.
     func startRecording(recordingStartMetadata: RecordingStartTimecodeMetadata?,
+                        outputFileURL: URL,
                         preferredStabilizationMode: AVCaptureVideoStabilizationMode? = .auto) {
         // Return early if already recording.
         guard !movieOutput.isRecording else { return }
@@ -60,7 +61,7 @@ final class MovieCapture: OutputService {
         startMonitoringDuration()
         
         delegate = MovieCaptureDelegate(recordingStartMetadata: recordingStartMetadata)
-        movieOutput.startRecording(to: URL.localVideoRecordingFileURL, recordingDelegate: delegate!)
+        movieOutput.startRecording(to: outputFileURL, recordingDelegate: delegate!)
     }
     
     /// Stops movie recording.

@@ -186,6 +186,9 @@ final class CameraModel: Camera {
     /// The most recent prepared remote start command.
     private var pendingRemoteStart: PreparedRemoteStart?
 
+    /// Optional metadata from a separate prepare_recording command.
+    private var pendingPreparedRecordingSession: RemoteRecordingSession?
+
     /// Task for a scheduled remote start.
     private var remoteStartTask: Task<Void, Never>?
 
@@ -239,6 +242,9 @@ final class CameraModel: Camera {
 
     /// Calibration snapshot captured at recording start and persisted as sidecar JSON on stop.
     private var pendingRecordingCalibrationJSON: Data?
+
+    /// Session metadata shared by the director for the active recording.
+    private var activeRecordingSessionMetadata: RecordingSessionMetadata?
 
     /// Ensures camera state observers are only attached once.
     private var hasAttachedStateObservers = false
@@ -1130,6 +1136,88 @@ final class CameraModel: Camera {
                                               source: activeTimecodeInputMode.sourceIdentifier)
     }
 
+    private func makeRecordingSessionMetadata(from remoteSession: RemoteRecordingSession?) -> RecordingSessionMetadata {
+        let session = remoteSession ?? makeManualRecordingSession()
+        let experimentName = sanitizedRecordingToken(session.experimentName) ?? "experiment"
+        let takeNumber = max(1, session.takeNumber)
+        let captureMode = sanitizedRecordingToken(session.captureMode) ?? selectedVideoCaptureMode.filenameComponent
+        let sessionTime = sanitizedRecordingToken(session.sessionTime) ?? recordingSessionTimeString()
+        let defaultFolderName = "\(experimentName)_\(takeNumber)_\(captureMode)_\(sessionTime)"
+        let sessionFolderName = sanitizedRecordingBaseName(session.sessionFolderName) ?? defaultFolderName
+        let deviceName = sanitizedRecordingToken(directorDeviceName)
+            ?? sanitizedRecordingToken(remoteDirectorClient.transferDeviceID())
+            ?? "device"
+        let fileBaseName = sanitizedRecordingBaseName("\(deviceName)_\(sessionFolderName)")
+            ?? "\(deviceName)_\(defaultFolderName)"
+
+        return RecordingSessionMetadata(experimentName: experimentName,
+                                        takeNumber: takeNumber,
+                                        captureMode: captureMode,
+                                        sessionTime: sessionTime,
+                                        sessionFolderName: sessionFolderName,
+                                        fileBaseName: fileBaseName)
+    }
+
+    private func makeManualRecordingSession() -> RemoteRecordingSession {
+        let experimentName = "manual"
+        let takeNumber = 1
+        let captureMode = selectedVideoCaptureMode.filenameComponent
+        let sessionTime = recordingSessionTimeString()
+        return RemoteRecordingSession(experimentName: experimentName,
+                                      takeNumber: takeNumber,
+                                      captureMode: captureMode,
+                                      sessionTime: sessionTime,
+                                      sessionFolderName: "\(experimentName)_\(takeNumber)_\(captureMode)_\(sessionTime)")
+    }
+
+    private func fallbackRecordingFileBaseName() -> String {
+        makeRecordingSessionMetadata(from: nil).fileBaseName
+    }
+
+    private func recordingSessionTimeString() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyyMMdd'T'HHmmss'Z'"
+        return formatter.string(from: Date())
+    }
+
+    private func sanitizedRecordingToken(_ value: String) -> String? {
+        sanitizedRecordingName(value, allowUnderscore: false)
+    }
+
+    private func sanitizedRecordingBaseName(_ value: String) -> String? {
+        sanitizedRecordingName(value, allowUnderscore: true)
+    }
+
+    private func sanitizedRecordingName(_ value: String, allowUnderscore: Bool) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        var output = ""
+        var lastWasSeparator = false
+        for scalar in trimmed.unicodeScalars {
+            let scalarValue = scalar.value
+            let isASCIIAlphanumeric = (48...57).contains(scalarValue)
+                || (65...90).contains(scalarValue)
+                || (97...122).contains(scalarValue)
+            if isASCIIAlphanumeric {
+                output.unicodeScalars.append(scalar)
+                lastWasSeparator = false
+            } else if allowUnderscore && scalarValue == 95 {
+                output.append("_")
+                lastWasSeparator = false
+            } else if !lastWasSeparator {
+                output.append("-")
+                lastWasSeparator = true
+            }
+        }
+
+        let cleaned = output.trimmingCharacters(in: CharacterSet(charactersIn: "-_"))
+        guard !cleaned.isEmpty else { return nil }
+        return String(cleaned.prefix(120))
+    }
+
     private func startRecordingClock(seedTimecode: TentacleTimecode?) {
         let baseMilliseconds = seedTimecode.map { millisecondsOfDay(from: $0) } ?? 0
         recordingClockAnchor = RecordingClockAnchor(baseMillisecondsOfDay: baseMilliseconds,
@@ -1578,13 +1666,17 @@ final class CameraModel: Camera {
         switch await captureService.captureActivity {
         case .movieCapture:
             let calibrationJSON = pendingRecordingCalibrationJSON
+            let recordingSessionMetadata = activeRecordingSessionMetadata
             pendingRecordingCalibrationJSON = nil
             do {
                 // If currently recording, stop and persist the movie to local app storage.
                 let movie = try await captureService.stopRecording()
-                _ = try await localVideoStore.store(movie: movie, calibrationJSON: calibrationJSON)
+                _ = try await localVideoStore.store(movie: movie,
+                                                    calibrationJSON: calibrationJSON,
+                                                    fileBaseName: recordingSessionMetadata?.fileBaseName ?? fallbackRecordingFileBaseName())
                 localVideoURLs = await localVideoStore.loadStoredVideos()
                 recordingStartTimecodeMetadata = nil
+                activeRecordingSessionMetadata = nil
                 stopRecordingClock()
                 rigState = isRemoteArmed ? .recordingPrepared : .normalExit
                 applyRigPowerPolicy()
@@ -1597,13 +1689,21 @@ final class CameraModel: Camera {
             // In any other case, start recording.
             let recordingSeedTimecode = recordingSeedTentacleTimecode()
             recordingStartTimecodeMetadata = currentRecordingStartMetadata()
-            let calibrationJSON = await captureService.recordingCalibrationJSONData()
-            let validation = await captureService.startRecording(recordingStartMetadata: recordingStartTimecodeMetadata)
+            let recordingSessionMetadata = makeRecordingSessionMetadata(from: nil)
+            activeRecordingSessionMetadata = recordingSessionMetadata
+            let outputFileURL = URL.localVideoRecordingFileURL(fileBaseName: recordingSessionMetadata.fileBaseName)
+            let calibrationJSON = await captureService.recordingCalibrationJSONData(
+                recordingSession: recordingSessionMetadata,
+                identity: remoteDirectorClient.manualSnapshotIdentity()
+            )
+            let validation = await captureService.startRecording(recordingStartMetadata: recordingStartTimecodeMetadata,
+                                                                 outputFileURL: outputFileURL)
             if let validation {
                 updateManualLockProfileState(from: validation)
                 persistManualLockProfileStore()
                 guard validation.classification == .exactMatch || validation.classification == .adjustedMatch else {
                     recordingStartTimecodeMetadata = nil
+                    activeRecordingSessionMetadata = nil
                     applyRigPowerPolicy()
                     remoteDirectorClient.sendStatusNow()
                     return
@@ -1673,6 +1773,7 @@ final class CameraModel: Camera {
     private struct PreparedRemoteStart {
         let sessionID: String
         let startAtUnixMS: Int64
+        let recordingSession: RemoteRecordingSession
     }
 
     private struct RemotePullVideosRequest {
@@ -1695,6 +1796,7 @@ final class CameraModel: Camera {
     private struct RemoteTransferItem {
         let videoURL: URL
         let sidecarURL: URL?
+        let sessionFolderName: String
         let fingerprint: String
         let videoBytes: Int64
         let sidecarBytes: Int64
@@ -1764,6 +1866,7 @@ final class CameraModel: Camera {
 
     private func transitionRigState(to targetState: RigState,
                                     reason: String,
+                                    recordingSession: RemoteRecordingSession? = nil,
                                     stopRecordingIfNeeded: Bool = false) async -> RemoteDirectorCommandReply {
         logger.info("Rig transition \(self.rigState.rawValue, privacy: .public) -> \(targetState.rawValue, privacy: .public), reason=\(reason, privacy: .public)")
         let isRecording = await isCapturePipelineRecording()
@@ -1838,7 +1941,7 @@ final class CameraModel: Camera {
                 let prepareReply = await transitionRigState(to: .recordingPrepared, reason: "\(reason)_prepare")
                 guard prepareReply.ok else { return prepareReply }
             }
-            return await startRigRecording(reason: reason)
+            return await startRigRecording(reason: reason, recordingSession: recordingSession)
 
         case .shutdown, .normalExit:
             if isRecording {
@@ -1904,16 +2007,25 @@ final class CameraModel: Camera {
         }
     }
 
-    private func startRigRecording(reason: String) async -> RemoteDirectorCommandReply {
+    private func startRigRecording(reason: String,
+                                   recordingSession: RemoteRecordingSession?) async -> RemoteDirectorCommandReply {
         let recordingSeedTimecode = recordingSeedTentacleTimecode()
         recordingStartTimecodeMetadata = currentRecordingStartMetadata()
-        let calibrationJSON = await captureService.recordingCalibrationJSONData()
-        let validation = await captureService.startRecording(recordingStartMetadata: recordingStartTimecodeMetadata)
+        let recordingSessionMetadata = makeRecordingSessionMetadata(from: recordingSession)
+        activeRecordingSessionMetadata = recordingSessionMetadata
+        let outputFileURL = URL.localVideoRecordingFileURL(fileBaseName: recordingSessionMetadata.fileBaseName)
+        let calibrationJSON = await captureService.recordingCalibrationJSONData(
+            recordingSession: recordingSessionMetadata,
+            identity: remoteDirectorClient.manualSnapshotIdentity()
+        )
+        let validation = await captureService.startRecording(recordingStartMetadata: recordingStartTimecodeMetadata,
+                                                             outputFileURL: outputFileURL)
         if let validation {
             updateManualLockProfileState(from: validation)
             persistManualLockProfileStore()
             guard validation.classification == .exactMatch || validation.classification == .adjustedMatch else {
                 recordingStartTimecodeMetadata = nil
+                activeRecordingSessionMetadata = nil
                 rigState = .recordingPrepared
                 applyRigPowerPolicy()
                 remoteDirectorClient.sendStatusNow()
@@ -1940,12 +2052,16 @@ final class CameraModel: Camera {
         }
 
         let calibrationJSON = pendingRecordingCalibrationJSON
+        let recordingSessionMetadata = activeRecordingSessionMetadata
         pendingRecordingCalibrationJSON = nil
         do {
             let movie = try await captureService.stopRecording()
-            _ = try await localVideoStore.store(movie: movie, calibrationJSON: calibrationJSON)
+            _ = try await localVideoStore.store(movie: movie,
+                                                calibrationJSON: calibrationJSON,
+                                                fileBaseName: recordingSessionMetadata?.fileBaseName ?? fallbackRecordingFileBaseName())
             localVideoURLs = await localVideoStore.loadStoredVideos()
             recordingStartTimecodeMetadata = nil
+            activeRecordingSessionMetadata = nil
             stopRecordingClock()
             rigState = .recordingPrepared
             applyRigPowerPolicy()
@@ -2038,19 +2154,26 @@ final class CameraModel: Camera {
         case .armIdle:
             return await transitionRigState(to: .armedIdle, reason: "remote_arm_idle")
 
-        case .prepareStart(let sessionID, let startAtUnixMS):
+        case .prepareStart(let sessionID, let startAtUnixMS, let recordingSession):
             let prepareReply = await transitionRigState(to: .recordingPrepared,
                                                         reason: "remote_prepare_start")
             guard prepareReply.ok else { return prepareReply }
-            pendingRemoteStart = PreparedRemoteStart(sessionID: sessionID, startAtUnixMS: startAtUnixMS)
+            pendingRemoteStart = PreparedRemoteStart(sessionID: sessionID,
+                                                     startAtUnixMS: startAtUnixMS,
+                                                     recordingSession: recordingSession)
             isRemoteArmed = true
             return rigReply(ok: true, message: "Prepared start for session \(sessionID).")
 
-        case .commitStart(let sessionID, let startAtUnixMS):
+        case .commitStart(let sessionID, let startAtUnixMS, let recordingSession):
             guard let prepared = pendingRemoteStart, prepared.sessionID == sessionID else {
                 return rigReply(ok: false,
                                 message: "Missing matching prepare_start for session \(sessionID).",
                                 error: "missing_prepare")
+            }
+            guard prepared.recordingSession == recordingSession else {
+                return rigReply(ok: false,
+                                message: "Commit session metadata did not match prepare_start for session \(sessionID).",
+                                error: "session_metadata_mismatch")
             }
 
             let targetUnixMS = max(prepared.startAtUnixMS, startAtUnixMS)
@@ -2060,8 +2183,10 @@ final class CameraModel: Camera {
                 await self.waitUntil(unixMilliseconds: targetUnixMS)
                 guard !Task.isCancelled else { return }
                 _ = await self.transitionRigState(to: .recording,
-                                                  reason: "remote_commit_start")
+                                                  reason: "remote_commit_start",
+                                                  recordingSession: prepared.recordingSession)
                 self.pendingRemoteStart = nil
+                self.pendingPreparedRecordingSession = nil
                 self.remoteDirectorClient.sendStatusNow()
             }
             return rigReply(ok: true, message: "Commit accepted for session \(sessionID).")
@@ -2079,11 +2204,13 @@ final class CameraModel: Camera {
             }
             return rigReply(ok: true, message: "Prepared stop.")
 
-        case .prepareRecording:
+        case .prepareRecording(_, let recordingSession):
+            pendingPreparedRecordingSession = recordingSession
             return await transitionRigState(to: .recordingPrepared,
                                             reason: "remote_prepare_recording")
 
-        case .startRecording(_, let startAtUnixMS):
+        case .startRecording(_, let startAtUnixMS, let recordingSession):
+            let requestedRecordingSession = recordingSession ?? pendingPreparedRecordingSession
             if let startAtUnixMS {
                 remoteStartTask?.cancel()
                 remoteStartTask = Task { @MainActor [weak self] in
@@ -2091,12 +2218,19 @@ final class CameraModel: Camera {
                     await self.waitUntil(unixMilliseconds: startAtUnixMS)
                     guard !Task.isCancelled else { return }
                     _ = await self.transitionRigState(to: .recording,
-                                                      reason: "remote_start_recording_scheduled")
+                                                      reason: "remote_start_recording_scheduled",
+                                                      recordingSession: requestedRecordingSession)
+                    self.pendingPreparedRecordingSession = nil
                 }
                 return rigReply(ok: true, message: "Scheduled recording start.")
             }
-            return await transitionRigState(to: .recording,
-                                            reason: "remote_start_recording")
+            let reply = await transitionRigState(to: .recording,
+                                                 reason: "remote_start_recording",
+                                                 recordingSession: requestedRecordingSession)
+            if reply.ok {
+                pendingPreparedRecordingSession = nil
+            }
+            return reply
 
         case .stopRecording(_, let stopAtUnixMS):
             if let stopAtUnixMS {
@@ -2787,7 +2921,7 @@ final class CameraModel: Camera {
         return "\(safeBase).\(pathExtension)"
     }
 
-    private func sanitizedTransferComponent(_ value: String) -> String? {
+    private func sanitizedTransferComponent(_ value: String, maxLength: Int = 80) -> String? {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-_."))
@@ -2795,7 +2929,7 @@ final class CameraModel: Camera {
             allowed.contains(scalar) ? Character(scalar) : "_"
         }
         let cleaned = String(scalars).trimmingCharacters(in: CharacterSet(charactersIn: "._"))
-        return cleaned.isEmpty ? nil : String(cleaned.prefix(80))
+        return cleaned.isEmpty ? nil : String(cleaned.prefix(maxLength))
     }
 
     private func currentLocalVideoStorageSummary() -> LocalVideoStorageSummary {
@@ -3023,12 +3157,32 @@ final class CameraModel: Camera {
             sidecarBytes = 0
         }
 
+        guard let sessionFolderName = recordingSessionFolderName(forSidecarURL: resolvedSidecarURL,
+                                                                 videoURL: videoURL) else {
+            return nil
+        }
+
         let fingerprint = "\(videoURL.lastPathComponent)|\(videoBytes)|\(modifiedAt)"
         return RemoteTransferItem(videoURL: videoURL,
                                   sidecarURL: resolvedSidecarURL,
+                                  sessionFolderName: sessionFolderName,
                                   fingerprint: fingerprint,
                                   videoBytes: videoBytes,
                                   sidecarBytes: sidecarBytes)
+    }
+
+    private func recordingSessionFolderName(forSidecarURL sidecarURL: URL?, videoURL: URL) -> String? {
+        guard let sidecarURL,
+              let data = try? Data(contentsOf: sidecarURL),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let payload = object as? [String: Any],
+              let recordingSession = payload["recordingSession"] as? [String: Any],
+              let rawSessionFolderName = recordingSession["sessionFolderName"] as? String,
+              let sessionFolderName = sanitizedTransferComponent(rawSessionFolderName, maxLength: 160) else {
+            logger.error("Skipping upload for \(videoURL.lastPathComponent, privacy: .public): missing recordingSession.sessionFolderName sidecar metadata.")
+            return nil
+        }
+        return sessionFolderName
     }
 
     private func uploadTransferItem(_ item: RemoteTransferItem,
@@ -3038,6 +3192,7 @@ final class CameraModel: Camera {
         try await uploadSingleTransferFile(fileURL: item.videoURL,
                                            uploadBaseURL: uploadBaseURL,
                                            jobID: jobID,
+                                           sessionFolderName: item.sessionFolderName,
                                            contentKind: "video",
                                            mimeType: mimeType(for: item.videoURL),
                                            fingerprint: item.fingerprint)
@@ -3047,6 +3202,7 @@ final class CameraModel: Camera {
             try await uploadSingleTransferFile(fileURL: sidecarURL,
                                                uploadBaseURL: uploadBaseURL,
                                                jobID: jobID,
+                                               sessionFolderName: item.sessionFolderName,
                                                contentKind: "calibration_json",
                                                mimeType: "application/json",
                                                fingerprint: item.fingerprint)
@@ -3059,11 +3215,13 @@ final class CameraModel: Camera {
     private func uploadSingleTransferFile(fileURL: URL,
                                           uploadBaseURL: URL,
                                           jobID: String,
+                                          sessionFolderName: String,
                                           contentKind: String,
                                           mimeType: String,
                                           fingerprint: String) async throws {
         guard let requestURL = transferRequestURL(baseURL: uploadBaseURL,
                                                   jobID: jobID,
+                                                  sessionFolderName: sessionFolderName,
                                                   fileURL: fileURL,
                                                   contentKind: contentKind) else {
             throw NSError(domain: "RemoteTransfer",
@@ -3081,6 +3239,7 @@ final class CameraModel: Camera {
         request.setValue(remoteDirectorClient.transferDeviceID(), forHTTPHeaderField: "X-Device-ID")
         request.setValue(directorDeviceName, forHTTPHeaderField: "X-Device-Name")
         request.setValue(jobID, forHTTPHeaderField: "X-Transfer-Job-ID")
+        request.setValue(sessionFolderName, forHTTPHeaderField: "X-Session-Folder")
 
         let (_, response) = try await URLSession.shared.upload(for: request, fromFile: fileURL)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -3097,6 +3256,7 @@ final class CameraModel: Camera {
 
     private func transferRequestURL(baseURL: URL,
                                     jobID: String,
+                                    sessionFolderName: String,
                                     fileURL: URL,
                                     contentKind: String) -> URL? {
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
@@ -3106,6 +3266,7 @@ final class CameraModel: Camera {
         queryItems.append(URLQueryItem(name: "device_id", value: remoteDirectorClient.transferDeviceID()))
         queryItems.append(URLQueryItem(name: "device_name", value: directorDeviceName))
         queryItems.append(URLQueryItem(name: "job_id", value: jobID))
+        queryItems.append(URLQueryItem(name: "session_folder", value: sessionFolderName))
         queryItems.append(URLQueryItem(name: "kind", value: contentKind))
         queryItems.append(URLQueryItem(name: "filename", value: fileURL.lastPathComponent))
         components.queryItems = queryItems

@@ -22,17 +22,11 @@ extension URL {
         return baseURL.appendingPathComponent("Videos", isDirectory: true)
     }
 
-    /// A unique output location for persisted local video recordings.
-    static var localVideoRecordingFileURL: URL {
+    /// Output location for a named local video recording.
+    static func localVideoRecordingFileURL(fileBaseName: String) -> URL {
         let fileManager = FileManager.default
         let videosURL = localVideosDirectoryURL
         try? fileManager.createDirectory(at: videosURL, withIntermediateDirectories: true)
-
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd_HHmmss_SSS"
-        let timestamp = formatter.string(from: Date())
-        let fileName = "video_\(timestamp)_\(UUID().uuidString.prefix(8))"
-        return videosURL.appending(component: fileName).appendingPathExtension(for: .quickTimeMovie)
+        return videosURL.appending(component: fileBaseName).appendingPathExtension(for: .quickTimeMovie)
     }
 }

@@ -13,14 +13,14 @@ from urllib.parse import parse_qs, urlparse
 from .models import timestamp_now
 
 
-def _safe_component(value: str, fallback: str) -> str:
+def _safe_component(value: str, fallback: str, max_length: int = 80) -> str:
     trimmed = (value or "").strip()
     if not trimmed:
         return fallback
 
     cleaned = "".join(ch if (ch.isalnum() or ch in {"-", "_", "."}) else "_" for ch in trimmed)
     cleaned = cleaned.strip("._")
-    return cleaned[:80] if cleaned else fallback
+    return cleaned[:max_length] if cleaned else fallback
 
 
 def _safe_filename(value: str) -> str:
@@ -189,6 +189,11 @@ class UploadIngestServer:
             _first_value(query, "kind", handler.headers.get("X-Content-Kind", "")),
             fallback="file",
         )
+        session_folder = _safe_component(
+            _first_value(query, "session_folder", handler.headers.get("X-Session-Folder", "")),
+            fallback="",
+            max_length=160,
+        )
 
         filename_query = _first_value(query, "filename", "")
         filename_header = handler.headers.get("X-Original-Filename", "")
@@ -215,7 +220,13 @@ class UploadIngestServer:
                                                     device_name=device_name,
                                                     fallback_filename=filename)
         else:
-            target_dir = self.ingest_root / f"{device_name}_{device_id}" / job_id / kind
+            if not session_folder:
+                self._write_json(handler, 400, {"ok": False, "error": "session_folder is required."})
+                return
+            if kind not in {"video", "calibration_json"}:
+                self._write_json(handler, 400, {"ok": False, "error": "Unsupported upload kind."})
+                return
+            target_dir = self.ingest_root / session_folder / kind
             target_dir.mkdir(parents=True, exist_ok=True)
             destination = self._unique_destination(target_dir / filename)
         temp_path = destination.with_suffix(destination.suffix + ".part")

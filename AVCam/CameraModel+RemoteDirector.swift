@@ -58,14 +58,22 @@ struct RemoteDirectorStatusPayload {
                                                    preferredStatusIntervalMS: 1_000)
 }
 
+struct RemoteRecordingSession: Sendable, Equatable {
+    let experimentName: String
+    let takeNumber: Int
+    let captureMode: String
+    let sessionTime: String
+    let sessionFolderName: String
+}
+
 enum RemoteDirectorCommand {
     case arm
     case armIdle
-    case prepareStart(sessionID: String, startAtUnixMS: Int64)
-    case commitStart(sessionID: String, startAtUnixMS: Int64)
+    case prepareStart(sessionID: String, startAtUnixMS: Int64, recordingSession: RemoteRecordingSession)
+    case commitStart(sessionID: String, startAtUnixMS: Int64, recordingSession: RemoteRecordingSession)
     case prepareStop(sessionID: String, stopAtUnixMS: Int64)
-    case prepareRecording(sessionID: String?)
-    case startRecording(sessionID: String?, startAtUnixMS: Int64?)
+    case prepareRecording(sessionID: String?, recordingSession: RemoteRecordingSession?)
+    case startRecording(sessionID: String?, startAtUnixMS: Int64?, recordingSession: RemoteRecordingSession?)
     case stopRecording(sessionID: String?, stopAtUnixMS: Int64?)
     case getStatus
     case setBrightness(Double)
@@ -620,6 +628,26 @@ final class RemoteDirectorClient {
         estimatedClockOffsetMS = median(clockOffsetSamplesMS)
     }
 
+    private func parseRecordingSession(_ payload: [String: Any]) -> RemoteRecordingSession? {
+        guard let experimentName = nonEmptyString(payload["experimentName"]) ?? nonEmptyString(payload["experiment_name"]),
+              let takeNumber = intValue(payload["takeNumber"]) ?? intValue(payload["take_number"]),
+              takeNumber > 0,
+              let captureMode = nonEmptyString(payload["captureMode"]) ?? nonEmptyString(payload["capture_mode"]),
+              let sessionTime = nonEmptyString(payload["sessionTime"]) ?? nonEmptyString(payload["session_time"]) else {
+            return nil
+        }
+
+        let sessionFolderName = nonEmptyString(payload["sessionFolderName"])
+            ?? nonEmptyString(payload["session_folder_name"])
+            ?? "\(experimentName)_\(takeNumber)_\(captureMode)_\(sessionTime)"
+
+        return RemoteRecordingSession(experimentName: experimentName,
+                                      takeNumber: takeNumber,
+                                      captureMode: captureMode,
+                                      sessionTime: sessionTime,
+                                      sessionFolderName: sessionFolderName)
+    }
+
     private func parseCommandEnvelope(commandName: String,
                                       payload: [String: Any],
                                       requestID: String) -> RemoteDirectorCommandEnvelope? {
@@ -631,21 +659,29 @@ final class RemoteDirectorClient {
             command = .armIdle
         case "prepare_start":
             guard let sessionID = payload["session_id"] as? String,
-                  let startAtUnixMS = int64Value(payload["start_at_unix_ms"]) else { return nil }
-            command = .prepareStart(sessionID: sessionID, startAtUnixMS: startAtUnixMS)
+                  let startAtUnixMS = int64Value(payload["start_at_unix_ms"]),
+                  let recordingSession = parseRecordingSession(payload) else { return nil }
+            command = .prepareStart(sessionID: sessionID,
+                                    startAtUnixMS: startAtUnixMS,
+                                    recordingSession: recordingSession)
         case "commit_start":
             guard let sessionID = payload["session_id"] as? String,
-                  let startAtUnixMS = int64Value(payload["start_at_unix_ms"]) else { return nil }
-            command = .commitStart(sessionID: sessionID, startAtUnixMS: startAtUnixMS)
+                  let startAtUnixMS = int64Value(payload["start_at_unix_ms"]),
+                  let recordingSession = parseRecordingSession(payload) else { return nil }
+            command = .commitStart(sessionID: sessionID,
+                                   startAtUnixMS: startAtUnixMS,
+                                   recordingSession: recordingSession)
         case "prepare_stop":
             let sessionID = payload["session_id"] as? String ?? "unknown-session"
             guard let stopAtUnixMS = int64Value(payload["stop_at_unix_ms"]) else { return nil }
             command = .prepareStop(sessionID: sessionID, stopAtUnixMS: stopAtUnixMS)
         case "prepare_recording":
-            command = .prepareRecording(sessionID: payload["session_id"] as? String)
+            command = .prepareRecording(sessionID: payload["session_id"] as? String,
+                                        recordingSession: parseRecordingSession(payload))
         case "start_recording":
             command = .startRecording(sessionID: payload["session_id"] as? String,
-                                      startAtUnixMS: int64Value(payload["start_at_unix_ms"]))
+                                      startAtUnixMS: int64Value(payload["start_at_unix_ms"]),
+                                      recordingSession: parseRecordingSession(payload))
         case "stop_recording":
             command = .stopRecording(sessionID: payload["session_id"] as? String,
                                      stopAtUnixMS: int64Value(payload["stop_at_unix_ms"]))
@@ -824,6 +860,12 @@ final class RemoteDirectorClient {
 
     private static func unixNowMS() -> Int64 {
         Int64((Date().timeIntervalSince1970 * 1000).rounded())
+    }
+
+    private func nonEmptyString(_ value: Any?) -> String? {
+        guard let string = value as? String else { return nil }
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
     }
 
     private func int64Value(_ value: Any?) -> Int64? {

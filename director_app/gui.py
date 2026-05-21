@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import json
 import queue
+import shutil
+import struct
 import subprocess
 import sys
+import tempfile
 import time
+import zlib
 from datetime import datetime
 from pathlib import Path
 from tkinter import END, StringVar, Text, Tk, messagebox, ttk
@@ -22,6 +27,14 @@ from .upload_server import UploadIngestServer, discover_advertised_host
 
 
 CAPTURE_MODES = ("hd720p30", "hd1080p30", "hd1080p60", "uhd4k30", "uhd4k60")
+CAPTURE_MODE_FILENAME_COMPONENTS = {
+    "hd720p30": "720p30fps",
+    "hd1080p30": "1080p30fps",
+    "hd1080p60": "1080p60fps",
+    "uhd4k30": "4k30fps",
+    "uhd4k60": "4k60fps",
+}
+TAKE_NUMBERS_STATE_PATH = Path("director_app/state/take_numbers.json")
 
 DEVICE_COLUMNS = (
     "name",
@@ -128,6 +141,9 @@ class DirectorGUI:
         self.port_var = StringVar(value="8765")
         self.upload_host_var = StringVar(value="")
         self.upload_port_var = StringVar(value="8780")
+        self.experiment_name_var = StringVar(value="experiment")
+        self._take_numbers_by_experiment: dict[str, int] = self._load_take_numbers()
+        self.take_number_var = StringVar(value=str(self._take_numbers_by_experiment.get("experiment", 1)))
         self.start_delay_var = StringVar(value="2.0")
         self.stop_delay_var = StringVar(value="2.0")
         self.tentacle_name_var = StringVar(value="NeuROK")
@@ -149,6 +165,8 @@ class DirectorGUI:
         self.selected_device_var = StringVar(value="No camera selected")
         self._upload_url_for_clients = ""
         self._latest_devices_by_id: dict[str, dict[str, Any]] = {}
+        self._last_experiment_key = "experiment"
+        self._is_syncing_experiment_take = False
         self.workspace: ttk.PanedWindow | None = None
 
         self._tentacle_anchor_monotonic: float | None = None
@@ -156,10 +174,13 @@ class DirectorGUI:
         self._tentacle_anchor_fps: int | None = None
 
         self._build_ui()
+        self.experiment_name_var.trace_add("write", self._on_experiment_name_changed)
+        self.take_number_var.trace_add("write", self._on_take_number_changed)
         self._apply_time_source_settings()
         self._schedule_pump()
         self._schedule_status_refresh()
         self._schedule_tentacle_clock()
+        self.root.after(100, self.start_server)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -418,13 +439,15 @@ class DirectorGUI:
         timing.grid(row=0, column=0, sticky="ew")
         for col in range(2):
             timing.columnconfigure(col, weight=1)
-        self._labeled_entry(timing, "Start Delay (s)", self.start_delay_var, row=0, column=0, width=8)
-        self._labeled_entry(timing, "Stop Delay (s)", self.stop_delay_var, row=0, column=1, width=8)
+        self._labeled_entry(timing, "Experiment", self.experiment_name_var, row=0, column=0, width=18)
+        self._labeled_entry(timing, "Take", self.take_number_var, row=0, column=1, width=8)
+        self._labeled_entry(timing, "Start Delay (s)", self.start_delay_var, row=1, column=0, width=8)
+        self._labeled_entry(timing, "Stop Delay (s)", self.stop_delay_var, row=1, column=1, width=8)
         ttk.Button(timing, text="Prepare + Commit Start", command=self.start_all, style="Primary.TButton").grid(
-            row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
+            row=2, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
         )
         ttk.Button(timing, text="Prepare Stop", command=self.stop_all).grid(
-            row=1, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
+            row=2, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
         )
 
         global_actions = ttk.LabelFrame(tab, text="All Cameras", padding=10, style="Panel.TLabelframe")
@@ -478,17 +501,20 @@ class DirectorGUI:
         ttk.Button(preview, text="Preview Selected", command=self.preview_photo_selected).grid(
             row=0, column=0, sticky="ew", padx=(0, 6)
         )
-        ttk.Button(preview, text="Preview All", command=self.preview_photos_all).grid(
+        ttk.Button(preview, text="Open Selected Image", command=self.open_selected_preview_image).grid(
             row=0, column=1, sticky="ew", padx=(6, 0)
         )
-        ttk.Button(preview, text="Open Preview Folder", command=self.open_preview_folder).grid(
+        ttk.Button(preview, text="Preview All", command=self.preview_photos_all).grid(
             row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
         )
-        ttk.Button(preview, text="Open Selected Image", command=self.open_selected_preview_image).grid(
+        ttk.Button(preview, text="Open Grid-view Image", command=self.open_preview_grid_image).grid(
             row=1, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
         )
+        ttk.Button(preview, text="Open Preview Folder", command=self.open_preview_folder).grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0)
+        )
         self.preview_status_label = ttk.Label(preview, textvariable=self.preview_status_var, style="Muted.TLabel", wraplength=380)
-        self.preview_status_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        self.preview_status_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
         return tab
 
     def _build_camera_tab(self, notebook: ttk.Notebook) -> ttk.Frame:
@@ -993,6 +1019,152 @@ class DirectorGUI:
     def _on_time_source_changed(self, _event: Any | None = None) -> None:
         self._apply_time_source_settings()
 
+    def _load_take_numbers(self) -> dict[str, int]:
+        try:
+            with TAKE_NUMBERS_STATE_PATH.open("r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+        except FileNotFoundError:
+            return {"experiment": 1}
+        except Exception:
+            return {"experiment": 1}
+
+        raw_take_numbers = state.get("take_numbers_by_experiment") if isinstance(state, dict) else None
+        if not isinstance(raw_take_numbers, dict):
+            return {"experiment": 1}
+
+        take_numbers: dict[str, int] = {}
+        for raw_name, raw_take in raw_take_numbers.items():
+            experiment_name = self._safe_recording_component(str(raw_name), fallback="experiment")
+            try:
+                take_number = int(raw_take)
+            except Exception:
+                continue
+            take_numbers[experiment_name] = max(1, take_number)
+
+        if "experiment" not in take_numbers:
+            take_numbers["experiment"] = 1
+        return take_numbers
+
+    def _persist_take_numbers(self) -> None:
+        current_experiment = self._current_experiment_name()
+        self._take_numbers_by_experiment[current_experiment] = self._current_take_number(current_experiment)
+        self._write_take_numbers_state()
+
+    def _write_take_numbers_state(self) -> None:
+        payload = {
+            "schema_version": 1,
+            "take_numbers_by_experiment": dict(sorted(self._take_numbers_by_experiment.items())),
+        }
+        try:
+            TAKE_NUMBERS_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            TAKE_NUMBERS_STATE_PATH.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        except Exception as exc:
+            self._append_log(f"Unable to save take-number state: {exc}")
+
+    def _on_experiment_name_changed(self, *_args: Any) -> None:
+        if self._is_syncing_experiment_take:
+            return
+
+        current_key = self._current_experiment_name()
+        if current_key == self._last_experiment_key:
+            return
+
+        next_take = self._take_numbers_by_experiment.get(current_key, 1)
+        self._last_experiment_key = current_key
+        self._is_syncing_experiment_take = True
+        try:
+            self.take_number_var.set(str(max(1, next_take)))
+        finally:
+            self._is_syncing_experiment_take = False
+
+    def _on_take_number_changed(self, *_args: Any) -> None:
+        if self._is_syncing_experiment_take:
+            return
+
+        raw_take = self.take_number_var.get().strip()
+        if not raw_take.isdigit():
+            return
+        self._take_numbers_by_experiment[self._current_experiment_name()] = max(1, int(raw_take))
+        self._write_take_numbers_state()
+
+    def _current_experiment_name(self) -> str:
+        return self._safe_recording_component(self.experiment_name_var.get(), fallback="experiment")
+
+    def _current_take_number(self, experiment_name: str | None = None) -> int:
+        fallback = self._take_numbers_by_experiment.get(experiment_name or self._current_experiment_name(), 1)
+        take = max(1, parse_nonnegative_int(self.take_number_var.get(), fallback=fallback))
+        if self.take_number_var.get().strip() != str(take):
+            self.take_number_var.set(str(take))
+        return take
+
+    def _safe_recording_component(self,
+                                  value: str,
+                                  fallback: str,
+                                  allow_underscore: bool = False,
+                                  max_length: int = 120) -> str:
+        trimmed = (value or "").strip()
+        output: list[str] = []
+        last_was_separator = False
+        for ch in trimmed:
+            if ch.isascii() and ch.isalnum():
+                output.append(ch)
+                last_was_separator = False
+            elif allow_underscore and ch == "_":
+                output.append(ch)
+                last_was_separator = False
+            elif not last_was_separator:
+                output.append("-")
+                last_was_separator = True
+
+        cleaned = "".join(output).strip("-_")
+        return cleaned[:max_length] if cleaned else fallback
+
+    def _capture_mode_filename_component(self) -> str:
+        mode = self.capture_mode_var.get().strip()
+        return CAPTURE_MODE_FILENAME_COMPONENTS.get(
+            mode,
+            self._safe_recording_component(mode, fallback="capturemode"),
+        )
+
+    def _recording_session_payload(self) -> dict[str, Any]:
+        experiment_name = self._current_experiment_name()
+        take_number = self._current_take_number(experiment_name)
+        capture_mode = self._capture_mode_filename_component()
+        session_time = datetime.utcnow().strftime("%Y%m%d")
+        session_folder_name = self._safe_recording_component(
+            f"{experiment_name}_{take_number}_{capture_mode}_{session_time}",
+            fallback=f"experiment_{take_number}_{capture_mode}_{session_time}",
+            allow_underscore=True,
+        )
+
+        self._take_numbers_by_experiment[experiment_name] = take_number
+        self._persist_take_numbers()
+        return {
+            "session_id": f"session-{session_folder_name}",
+            "experimentName": experiment_name,
+            "experiment_name": experiment_name,
+            "takeNumber": take_number,
+            "take_number": take_number,
+            "captureMode": capture_mode,
+            "capture_mode": capture_mode,
+            "sessionTime": session_time,
+            "session_time": session_time,
+            "sessionFolderName": session_folder_name,
+            "session_folder_name": session_folder_name,
+        }
+
+    def _increment_take_after_recording_trigger(self, payload: dict[str, Any]) -> None:
+        experiment_name = str(payload.get("experimentName") or "experiment")
+        try:
+            next_take = int(payload.get("takeNumber") or 1) + 1
+        except Exception:
+            next_take = self._take_numbers_by_experiment.get(experiment_name, 1) + 1
+        next_take = max(1, next_take)
+        self._take_numbers_by_experiment[experiment_name] = next_take
+        if self._current_experiment_name() == experiment_name:
+            self.take_number_var.set(str(next_take))
+        self._persist_take_numbers()
+
     def _capture_mode_fps(self, mode: str) -> int | None:
         normalized = mode.strip().lower()
         if normalized.endswith("60"):
@@ -1082,24 +1254,24 @@ class DirectorGUI:
         self._send_selected_command("arm_idle", {})
 
     def prepare_recording_all(self) -> None:
-        session_id = datetime.utcnow().strftime("session-%Y%m%d-%H%M%S")
-        self.server.send_command_all("prepare_recording", {"session_id": session_id})
+        self.server.send_command_all("prepare_recording", self._recording_session_payload())
 
     def start_recording_all(self) -> None:
-        session_id = datetime.utcnow().strftime("session-%Y%m%d-%H%M%S")
-        self.server.send_command_all("start_recording", {"session_id": session_id})
+        payload = self._recording_session_payload()
+        self.server.send_command_all("start_recording", payload)
+        self._increment_take_after_recording_trigger(payload)
 
     def stop_recording_all(self) -> None:
         session_id = datetime.utcnow().strftime("session-%Y%m%d-%H%M%S")
         self.server.send_command_all("stop_recording", {"session_id": session_id})
 
     def prepare_recording_selected(self) -> None:
-        session_id = datetime.utcnow().strftime("session-%Y%m%d-%H%M%S")
-        self._send_selected_command("prepare_recording", {"session_id": session_id})
+        self._send_selected_command("prepare_recording", self._recording_session_payload())
 
     def start_recording_selected(self) -> None:
-        session_id = datetime.utcnow().strftime("session-%Y%m%d-%H%M%S")
-        self._send_selected_command("start_recording", {"session_id": session_id})
+        payload = self._recording_session_payload()
+        if self._send_selected_command("start_recording", payload):
+            self._increment_take_after_recording_trigger(payload)
 
     def stop_recording_selected(self) -> None:
         session_id = datetime.utcnow().strftime("session-%Y%m%d-%H%M%S")
@@ -1108,12 +1280,13 @@ class DirectorGUI:
     def start_all(self) -> None:
         delay = parse_delay(self.start_delay_var.get(), fallback=2.0)
         start_at_ms = int((time.time() + delay) * 1000)
-        session_id = datetime.utcnow().strftime("session-%Y%m%d-%H%M%S")
-        payload = {"session_id": session_id, "start_at_unix_ms": start_at_ms}
+        payload = self._recording_session_payload()
+        payload["start_at_unix_ms"] = start_at_ms
 
         # Two-step for safer coordination.
         self.server.send_command_all("prepare_start", payload)
         self.server.send_command_all("commit_start", payload)
+        self._increment_take_after_recording_trigger(payload)
 
     def stop_all(self) -> None:
         delay = parse_delay(self.stop_delay_var.get(), fallback=2.0)
@@ -1188,6 +1361,263 @@ class DirectorGUI:
     def open_preview_folder(self) -> None:
         self._open_path(Path("director_app/captures/preview_photos"))
 
+    def open_preview_grid_image(self) -> None:
+        devices = self.server.snapshot_devices()
+        grid_path = self._build_preview_grid_image(devices)
+        if grid_path is None:
+            self._append_log("No received preview images are available for a grid view.")
+            return
+        self.preview_status_var.set(f"Preview photos: grid view {grid_path}")
+        self._open_path(grid_path)
+
+    def _build_preview_grid_image(self, devices: list[dict[str, Any]]) -> Path | None:
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self._append_log("Unable to create preview grid PNG: ffmpeg is not installed.")
+            return None
+
+        candidates: list[dict[str, Any]] = []
+        for device in devices:
+            image_path = Path(str(device.get("preview_image_path") or ""))
+            if not image_path.is_file():
+                continue
+            candidates.append(device)
+
+        if not candidates:
+            return None
+
+        latest_by_batch: dict[str, float] = {}
+        for device in candidates:
+            batch_id = str(device.get("preview_batch_id") or "")
+            latest_by_batch[batch_id] = max(latest_by_batch.get(batch_id, 0), float(device.get("preview_updated_unix") or 0))
+        latest_batch_id = max(latest_by_batch, key=latest_by_batch.get)
+        batch_devices = [
+            device
+            for device in candidates
+            if str(device.get("preview_batch_id") or "") == latest_batch_id
+        ]
+        if not batch_devices:
+            batch_devices = candidates
+        batch_devices.sort(key=lambda device: str(device.get("name") or device.get("device_id") or ""))
+
+        count = len(batch_devices)
+        columns = 1
+        while columns * columns < count:
+            columns += 1
+        rows = (count + columns - 1) // columns
+        cell_width = 320
+        cell_height = 480
+
+        inputs: list[str] = []
+        filters: list[str] = []
+        stack_inputs: list[str] = []
+        layouts: list[str] = []
+
+        output_dir = Path("director_app/captures/preview_photos") / (latest_batch_id or "latest")
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_path = output_dir / "grid_view.png"
+        with tempfile.TemporaryDirectory(prefix="preview_grid_") as temp_dir:
+            inputs.clear()
+            filters.clear()
+            stack_inputs.clear()
+            layouts.clear()
+
+            for index, device in enumerate(batch_devices):
+                row = index // columns
+                column = index % columns
+                x = column * cell_width
+                y = row * cell_height
+                image_input = index * 2
+                label_input = image_input + 1
+                image_path = Path(str(device.get("preview_image_path") or ""))
+                label_path = Path(temp_dir) / f"label_{index}.png"
+                label = str(device.get("name") or device.get("device_id") or "Camera")
+                self._write_label_overlay_png(label_path, label, cell_width, cell_height)
+
+                inputs.extend(["-i", str(image_path), "-i", str(label_path)])
+                filters.append(
+                    f"[{image_input}:v]"
+                    f"scale={cell_width}:{cell_height}:force_original_aspect_ratio=increase,"
+                    f"crop={cell_width}:{cell_height},setsar=1"
+                    f"[base{index}]"
+                )
+                filters.append(f"[{label_input}:v]format=rgba[label{index}]")
+                filters.append(f"[base{index}][label{index}]overlay=0:0:format=auto[tile{index}]")
+                stack_inputs.append(f"[tile{index}]")
+                layouts.append(f"{x}_{y}")
+
+            if len(stack_inputs) == 1:
+                filters.append(
+                    f"{stack_inputs[0]}"
+                    f"format=rgb24[out]"
+                )
+            else:
+                filters.append(
+                    f"{''.join(stack_inputs)}"
+                    f"xstack=inputs={len(stack_inputs)}:layout={'|'.join(layouts)}:"
+                    f"fill=0x101820,"
+                    f"format=rgb24[out]"
+                )
+
+            command = [
+                ffmpeg,
+                "-y",
+                *inputs,
+                "-filter_complex",
+                ";".join(filters),
+                "-map",
+                "[out]",
+                "-frames:v",
+                "1",
+                "-update",
+                "1",
+                str(output_path),
+            ]
+            try:
+                subprocess.run(command, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as exc:
+                detail = (exc.stderr or exc.stdout or str(exc)).strip().splitlines()[-1:]
+                self._append_log(f"Unable to create preview grid PNG: {detail[0] if detail else exc}")
+                return None
+            return output_path
+
+    def _write_label_overlay_png(self, path: Path, text: str, width: int, height: int) -> None:
+        pixels = bytearray([0, 0, 0, 0] * (width * height))
+        scale = 5
+        normalized = " ".join(text.replace("\n", " ").replace("\r", " ").upper().split())
+        max_chars = max(1, (width - 24) // (6 * scale))
+        if len(normalized) > max_chars:
+            if max_chars <= 3:
+                normalized = normalized[:max_chars]
+            else:
+                normalized = normalized[: max_chars - 3].rstrip() + "..."
+        self._draw_bitmap_text(pixels, normalized, width, height, 10, 10, scale, (0, 0, 0), alpha=160, bold=True)
+        self._draw_bitmap_text(pixels, normalized, width, height, 8, 8, scale, (230, 0, 0), alpha=255, bold=True)
+        self._write_rgba_png(path, width, height, pixels)
+
+    def _draw_bitmap_text(
+        self,
+        pixels: bytearray,
+        text: str,
+        width: int,
+        height: int,
+        x: int,
+        y: int,
+        scale: int,
+        color: tuple[int, int, int],
+        alpha: int | None = None,
+        bold: bool = False,
+    ) -> None:
+        channels = 4 if alpha is not None else 3
+        cursor_x = x
+        for char in text:
+            glyph = self._bitmap_for_char(char)
+            for row_index, row in enumerate(glyph):
+                for col_index, bit in enumerate(row):
+                    if bit == " ":
+                        continue
+                    px = cursor_x + (col_index * scale)
+                    py = y + (row_index * scale)
+                    extra_width = 1 if bold else 0
+                    for dy in range(scale):
+                        for dx in range(scale + extra_width):
+                            target_x = px + dx
+                            target_y = py + dy
+                            if 0 <= target_x < width and 0 <= target_y < height:
+                                offset = ((target_y * width) + target_x) * channels
+                                if alpha is None:
+                                    pixels[offset : offset + 3] = bytes(color)
+                                else:
+                                    pixels[offset : offset + 4] = bytes((*color, alpha))
+            cursor_x += 6 * scale
+
+    def _bitmap_for_char(self, char: str) -> tuple[str, ...]:
+        glyphs: dict[str, tuple[str, ...]] = {
+            "A": (" ### ", "#   #", "#   #", "#####", "#   #", "#   #", "#   #"),
+            "B": ("#### ", "#   #", "#   #", "#### ", "#   #", "#   #", "#### "),
+            "C": (" ####", "#    ", "#    ", "#    ", "#    ", "#    ", " ####"),
+            "D": ("#### ", "#   #", "#   #", "#   #", "#   #", "#   #", "#### "),
+            "E": ("#####", "#    ", "#    ", "#### ", "#    ", "#    ", "#####"),
+            "F": ("#####", "#    ", "#    ", "#### ", "#    ", "#    ", "#    "),
+            "G": (" ####", "#    ", "#    ", "#  ##", "#   #", "#   #", " ####"),
+            "H": ("#   #", "#   #", "#   #", "#####", "#   #", "#   #", "#   #"),
+            "I": ("#####", "  #  ", "  #  ", "  #  ", "  #  ", "  #  ", "#####"),
+            "J": ("#####", "    #", "    #", "    #", "#   #", "#   #", " ### "),
+            "K": ("#   #", "#  # ", "# #  ", "##   ", "# #  ", "#  # ", "#   #"),
+            "L": ("#    ", "#    ", "#    ", "#    ", "#    ", "#    ", "#####"),
+            "M": ("#   #", "## ##", "# # #", "#   #", "#   #", "#   #", "#   #"),
+            "N": ("#   #", "##  #", "# # #", "#  ##", "#   #", "#   #", "#   #"),
+            "O": (" ### ", "#   #", "#   #", "#   #", "#   #", "#   #", " ### "),
+            "P": ("#### ", "#   #", "#   #", "#### ", "#    ", "#    ", "#    "),
+            "Q": (" ### ", "#   #", "#   #", "#   #", "# # #", "#  # ", " ## #"),
+            "R": ("#### ", "#   #", "#   #", "#### ", "# #  ", "#  # ", "#   #"),
+            "S": (" ####", "#    ", "#    ", " ### ", "    #", "    #", "#### "),
+            "T": ("#####", "  #  ", "  #  ", "  #  ", "  #  ", "  #  ", "  #  "),
+            "U": ("#   #", "#   #", "#   #", "#   #", "#   #", "#   #", " ### "),
+            "V": ("#   #", "#   #", "#   #", "#   #", "#   #", " # # ", "  #  "),
+            "W": ("#   #", "#   #", "#   #", "#   #", "# # #", "## ##", "#   #"),
+            "X": ("#   #", "#   #", " # # ", "  #  ", " # # ", "#   #", "#   #"),
+            "Y": ("#   #", "#   #", " # # ", "  #  ", "  #  ", "  #  ", "  #  "),
+            "Z": ("#####", "    #", "   # ", "  #  ", " #   ", "#    ", "#####"),
+            "0": (" ### ", "#   #", "#  ##", "# # #", "##  #", "#   #", " ### "),
+            "1": ("  #  ", " ##  ", "# #  ", "  #  ", "  #  ", "  #  ", "#####"),
+            "2": (" ### ", "#   #", "    #", "   # ", "  #  ", " #   ", "#####"),
+            "3": ("#### ", "    #", "    #", " ### ", "    #", "    #", "#### "),
+            "4": ("#   #", "#   #", "#   #", "#####", "    #", "    #", "    #"),
+            "5": ("#####", "#    ", "#    ", "#### ", "    #", "    #", "#### "),
+            "6": (" ### ", "#    ", "#    ", "#### ", "#   #", "#   #", " ### "),
+            "7": ("#####", "    #", "   # ", "  #  ", " #   ", " #   ", " #   "),
+            "8": (" ### ", "#   #", "#   #", " ### ", "#   #", "#   #", " ### "),
+            "9": (" ### ", "#   #", "#   #", " ####", "    #", "    #", " ### "),
+            " ": ("     ", "     ", "     ", "     ", "     ", "     ", "     "),
+            "-": ("     ", "     ", "     ", "#####", "     ", "     ", "     "),
+            "_": ("     ", "     ", "     ", "     ", "     ", "     ", "#####"),
+            ".": ("     ", "     ", "     ", "     ", "     ", " ##  ", " ##  "),
+            ":": ("     ", " ##  ", " ##  ", "     ", " ##  ", " ##  ", "     "),
+            "/": ("    #", "    #", "   # ", "  #  ", " #   ", "#    ", "#    "),
+            "(": ("   # ", "  #  ", " #   ", " #   ", " #   ", "  #  ", "   # "),
+            ")": (" #   ", "  #  ", "   # ", "   # ", "   # ", "  #  ", " #   "),
+        }
+        return glyphs.get(char, glyphs[" "])
+
+    def _write_rgb_png(self, path: Path, width: int, height: int, pixels: bytearray) -> None:
+        def chunk(tag: bytes, data: bytes) -> bytes:
+            checksum = zlib.crc32(tag + data) & 0xFFFFFFFF
+            return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", checksum)
+
+        scanlines = [
+            b"\x00" + bytes(pixels[(row * width * 3) : ((row + 1) * width * 3)])
+            for row in range(height)
+        ]
+        payload = b"".join(
+            [
+                b"\x89PNG\r\n\x1a\n",
+                chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)),
+                chunk(b"IDAT", zlib.compress(b"".join(scanlines))),
+                chunk(b"IEND", b""),
+            ]
+        )
+        path.write_bytes(payload)
+
+    def _write_rgba_png(self, path: Path, width: int, height: int, pixels: bytearray) -> None:
+        def chunk(tag: bytes, data: bytes) -> bytes:
+            checksum = zlib.crc32(tag + data) & 0xFFFFFFFF
+            return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", checksum)
+
+        scanlines = [
+            b"\x00" + bytes(pixels[(row * width * 4) : ((row + 1) * width * 4)])
+            for row in range(height)
+        ]
+        payload = b"".join(
+            [
+                b"\x89PNG\r\n\x1a\n",
+                chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)),
+                chunk(b"IDAT", zlib.compress(b"".join(scanlines))),
+                chunk(b"IEND", b""),
+            ]
+        )
+        path.write_bytes(payload)
+
     def open_selected_preview_image(self) -> None:
         selected = self.tree.selection()
         if not selected:
@@ -1215,12 +1645,13 @@ class DirectorGUI:
             return ""
         return str(selected[0])
 
-    def _send_selected_command(self, command: str, payload: dict[str, Any]) -> None:
+    def _send_selected_command(self, command: str, payload: dict[str, Any]) -> bool:
         device_id = self._selected_device_id()
         if not device_id:
             self._append_log(f"Select one device row before sending {command}.")
-            return
+            return False
         self.server.send_command_to_device(device_id, command, payload)
+        return True
 
     def _open_path(self, path: Path) -> None:
         try:
@@ -1281,6 +1712,7 @@ class DirectorGUI:
         self.server.send_command_all("set_capture_mode", {"mode": mode})
 
     def on_close(self) -> None:
+        self._persist_take_numbers()
         self.tentacle_reader.stop()
         self.server.clear_timecode_anchor()
         self.upload_server.stop()

@@ -21,6 +21,7 @@ xcuserdata/
 !**/*.playground/playground.xcworkspace/xcshareddata/WorkspaceSettings.xcsettings
 
 ingest/
+ingest_old/
 
 camera_param_presets/
 
@@ -29,5 +30,6 @@ camera_param_sync_reports/
 **/__pycache__/
 
 director_app/captures/
+director_app/state/
 
 syncrec_v0

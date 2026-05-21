@@ -2501,7 +2501,8 @@ actor CaptureService {
     // MARK: - Movie capture
     /// Starts recording video. The video records until the user stops recording,
     /// which calls the following `stopRecording()` method.
-    func startRecording(recordingStartMetadata: RecordingStartTimecodeMetadata?) async -> ManualValidationReport? {
+    func startRecording(recordingStartMetadata: RecordingStartTimecodeMetadata?,
+                        outputFileURL: URL) async -> ManualValidationReport? {
         var validationReport: ManualValidationReport?
         if let profile = activeManualLockProfile {
             var validation = validateManualLockProfile(reason: "before_recording_start",
@@ -2527,6 +2528,7 @@ actor CaptureService {
             stabilizationMode = .auto
         }
         movieCapture.startRecording(recordingStartMetadata: recordingStartMetadata,
+                                    outputFileURL: outputFileURL,
                                     preferredStabilizationMode: stabilizationMode)
         if let profile = activeManualLockProfile {
             validationReport = validateManualLockProfile(reason: "after_recording_start",
@@ -2542,8 +2544,11 @@ actor CaptureService {
     }
 
     /// Captures a JSON snapshot of camera calibration-related state at recording start.
-    func recordingCalibrationJSONData() -> Data {
-        let actualSnapshot = exportActualCameraSnapshot(reason: "recording_calibration_sidecar")
+    func recordingCalibrationJSONData(recordingSession: RecordingSessionMetadata?,
+                                      identity: ManualSnapshotDeviceIdentity) -> Data {
+        var actualSnapshot = exportActualCameraSnapshot(reason: "recording_calibration_sidecar",
+                                                        identity: identity)
+        actualSnapshot.recordingSession = recordingSession
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         if let data = try? encoder.encode(actualSnapshot) {
@@ -2555,6 +2560,17 @@ actor CaptureService {
             "capturedAt": Self.calibrationTimestampFormatter.string(from: Date()),
             "source": "AVCaptureDevice.activeFormat"
         ]
+        if let recordingSession {
+            payload["recordingSession"] = jsonSafeValue(from: [
+                "schemaVersion": recordingSession.schemaVersion,
+                "experimentName": recordingSession.experimentName,
+                "takeNumber": recordingSession.takeNumber,
+                "captureMode": recordingSession.captureMode,
+                "sessionTime": recordingSession.sessionTime,
+                "sessionFolderName": recordingSession.sessionFolderName,
+                "fileBaseName": recordingSession.fileBaseName
+            ])
+        }
 
         guard isSetUp, let device = activeVideoInput?.device else {
             payload["available"] = false

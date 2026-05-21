@@ -140,6 +140,16 @@ struct RecordingStartTimecodeMetadata: Sendable, Equatable {
     let source: String
 }
 
+struct RecordingSessionMetadata: Codable, Sendable, Equatable {
+    var schemaVersion: Int = 1
+    var experimentName: String
+    var takeNumber: Int
+    var captureMode: String
+    var sessionTime: String
+    var sessionFolderName: String
+    var fileBaseName: String
+}
+
 enum TentacleConnectionState: Equatable {
     case idle
     case bluetoothUnavailable
@@ -321,6 +331,21 @@ enum VideoCaptureModePreset: String, Identifiable, CaseIterable, Codable, Sendab
             return "4K 30"
         case .uhd4k60:
             return "4K 60"
+        }
+    }
+
+    var filenameComponent: String {
+        switch self {
+        case .hd720p30:
+            return "720p30fps"
+        case .hd1080p30:
+            return "1080p30fps"
+        case .hd1080p60:
+            return "1080p60fps"
+        case .uhd4k30:
+            return "4k30fps"
+        case .uhd4k60:
+            return "4k60fps"
         }
     }
 
@@ -586,6 +611,7 @@ struct ManualCameraActualSnapshot: Codable, Sendable, Equatable {
     var zoom: ManualZoomSnapshot?
     var stabilization: ManualStabilizationSnapshot?
     var intrinsics: ManualCameraIntrinsicsSnapshot
+    var recordingSession: RecordingSessionMetadata? = nil
     var isSubjectAreaChangeMonitoringEnabled: Bool?
 }
 

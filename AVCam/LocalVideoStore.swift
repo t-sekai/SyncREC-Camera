@@ -32,16 +32,17 @@ actor LocalVideoStore {
         return restoredURLs
     }
 
-    func store(movie: Movie, calibrationJSON: Data?) async throws -> URL {
+    func store(movie: Movie, calibrationJSON: Data?, fileBaseName: String) async throws -> URL {
         try await waitForMovieFileToExist(at: movie.url)
         let folderURL = try ensureVideosFolder()
-        let sourceFolderURL = movie.url.deletingLastPathComponent()
+        let preferredURL = folderURL.appending(path: "\(sanitizedBaseName(fileBaseName)).mov",
+                                               directoryHint: .notDirectory)
 
         let destinationURL: URL
-        if isSameFileLocation(sourceFolderURL, folderURL) {
+        if isSameFileLocation(movie.url, preferredURL) {
             destinationURL = movie.url
         } else {
-            let relocatedURL = folderURL.appending(path: uniqueFileName(), directoryHint: .notDirectory)
+            let relocatedURL = uniqueDestination(preferredURL)
             try await moveOrCopyMovie(from: movie.url, to: relocatedURL)
             destinationURL = relocatedURL
         }
@@ -91,7 +92,6 @@ actor LocalVideoStore {
         }
 
         markExcludedFromBackupIfPossible(videosURL)
-        migrateLegacyVideosIfNeeded(to: videosURL)
         return videosURL
     }
 
@@ -106,64 +106,48 @@ actor LocalVideoStore {
             .appendingPathComponent(Self.folderName, isDirectory: true)
     }
 
-    private func legacyVideosFolderURL(relativeTo preferredURL: URL) -> URL? {
-        guard let appSupportURL = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
-            return nil
-        }
-        let legacyURL = appSupportURL.appendingPathComponent(Self.folderName, isDirectory: true)
-        guard !isSameFileLocation(legacyURL, preferredURL) else {
-            return nil
-        }
-        return legacyURL
-    }
+    private func sanitizedBaseName(_ value: String) -> String {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        var output = ""
+        var lastWasSeparator = false
 
-    private func migrateLegacyVideosIfNeeded(to preferredURL: URL) {
-        guard let legacyURL = legacyVideosFolderURL(relativeTo: preferredURL),
-              fileManager.fileExists(atPath: legacyURL.path),
-              let contents = try? fileManager.contentsOfDirectory(at: legacyURL,
-                                                                  includingPropertiesForKeys: nil,
-                                                                  options: [.skipsHiddenFiles]) else {
-            return
-        }
-
-        for sourceURL in contents where shouldMigrateFile(at: sourceURL) {
-            let destinationURL = preferredURL.appendingPathComponent(sourceURL.lastPathComponent, isDirectory: false)
-            if fileManager.fileExists(atPath: destinationURL.path) {
-                continue
+        for scalar in trimmed.unicodeScalars {
+            let scalarValue = scalar.value
+            let isASCIIAlphanumeric = (48...57).contains(scalarValue)
+                || (65...90).contains(scalarValue)
+                || (97...122).contains(scalarValue)
+            if isASCIIAlphanumeric || scalarValue == 95 || scalarValue == 45 {
+                output.unicodeScalars.append(scalar)
+                lastWasSeparator = false
+            } else if !lastWasSeparator {
+                output.append("-")
+                lastWasSeparator = true
             }
+        }
 
-            do {
-                try fileManager.moveItem(at: sourceURL, to: destinationURL)
-            } catch {
-                do {
-                    try fileManager.copyItem(at: sourceURL, to: destinationURL)
-                    try? fileManager.removeItem(at: sourceURL)
-                } catch {
-                    logger.error("Failed to migrate local video file \(sourceURL.lastPathComponent, privacy: .public): \(error.localizedDescription, privacy: .public)")
-                }
+        let cleaned = output.trimmingCharacters(in: CharacterSet(charactersIn: "-_"))
+        if cleaned.isEmpty {
+            return "recording"
+        }
+        return String(cleaned.prefix(160))
+    }
+
+    private func uniqueDestination(_ candidate: URL) -> URL {
+        guard fileManager.fileExists(atPath: candidate.path) else {
+            return candidate
+        }
+
+        let stem = candidate.deletingPathExtension().lastPathComponent
+        let pathExtension = candidate.pathExtension
+        let folderURL = candidate.deletingLastPathComponent()
+        var index = 2
+        while true {
+            let next = folderURL.appending(path: "\(stem)_\(index).\(pathExtension)", directoryHint: .notDirectory)
+            if !fileManager.fileExists(atPath: next.path) {
+                return next
             }
-            markExcludedFromBackupIfPossible(destinationURL)
+            index += 1
         }
-
-        if let remaining = try? fileManager.contentsOfDirectory(at: legacyURL,
-                                                                includingPropertiesForKeys: nil,
-                                                                options: [.skipsHiddenFiles]),
-           remaining.isEmpty {
-            try? fileManager.removeItem(at: legacyURL)
-        }
-    }
-
-    private func shouldMigrateFile(at url: URL) -> Bool {
-        let ext = url.pathExtension.lowercased()
-        return ext == "mov" || ext == "mp4" || ext == "json"
-    }
-
-    private func uniqueFileName() -> String {
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.dateFormat = "yyyyMMdd_HHmmss_SSS"
-        let timestamp = formatter.string(from: Date())
-        return "video_\(timestamp)_\(UUID().uuidString.prefix(8)).mov"
     }
 
     private func calibrationSidecarURL(forMovieURL movieURL: URL) -> URL {
