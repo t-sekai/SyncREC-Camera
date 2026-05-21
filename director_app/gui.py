@@ -35,6 +35,8 @@ CAPTURE_MODE_FILENAME_COMPONENTS = {
     "uhd4k60": "4k60fps",
 }
 TAKE_NUMBERS_STATE_PATH = Path("director_app/state/take_numbers.json")
+DEFAULT_PULL_CONCURRENCY = 3
+MAX_PULL_CONCURRENCY = 8
 
 DEVICE_COLUMNS = (
     "name",
@@ -150,6 +152,7 @@ class DirectorGUI:
         self.time_source_var = StringVar(value="laptop")
         self.laptop_fps_var = StringVar(value="30")
         self.pull_max_files_var = StringVar(value="0")
+        self.pull_concurrency_var = StringVar(value=str(DEFAULT_PULL_CONCURRENCY))
         self.capture_mode_var = StringVar(value="hd1080p30")
         self.tentacle_state_var = StringVar(value="Tentacle: idle")
         self.tentacle_timecode_var = StringVar(value="Director timecode: --:--:--:--")
@@ -484,14 +487,21 @@ class DirectorGUI:
         transfer.columnconfigure(0, weight=1)
         transfer.columnconfigure(1, weight=1)
         self._labeled_entry(transfer, "Pull Max Files (0 = all)", self.pull_max_files_var, row=0, column=0, width=10)
-        ttk.Button(transfer, text="Pull Videos Selected", command=self.pull_selected_device, style="Primary.TButton").grid(
-            row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0)
+        self._labeled_entry(transfer, "Pull Concurrency", self.pull_concurrency_var, row=0, column=1, width=10)
+        ttk.Button(transfer, text="Pull Videos All", command=self.pull_all_devices, style="Primary.TButton").grid(
+            row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
         )
-        ttk.Button(transfer, text="Delete Uploaded Selected", command=self.delete_uploaded_videos_selected).grid(
+        ttk.Button(transfer, text="Delete Uploaded All", command=self.delete_uploaded_videos_all).grid(
+            row=1, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
+        )
+        ttk.Button(transfer, text="Pull Videos Selected", command=self.pull_selected_device, style="Primary.TButton").grid(
             row=2, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
         )
-        ttk.Button(transfer, text="Force Delete Selected", command=self.force_delete_videos_selected, style="Danger.TButton").grid(
+        ttk.Button(transfer, text="Delete Uploaded Selected", command=self.delete_uploaded_videos_selected).grid(
             row=2, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
+        )
+        ttk.Button(transfer, text="Force Delete Selected", command=self.force_delete_videos_selected, style="Danger.TButton").grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0)
         )
 
         preview = ttk.LabelFrame(tab, text="Preview Photos", padding=10, style="Panel.TLabelframe")
@@ -702,18 +712,22 @@ class DirectorGUI:
     def _schedule_status_refresh(self) -> None:
         self._refresh_tree(self.server.snapshot_devices())
         pull = self.server.pull_status()
-        active_device = pull.get("active_device_id", "")
-        active_job = pull.get("active_job_id", "")
+        active_device_ids = pull.get("active_device_ids") or []
+        active_count = int(pull.get("active_count") or 0)
+        concurrency_limit = int(pull.get("concurrency_limit") or 1)
         queued = pull.get("queued_count", 0)
 
-        if active_device:
+        if active_count:
+            active_text = ", ".join(str(device_id) for device_id in active_device_ids[:3])
+            if active_count > 3:
+                active_text = f"{active_text}, +{active_count - 3} more"
             self.pull_status_var.set(
-                f"Pull queue: active={active_device} job={active_job} queued={queued}"
+                f"Pull queue: active={active_count}/{concurrency_limit} [{active_text}] queued={queued}"
             )
         elif queued:
-            self.pull_status_var.set(f"Pull queue: queued={queued}, waiting for active job")
+            self.pull_status_var.set(f"Pull queue: queued={queued}, waiting for an upload slot")
         else:
-            self.pull_status_var.set("Pull queue: idle")
+            self.pull_status_var.set(f"Pull queue: idle (concurrency={concurrency_limit})")
 
         self.root.after(1000, self._schedule_status_refresh)
 
@@ -1302,15 +1316,56 @@ class DirectorGUI:
             return
 
         device_id = str(selected[0])
-        max_files = parse_nonnegative_int(self.pull_max_files_var.get(), fallback=0)
+        max_files, concurrency = self._pull_upload_settings()
         if not self.upload_server.is_running or not self._upload_url_for_clients:
             self._append_log("Upload endpoint is not running. Start server first.")
             return
 
+        self.server.configure_pull_concurrency(concurrency)
         self.server.queue_pull_videos(device_id=device_id,
                                       max_files=max_files,
                                       policy="new_only",
                                       upload_url=self._upload_url_for_clients)
+
+    def pull_all_devices(self) -> None:
+        if not self.upload_server.is_running or not self._upload_url_for_clients:
+            self._append_log("Upload endpoint is not running. Start server first.")
+            return
+
+        max_files, concurrency = self._pull_upload_settings()
+        devices = self.server.snapshot_devices()
+        device_ids: list[str] = []
+        skipped_recording: list[str] = []
+        skipped_busy: list[str] = []
+
+        for device in devices:
+            device_id = str(device.get("device_id") or "")
+            if not device_id:
+                continue
+            name = self._device_display_name(device)
+            if bool(device.get("recording")):
+                skipped_recording.append(name)
+                continue
+            if self._device_transfer_is_active(device):
+                skipped_busy.append(name)
+                continue
+            device_ids.append(device_id)
+
+        if not device_ids:
+            self._append_log("No idle connected devices are available for Pull Videos All.")
+            return
+
+        self.server.queue_pull_videos_many(device_ids=device_ids,
+                                           max_files=max_files,
+                                           policy="new_only",
+                                           upload_url=self._upload_url_for_clients,
+                                           concurrency_limit=concurrency)
+        detail = f"Queued Pull Videos All for {len(device_ids)} device(s) with concurrency {concurrency}."
+        if skipped_recording:
+            detail += f" Skipped recording: {', '.join(skipped_recording)}."
+        if skipped_busy:
+            detail += f" Skipped busy transfers: {', '.join(skipped_busy)}."
+        self._append_log(detail)
 
     def delete_uploaded_videos_selected(self) -> None:
         device_id = self._selected_device_id()
@@ -1323,6 +1378,57 @@ class DirectorGUI:
         ):
             return
         self.server.send_command_to_device(device_id, "delete_uploaded_videos", {})
+
+    def delete_uploaded_videos_all(self) -> None:
+        devices = self.server.snapshot_devices()
+        device_ids: list[str] = []
+        skipped_recording: list[str] = []
+        skipped_busy: list[str] = []
+        for device in devices:
+            device_id = str(device.get("device_id") or "")
+            if not device_id:
+                continue
+            name = self._device_display_name(device)
+            if bool(device.get("recording")):
+                skipped_recording.append(name)
+                continue
+            if self._device_transfer_is_active(device):
+                skipped_busy.append(name)
+                continue
+            device_ids.append(device_id)
+
+        if not device_ids:
+            self._append_log("No idle connected devices are available for Delete Uploaded All.")
+            return
+        if not messagebox.askyesno(
+            "Delete Uploaded Videos",
+            f"Delete local videos marked uploaded on {len(device_ids)} idle iPhone(s)? Videos not marked uploaded will remain.",
+        ):
+            return
+
+        for device_id in device_ids:
+            self.server.send_command_to_device(device_id, "delete_uploaded_videos", {})
+        detail = f"Sent Delete Uploaded All to {len(device_ids)} device(s)."
+        if skipped_recording:
+            detail += f" Skipped recording: {', '.join(skipped_recording)}."
+        if skipped_busy:
+            detail += f" Skipped busy transfers: {', '.join(skipped_busy)}."
+        self._append_log(detail)
+
+    def _pull_upload_settings(self) -> tuple[int, int]:
+        max_files = parse_nonnegative_int(self.pull_max_files_var.get(), fallback=0)
+        concurrency = parse_nonnegative_int(self.pull_concurrency_var.get(), fallback=DEFAULT_PULL_CONCURRENCY)
+        concurrency = max(1, min(MAX_PULL_CONCURRENCY, concurrency))
+        if self.pull_concurrency_var.get().strip() != str(concurrency):
+            self.pull_concurrency_var.set(str(concurrency))
+        return max_files, concurrency
+
+    def _device_transfer_is_active(self, device: dict[str, Any]) -> bool:
+        transfer_state = str(device.get("transfer_state") or "").lower()
+        return transfer_state in {"starting", "uploading", "progress"}
+
+    def _device_display_name(self, device: dict[str, Any]) -> str:
+        return str(device.get("name") or device.get("device_id") or "Unknown")
 
     def force_delete_videos_selected(self) -> None:
         device_id = self._selected_device_id()

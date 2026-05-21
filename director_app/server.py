@@ -47,6 +47,7 @@ class PreviewPhotoRequest:
 class DirectorServer:
     HEARTBEAT_TIMEOUT_SECONDS = 45.0
     HEARTBEAT_CHECK_SECONDS = 5.0
+    MAX_PULL_CONCURRENCY = 8
 
     def __init__(self, event_queue: queue.Queue[tuple[str, Any]]):
         self.event_queue = event_queue
@@ -60,9 +61,10 @@ class DirectorServer:
         self._heartbeat_task: asyncio.Task | None = None
         self._time_sync_task: asyncio.Task | None = None
 
-        # Serialized pull-videos queue. Only one iPhone gets a pull command at a time.
+        # Bounded pull-videos queue. A small active set avoids saturating Wi-Fi airtime.
         self._pull_queue: deque[PullVideosRequest] = deque()
-        self._active_pull: PullVideosRequest | None = None
+        self._active_pulls: dict[str, PullVideosRequest] = {}
+        self._pull_concurrency_limit = 3
         self._ack_waiters: dict[tuple[str, str], asyncio.Future] = {}
 
         self._preview_upload_url = ""
@@ -130,7 +132,7 @@ class DirectorServer:
 
         with self._lock:
             self._pull_queue.clear()
-            self._active_pull = None
+            self._active_pulls.clear()
             for request in self._preview_requests.values():
                 if request.timeout_task:
                     request.timeout_task.cancel()
@@ -244,6 +246,15 @@ class DirectorServer:
 
         asyncio.run_coroutine_threadsafe(self._sync_camera_params_all(dry_run=dry_run), loop)
 
+    def configure_pull_concurrency(self, limit: int) -> None:
+        normalized = self._normalized_pull_concurrency(limit)
+        with self._lock:
+            self._pull_concurrency_limit = normalized
+
+        loop = self._loop
+        if loop:
+            asyncio.run_coroutine_threadsafe(self._dispatch_available_pulls(), loop)
+
     def queue_pull_videos(self,
                           device_id: str,
                           max_files: int = 0,
@@ -267,17 +278,76 @@ class DirectorServer:
 
         async def _enqueue() -> None:
             with self._lock:
+                if self._is_pull_already_pending_locked(device_id):
+                    self.log(f"Skipped duplicate pull_videos request for {device_id}; already active or queued.")
+                    return
                 self._pull_queue.append(request)
                 queued_count = len(self._pull_queue)
-                active_device = self._active_pull.device_id if self._active_pull else None
+                active_count = len(self._active_pulls)
+                limit = self._pull_concurrency_limit
 
             self.log(
                 f"Queued pull_videos for {device_id} job={payload['job_id']} "
-                f"(queue={queued_count}, active={active_device or 'none'})."
+                f"(queue={queued_count}, active={active_count}/{limit})."
             )
-            await self._dispatch_next_pull_if_idle()
+            await self._dispatch_available_pulls()
 
         asyncio.run_coroutine_threadsafe(_enqueue(), loop)
+
+    def queue_pull_videos_many(self,
+                               device_ids: list[str],
+                               max_files: int = 0,
+                               policy: str = "new_only",
+                               upload_url: str | None = None,
+                               concurrency_limit: int | None = None) -> None:
+        loop = self._loop
+        if not loop:
+            self.log("Server not running.")
+            return
+
+        unique_device_ids = list(dict.fromkeys(device_id for device_id in device_ids if device_id))
+        if not unique_device_ids:
+            self.log("No devices available for pull_videos.")
+            return
+
+        async def _enqueue_many() -> None:
+            if concurrency_limit is not None:
+                with self._lock:
+                    self._pull_concurrency_limit = self._normalized_pull_concurrency(concurrency_limit)
+
+            queued_jobs: list[tuple[str, str]] = []
+            skipped: list[str] = []
+            with self._lock:
+                for device_id in unique_device_ids:
+                    if self._is_pull_already_pending_locked(device_id):
+                        skipped.append(device_id)
+                        continue
+
+                    payload: dict[str, Any] = {
+                        "job_id": f"pull-{datetime.utcnow().strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}",
+                        "policy": policy,
+                    }
+                    if max_files > 0:
+                        payload["max_files"] = max_files
+                    if upload_url:
+                        payload["upload_url"] = upload_url
+
+                    self._pull_queue.append(PullVideosRequest(device_id=device_id, payload=payload))
+                    queued_jobs.append((device_id, str(payload["job_id"])))
+
+                queued_count = len(self._pull_queue)
+                active_count = len(self._active_pulls)
+                limit = self._pull_concurrency_limit
+
+            self.log(
+                f"Queued pull_videos for {len(queued_jobs)} device(s) "
+                f"(skipped duplicates={len(skipped)}, queue={queued_count}, active={active_count}/{limit})."
+            )
+            if skipped:
+                self.log(f"Skipped already active/queued pull_videos device(s): {', '.join(skipped)}")
+            await self._dispatch_available_pulls()
+
+        asyncio.run_coroutine_threadsafe(_enqueue_many(), loop)
 
     def configure_preview_upload_url(self, upload_url: str) -> None:
         self._preview_upload_url = upload_url.strip()
@@ -320,11 +390,17 @@ class DirectorServer:
 
     def pull_status(self) -> dict[str, Any]:
         with self._lock:
-            active = self._active_pull
+            active_pulls = list(self._active_pulls.values())
+            active_device_ids = [request.device_id for request in active_pulls]
+            active_job_ids = [str(request.payload.get("job_id", "")) for request in active_pulls]
             return {
-                "active_device_id": active.device_id if active else "",
-                "active_job_id": (active.payload.get("job_id", "") if active else ""),
+                "active_device_id": ", ".join(active_device_ids),
+                "active_job_id": ", ".join(active_job_ids),
+                "active_device_ids": active_device_ids,
+                "active_job_ids": active_job_ids,
+                "active_count": len(active_pulls),
                 "queued_count": len(self._pull_queue),
+                "concurrency_limit": self._pull_concurrency_limit,
             }
 
     def snapshot_devices(self) -> list[dict[str, Any]]:
@@ -408,7 +484,7 @@ class DirectorServer:
             websockets_to_close = [d.websocket for d in self.devices.values()]
             self.devices.clear()
             self._pull_queue.clear()
-            self._active_pull = None
+            self._active_pulls.clear()
             for request in self._preview_requests.values():
                 if request.timeout_task:
                     request.timeout_task.cancel()
@@ -557,6 +633,7 @@ class DirectorServer:
             with self._lock:
                 disconnected = self.devices.pop(websocket, None)
             if disconnected:
+                self._drop_queued_pulls_for_device(disconnected.device_id, reason="device disconnected")
                 await self._release_active_pull_if_device(disconnected.device_id,
                                                           reason="device disconnected")
                 self._mark_preview_disconnected(disconnected.device_id)
@@ -1318,34 +1395,55 @@ class DirectorServer:
         status = str(payload.get("classification") or payload.get("camera_params_status") or "")
         return ", ".join(part for part in (status, mode, fmt, iso) if part)
 
-    async def _dispatch_next_pull_if_idle(self) -> None:
+    def _normalized_pull_concurrency(self, limit: int) -> int:
+        try:
+            parsed = int(limit)
+        except Exception:
+            parsed = 3
+        return max(1, min(self.MAX_PULL_CONCURRENCY, parsed))
+
+    def _is_pull_already_pending_locked(self, device_id: str) -> bool:
+        return device_id in self._active_pulls or any(request.device_id == device_id for request in self._pull_queue)
+
+    def _drop_queued_pulls_for_device(self, device_id: str, reason: str) -> None:
+        with self._lock:
+            before = len(self._pull_queue)
+            self._pull_queue = deque(request for request in self._pull_queue if request.device_id != device_id)
+            dropped = before - len(self._pull_queue)
+        if dropped:
+            self.log(f"Dropped {dropped} queued pull request(s) for {device_id} ({reason}).")
+
+    async def _dispatch_available_pulls(self) -> None:
         while True:
             with self._lock:
-                if self._active_pull is not None or not self._pull_queue:
+                if len(self._active_pulls) >= self._pull_concurrency_limit or not self._pull_queue:
                     return
                 request = self._pull_queue.popleft()
-                self._active_pull = request
+                if request.device_id in self._active_pulls:
+                    self.log(f"Skipping duplicate queued pull request for {request.device_id}.")
+                    continue
+                self._active_pulls[request.device_id] = request
 
             sent = await self._send_command_to_device(device_id=request.device_id,
                                                       command="pull_videos",
                                                       payload=request.payload)
             if sent:
-                return
+                continue
 
             self.log(
                 f"Dropping queued pull request for {request.device_id}; unable to send command."
             )
             with self._lock:
-                if self._active_pull and self._active_pull.payload.get("job_id") == request.payload.get("job_id"):
-                    self._active_pull = None
+                active = self._active_pulls.get(request.device_id)
+                if active and active.payload.get("job_id") == request.payload.get("job_id"):
+                    self._active_pulls.pop(request.device_id, None)
 
     async def _release_active_pull_if_device(self, device_id: str, reason: str) -> None:
         with self._lock:
-            active = self._active_pull
-            if active is None or active.device_id != device_id:
+            active = self._active_pulls.pop(device_id, None)
+            if active is None:
                 return
             job_id = str(active.payload.get("job_id") or "")
-            self._active_pull = None
 
         self.log(f"Pull job complete for {device_id} job={job_id} ({reason}).")
-        await self._dispatch_next_pull_if_idle()
+        await self._dispatch_available_pulls()
