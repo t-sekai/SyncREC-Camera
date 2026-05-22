@@ -11,6 +11,7 @@ class DeviceState:
     websocket: Any
     device_id: str
     name: str
+    role: str = "camera"
     app_version: str = ""
     app_build: str = ""
     last_seen_unix: float = field(default_factory=time.time)
@@ -50,6 +51,9 @@ class DeviceState:
     preview_image_path: str = ""
     preview_metadata_path: str = ""
     preview_updated_unix: float | None = None
+    remote_director_state: str = ""
+    remote_director_detail: str = ""
+    remote_director_requested_unix: float | None = None
 
     @property
     def endpoint(self) -> str:

@@ -60,6 +60,9 @@ class DirectorServer:
         self._lock = threading.Lock()
         self._heartbeat_task: asyncio.Task | None = None
         self._time_sync_task: asyncio.Task | None = None
+        self._remote_director_active_id: str | None = None
+        self._remote_director_approved_id: str | None = None
+        self._remote_director_approved_snapshot: dict[str, Any] | None = None
 
         # Bounded pull-videos queue. A small active set avoids saturating Wi-Fi airtime.
         self._pull_queue: deque[PullVideosRequest] = deque()
@@ -198,7 +201,7 @@ class DirectorServer:
 
         async def _broadcast() -> None:
             with self._lock:
-                devices = list(self.devices.values())
+                devices = [device for device in self.devices.values() if device.role == "camera"]
             if not devices:
                 self.log(f"No devices connected for command: {command}")
                 return
@@ -212,6 +215,41 @@ class DirectorServer:
                                         request_id=request_id)
 
         asyncio.run_coroutine_threadsafe(_broadcast(), loop)
+
+    def send_command_sequence_all(self, commands: list[tuple[str, dict[str, Any]]]) -> None:
+        loop = self._loop
+        if not loop:
+            self.log("Server not running.")
+            return
+        normalized_commands = [(command, payload or {}) for command, payload in commands]
+        if not normalized_commands:
+            return
+
+        async def _broadcast_sequence() -> None:
+            with self._lock:
+                devices = [device for device in self.devices.values() if device.role == "camera"]
+            if not devices:
+                names = ", ".join(command for command, _payload in normalized_commands)
+                self.log(f"No devices connected for command sequence: {names}")
+                return
+
+            for command, payload in normalized_commands:
+                request_id = str(uuid.uuid4())
+                msg = {
+                    "type": "command",
+                    "command": command,
+                    "request_id": request_id,
+                    **payload,
+                }
+                for device in devices:
+                    device.pending_acks[request_id] = command
+                await self._send_to_devices(devices=devices,
+                                            encoded=json.dumps(msg),
+                                            log_prefix=f"Broadcast '{command}'",
+                                            request_id=request_id)
+                await asyncio.sleep(0)
+
+        asyncio.run_coroutine_threadsafe(_broadcast_sequence(), loop)
 
     def send_command_to_device(self,
                                device_id: str,
@@ -403,6 +441,66 @@ class DirectorServer:
                 "concurrency_limit": self._pull_concurrency_limit,
             }
 
+    def remote_director_status(self) -> dict[str, Any]:
+        with self._lock:
+            active = self._remote_director_snapshot_locked(
+                self._remote_director_active_id or self._remote_director_approved_id
+            )
+            pending = [
+                self._remote_director_snapshot_locked(device.device_id)
+                for device in self.devices.values()
+                if device.role == "remote_director_candidate"
+            ]
+        return {
+            "active": active,
+            "pending": [item for item in pending if item],
+        }
+
+    def approve_remote_director(self, device_id: str) -> None:
+        loop = self._loop
+        if not loop:
+            self.log("Server not running.")
+            return
+        asyncio.run_coroutine_threadsafe(self._approve_remote_director(device_id), loop)
+
+    def deny_remote_director(self, device_id: str) -> None:
+        loop = self._loop
+        if not loop:
+            self.log("Server not running.")
+            return
+        asyncio.run_coroutine_threadsafe(self._deny_remote_director(device_id), loop)
+
+    def release_remote_director(self) -> None:
+        loop = self._loop
+        if not loop:
+            self.log("Server not running.")
+            return
+        asyncio.run_coroutine_threadsafe(self._release_remote_director(), loop)
+
+    def send_remote_director_result(self,
+                                    device_id: str,
+                                    request_id: str,
+                                    ok: bool,
+                                    detail: str,
+                                    payload: dict[str, Any] | None = None) -> None:
+        loop = self._loop
+        if not loop:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._send_remote_director_result(device_id=device_id,
+                                              request_id=request_id,
+                                              ok=ok,
+                                              detail=detail,
+                                              payload=payload or {}),
+            loop,
+        )
+
+    def publish_remote_director_state(self, payload: dict[str, Any]) -> None:
+        loop = self._loop
+        if not loop:
+            return
+        asyncio.run_coroutine_threadsafe(self._publish_remote_director_state(payload), loop)
+
     def snapshot_devices(self) -> list[dict[str, Any]]:
         with self._lock:
             data = [
@@ -450,12 +548,191 @@ class DirectorServer:
                     "preview_updated_unix": d.preview_updated_unix,
                 }
                 for d in self.devices.values()
+                if d.role == "camera"
             ]
         data.sort(key=lambda x: x["name"])
         return data
 
     def log(self, message: str) -> None:
         self.event_queue.put(("log", f"[{timestamp_now()}] {message}"))
+
+    def _remote_director_snapshot_locked(self, device_id: str | None) -> dict[str, Any] | None:
+        if not device_id:
+            return None
+        device = next((d for d in self.devices.values() if d.device_id == device_id), None)
+        if not device:
+            if device_id == self._remote_director_approved_id and self._remote_director_approved_snapshot:
+                snapshot = dict(self._remote_director_approved_snapshot)
+                snapshot["connected"] = False
+                snapshot["role"] = "remote_director"
+                snapshot["state"] = "disconnected"
+                snapshot["detail"] = "Approved remote director is disconnected; it will be approved again if it rejoins."
+                return snapshot
+            return None
+        return {
+            "device_id": device.device_id,
+            "name": device.name,
+            "endpoint": device.endpoint,
+            "role": device.role,
+            "connected": True,
+            "state": device.remote_director_state,
+            "detail": device.remote_director_detail,
+            "requested_unix": device.remote_director_requested_unix,
+            "last_seen_unix": device.last_seen_unix,
+            "app_display_version": device.app_display_version,
+        }
+
+    def _remember_approved_remote_director_locked(self, device: DeviceState) -> None:
+        self._remote_director_approved_id = device.device_id
+        self._remote_director_approved_snapshot = {
+            "device_id": device.device_id,
+            "name": device.name,
+            "endpoint": device.endpoint,
+            "requested_unix": device.remote_director_requested_unix,
+            "last_seen_unix": device.last_seen_unix,
+            "app_display_version": device.app_display_version,
+        }
+
+    def _is_remembered_remote_director_locked(self, device_id: str) -> bool:
+        return bool(self._remote_director_approved_id and self._remote_director_approved_id == device_id)
+
+    def _normalize_client_role(self, value: Any) -> str:
+        raw = str(value or "camera").strip().lower()
+        if raw in {"remote_director", "remote_director_candidate", "controller", "director_controller"}:
+            return "remote_director_candidate"
+        return "camera"
+
+    async def _send_json(self, websocket: WebSocketServerProtocol, payload: dict[str, Any]) -> bool:
+        try:
+            await websocket.send(json.dumps(payload))
+            return True
+        except Exception as exc:
+            self.log(f"Send failed: {exc}")
+            return False
+
+    async def _send_remote_director_status(self,
+                                           device: DeviceState,
+                                           state: str,
+                                           detail: str,
+                                           approved: bool = False) -> None:
+        device.remote_director_state = state
+        device.remote_director_detail = detail
+        await self._send_json(device.websocket, {
+            "type": "remote_director_status",
+            "device_id": device.device_id,
+            "state": state,
+            "approved": approved,
+            "detail": detail,
+        })
+        self.event_queue.put(("remote_director_updated", self.remote_director_status()))
+
+    async def _approve_remote_director(self, device_id: str) -> None:
+        with self._lock:
+            target = next((d for d in self.devices.values() if d.device_id == device_id), None)
+            active_id = self._remote_director_active_id
+            approved_id = self._remote_director_approved_id
+
+        if not target or target.role not in {"remote_director_candidate", "remote_director_denied", "remote_director"}:
+            self.log(f"Remote director approval failed; candidate not connected: {device_id}")
+            return
+
+        if (active_id and active_id != device_id) or (approved_id and approved_id != device_id):
+            blocking_id = active_id or approved_id
+            self.log(f"Remote director approval failed; another controller is already active: {blocking_id}")
+            await self._send_remote_director_status(target,
+                                                    "busy",
+                                                    "Another remote director is already active.",
+                                                    approved=False)
+            return
+
+        with self._lock:
+            self._remote_director_active_id = device_id
+            target.role = "remote_director"
+            self._remember_approved_remote_director_locked(target)
+        self.log(f"Approved remote director: {target.name} ({target.device_id})")
+        await self._send_remote_director_status(target,
+                                                "approved",
+                                                "Approved by laptop director.",
+                                                approved=True)
+
+    async def _deny_remote_director(self, device_id: str) -> None:
+        with self._lock:
+            target = next((d for d in self.devices.values() if d.device_id == device_id), None)
+            if self._remote_director_active_id == device_id:
+                self._remote_director_active_id = None
+            if self._remote_director_approved_id == device_id:
+                self._remote_director_approved_id = None
+                self._remote_director_approved_snapshot = None
+            if target:
+                target.role = "remote_director_denied"
+
+        if not target:
+            self.log(f"Remote director deny failed; candidate not connected: {device_id}")
+            return
+        self.log(f"Denied remote director: {target.name} ({target.device_id})")
+        await self._send_remote_director_status(target,
+                                                "denied",
+                                                "Denied by laptop director.",
+                                                approved=False)
+
+    async def _release_remote_director(self) -> None:
+        with self._lock:
+            active_id = self._remote_director_active_id or self._remote_director_approved_id
+            target = next((d for d in self.devices.values() if d.device_id == active_id), None)
+            remembered = dict(self._remote_director_approved_snapshot or {})
+            self._remote_director_active_id = None
+            self._remote_director_approved_id = None
+            self._remote_director_approved_snapshot = None
+            if target:
+                target.role = "remote_director_denied"
+
+        if not target:
+            if active_id:
+                name = str(remembered.get("name") or active_id)
+                self.log(f"Released remote director: {name} ({active_id})")
+                self.event_queue.put(("remote_director_updated", self.remote_director_status()))
+            return
+        self.log(f"Released remote director: {target.name} ({target.device_id})")
+        await self._send_remote_director_status(target,
+                                                "released",
+                                                "Remote director slot released by laptop.",
+                                                approved=False)
+
+    async def _send_remote_director_result(self,
+                                           device_id: str,
+                                           request_id: str,
+                                           ok: bool,
+                                           detail: str,
+                                           payload: dict[str, Any]) -> None:
+        with self._lock:
+            target = next((d for d in self.devices.values() if d.device_id == device_id), None)
+        if not target:
+            return
+        message: dict[str, Any] = {
+            "type": "remote_director_result",
+            "device_id": device_id,
+            "request_id": request_id,
+            "ok": ok,
+            "detail": detail,
+        }
+        if payload:
+            message["payload"] = payload
+        await self._send_json(target.websocket, message)
+
+    async def _publish_remote_director_state(self, payload: dict[str, Any]) -> None:
+        with self._lock:
+            active_id = self._remote_director_active_id
+            target = next((d for d in self.devices.values() if d.device_id == active_id), None)
+        if not target:
+            return
+        message = {
+            "type": "remote_director_state",
+            "device_id": target.device_id,
+            "state": "approved",
+            "approved": True,
+            **payload,
+        }
+        await self._send_json(target.websocket, message)
 
     def _run_loop(self) -> None:
         loop = asyncio.new_event_loop()
@@ -483,6 +760,9 @@ class DirectorServer:
         with self._lock:
             websockets_to_close = [d.websocket for d in self.devices.values()]
             self.devices.clear()
+            self._remote_director_active_id = None
+            self._remote_director_approved_id = None
+            self._remote_director_approved_snapshot = None
             self._pull_queue.clear()
             self._active_pulls.clear()
             for request in self._preview_requests.values():
@@ -632,7 +912,20 @@ class DirectorServer:
             disconnected: DeviceState | None
             with self._lock:
                 disconnected = self.devices.pop(websocket, None)
+                has_replacement = bool(
+                    disconnected and any(
+                        device.device_id == disconnected.device_id
+                        for device in self.devices.values()
+                    )
+                )
+                was_active_remote_director = bool(
+                    disconnected and self._remote_director_active_id == disconnected.device_id
+                )
+                if was_active_remote_director and not has_replacement:
+                    self._remote_director_active_id = None
             if disconnected:
+                if was_active_remote_director and not has_replacement:
+                    self.event_queue.put(("remote_director_updated", self.remote_director_status()))
                 self._drop_queued_pulls_for_device(disconnected.device_id, reason="device disconnected")
                 await self._release_active_pull_if_device(disconnected.device_id,
                                                           reason="device disconnected")
@@ -666,6 +959,33 @@ class DirectorServer:
             device.name = str(msg.get("name") or device.name)
             device.app_version = str(msg.get("app_version") or "")
             device.app_build = str(msg.get("app_build") or "")
+            requested_role = self._normalize_client_role(msg.get("role"))
+            if requested_role == "camera":
+                with self._lock:
+                    if self._remote_director_active_id == device.device_id:
+                        self._remote_director_active_id = None
+                    if self._remote_director_approved_id == device.device_id:
+                        self._remote_director_approved_id = None
+                        self._remote_director_approved_snapshot = None
+            if requested_role == "remote_director_candidate":
+                with self._lock:
+                    active_id = self._remote_director_active_id
+                    remembered = self._is_remembered_remote_director_locked(device.device_id)
+                    device.role = (
+                        "remote_director"
+                        if remembered and (not active_id or active_id == device.device_id)
+                        else "remote_director_candidate"
+                    )
+                    if device.role == "remote_director":
+                        self._remote_director_active_id = device.device_id
+                        self._remember_approved_remote_director_locked(device)
+                device.remote_director_requested_unix = time.time()
+                device.recording = False
+                device.armed = False
+            else:
+                device.role = "camera"
+                device.remote_director_state = ""
+                device.remote_director_detail = ""
             replaced: list[DeviceState] = []
             with self._lock:
                 for other_ws, other_device in list(self.devices.items()):
@@ -683,7 +1003,95 @@ class DirectorServer:
                     f"Replaced stale connection for {old_device.name} "
                     f"({old_device.device_id}) with latest reconnect."
                 )
-            self.log(f"HELLO from {device.name} ({device.device_id})")
+            if device.role == "remote_director":
+                self.log(f"HELLO from approved remote director {device.name} ({device.device_id})")
+                await self._send_remote_director_status(device,
+                                                        "approved",
+                                                        "Approved by laptop director.",
+                                                        approved=True)
+            elif device.role == "remote_director_candidate":
+                active_id = self._remote_director_active_id
+                approved_id = self._remote_director_approved_id
+                if (active_id and active_id != device.device_id) or (approved_id and approved_id != device.device_id):
+                    await self._send_remote_director_status(device,
+                                                            "busy",
+                                                            "Another remote director is already active.",
+                                                            approved=False)
+                    self.log(f"Remote director request is waiting behind active controller: {device.name} ({device.device_id})")
+                else:
+                    await self._send_remote_director_status(device,
+                                                            "pending",
+                                                            "Waiting for laptop director approval.",
+                                                            approved=False)
+                    self.log(f"Remote director approval requested by {device.name} ({device.device_id})")
+            else:
+                self.log(f"HELLO from {device.name} ({device.device_id})")
+
+        elif mtype == "remote_director_request":
+            with self._lock:
+                active_id = self._remote_director_active_id
+                remembered = self._is_remembered_remote_director_locked(device.device_id)
+                device.role = (
+                    "remote_director"
+                    if remembered and (not active_id or active_id == device.device_id)
+                    else "remote_director_candidate"
+                )
+                if device.role == "remote_director":
+                    self._remote_director_active_id = device.device_id
+                    self._remember_approved_remote_director_locked(device)
+            device.remote_director_requested_unix = time.time()
+            if device.role == "remote_director":
+                await self._send_remote_director_status(device,
+                                                        "approved",
+                                                        "Approved by laptop director.",
+                                                        approved=True)
+            elif self._remote_director_active_id or (
+                self._remote_director_approved_id and self._remote_director_approved_id != device.device_id
+            ):
+                await self._send_remote_director_status(device,
+                                                        "busy",
+                                                        "Another remote director is already active.",
+                                                        approved=False)
+            else:
+                self.log(f"Remote director approval requested by {device.name} ({device.device_id})")
+                await self._send_remote_director_status(device,
+                                                        "pending",
+                                                        "Waiting for laptop director approval.",
+                                                        approved=False)
+
+        elif mtype == "remote_director_exit":
+            with self._lock:
+                if self._remote_director_active_id == device.device_id:
+                    self._remote_director_active_id = None
+            device.role = "remote_director_denied"
+            await self._send_remote_director_status(device,
+                                                    "released",
+                                                    "Remote director exited. Laptop approval is retained for reconnect.",
+                                                    approved=False)
+            self.log(f"Remote director exited: {device.name} ({device.device_id})")
+
+        elif mtype == "remote_director_control":
+            request_id = str(msg.get("request_id") or uuid.uuid4())
+            action = str(msg.get("action") or "")
+            control_payload = msg.get("payload") if isinstance(msg.get("payload"), dict) else {}
+            if self._remote_director_active_id != device.device_id or device.role != "remote_director":
+                await self._send_remote_director_result(device_id=device.device_id,
+                                                        request_id=request_id,
+                                                        ok=False,
+                                                        detail="This phone is not the approved remote director.",
+                                                        payload={})
+                await self._send_remote_director_status(device,
+                                                        "pending",
+                                                        "Waiting for laptop director approval.",
+                                                        approved=False)
+                return
+            self.event_queue.put(("remote_director_control", {
+                "device_id": device.device_id,
+                "name": device.name,
+                "request_id": request_id,
+                "action": action,
+                "payload": control_payload,
+            }))
 
         elif mtype == "status":
             if "app_version" in msg:
@@ -869,7 +1277,7 @@ class DirectorServer:
                                       command: str,
                                       payload: dict[str, Any]) -> bool:
         with self._lock:
-            target = next((d for d in self.devices.values() if d.device_id == device_id), None)
+            target = next((d for d in self.devices.values() if d.device_id == device_id and d.role == "camera"), None)
 
         if not target:
             self.log(f"Device not connected for command '{command}': {device_id}")
@@ -936,7 +1344,7 @@ class DirectorServer:
 
     async def _request_preview_photos_all(self, batch_id: str) -> None:
         with self._lock:
-            devices = list(self.devices.values())
+            devices = [device for device in self.devices.values() if device.role == "camera"]
         if not devices:
             self.log("No devices connected for preview photo request.")
             return
@@ -953,7 +1361,7 @@ class DirectorServer:
 
     async def _request_preview_photo(self, device_id: str, batch_id: str, attempt: int) -> None:
         with self._lock:
-            device = next((d for d in self.devices.values() if d.device_id == device_id), None)
+            device = next((d for d in self.devices.values() if d.device_id == device_id and d.role == "camera"), None)
         if not device:
             self.log(f"Preview photo request failed; device not connected: {device_id}")
             return
@@ -1220,7 +1628,7 @@ class DirectorServer:
 
     async def _copy_camera_params(self, device_id: str) -> None:
         with self._lock:
-            device = next((d for d in self.devices.values() if d.device_id == device_id), None)
+            device = next((d for d in self.devices.values() if d.device_id == device_id and d.role == "camera"), None)
         if not device:
             self.log(f"Copy camera params failed; device not connected: {device_id}")
             return
@@ -1268,7 +1676,7 @@ class DirectorServer:
             return
 
         with self._lock:
-            devices = list(self.devices.values())
+            devices = [device for device in self.devices.values() if device.role == "camera"]
         if not devices:
             self.log("No devices connected for camera params sync.")
             return

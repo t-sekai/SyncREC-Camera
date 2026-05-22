@@ -13,6 +13,7 @@ enum RemoteDirectorConfiguration {
     static let directorWebSocketURLDefaultsKey = "DirectorWebSocketURL"
     static let directorWebSocketURLInfoKey = "DirectorWebSocketURL"
     static let directorDeviceNameDefaultsKey = "DirectorDeviceName"
+    static let remoteDirectorModeEnabledDefaultsKey = "RemoteDirectorModeEnabled"
     static let defaultDirectorWebSocketURL = "ws://192.168.0.20:8765"
 }
 
@@ -122,6 +123,26 @@ final class CameraModel: Camera {
     var directorDeviceName = UIDevice.current.name {
         didSet { handleDirectorDeviceNameChange(from: oldValue) }
     }
+
+    /// Whether this iPhone should request handheld remote director control instead of recording.
+    var isRemoteDirectorModeEnabled = false {
+        didSet { handleRemoteDirectorModeChange(from: oldValue) }
+    }
+
+    private(set) var remoteDirectorApprovalState = RemoteDirectorApprovalState.inactive
+    private(set) var remoteDirectorStatusText = "Remote director inactive."
+    var remoteDirectorExperimentName = "experiment" {
+        didSet {
+            if !isApplyingRemoteDirectorExperimentMirror {
+                hasEditedRemoteDirectorExperimentName = true
+            }
+        }
+    }
+    private(set) var remoteDirectorTakeNumberText = "-"
+    private(set) var remoteDirectorSummaryLines = [String]()
+    private(set) var remoteDirectorLastResult = ""
+    private var hasEditedRemoteDirectorExperimentName = false
+    private var isApplyingRemoteDirectorExperimentMirror = false
 
     /// Persisted list of local video files in the app sandbox.
     private(set) var localVideoURLs = [URL]()
@@ -325,9 +346,15 @@ final class CameraModel: Camera {
         remoteDirectorClient.timeSyncHandler = { [weak self] packet in
             self?.directorLANTimecodeService.ingest(packet)
         }
+        remoteDirectorClient.remoteDirectorMessageHandler = { [weak self] payload in
+            self?.handleRemoteDirectorClientMessage(payload)
+        }
 
         directorWebSocketURL = currentDirectorWebSocketURL()
         directorDeviceName = currentDirectorDeviceName()
+        isRemoteDirectorModeEnabled = UserDefaults.standard.bool(
+            forKey: RemoteDirectorConfiguration.remoteDirectorModeEnabledDefaultsKey
+        )
         observeGuidedAccessChanges()
         updateRigStatusLines()
         isUpdatingManualControlState = true
@@ -419,6 +446,151 @@ final class CameraModel: Camera {
             return defaultsValue
         }
         return UIDevice.current.name
+    }
+
+    private func handleRemoteDirectorModeChange(from oldValue: Bool) {
+        guard isRemoteDirectorModeEnabled != oldValue else { return }
+        UserDefaults.standard.set(isRemoteDirectorModeEnabled,
+                                  forKey: RemoteDirectorConfiguration.remoteDirectorModeEnabledDefaultsKey)
+
+        guard status == .running else { return }
+        Task { @MainActor in
+            remoteDirectorClient.stop()
+            if isRemoteDirectorModeEnabled {
+                await startRemoteDirectorControllerMode()
+            } else {
+                remoteDirectorApprovalState = .inactive
+                remoteDirectorStatusText = "Remote director inactive."
+                remoteDirectorSummaryLines = []
+                remoteDirectorClient.setConnectionRole(.camera)
+                await start()
+            }
+        }
+    }
+
+    private func startRemoteDirectorControllerMode() async {
+        if captureActivity.isRecording {
+            await toggleRecording()
+        }
+        await captureService.stop()
+        stopAllTimecodeServices()
+        stopRecordingClock()
+        stopManualControlRefresh()
+        captureActivity = .idle
+        status = .running
+        rigState = .normalExit
+        isRemoteArmed = false
+        isRigLowPowerUIActive = false
+        remoteDirectorApprovalState = .requesting
+        remoteDirectorStatusText = "Requesting laptop approval..."
+        remoteDirectorSummaryLines = ["Waiting for laptop approval."]
+        remoteDirectorClient.setConnectionRole(.remoteDirectorCandidate)
+        remoteDirectorClient.start()
+        remoteDirectorClient.requestRemoteDirectorApproval()
+    }
+
+    private func handleRemoteDirectorClientMessage(_ payload: [String: Any]) {
+        let type = payload["type"] as? String ?? ""
+        if let stateText = payload["state"] as? String,
+           let parsed = RemoteDirectorApprovalState(rawValue: stateText) {
+            remoteDirectorApprovalState = parsed
+        }
+
+        if let detail = payload["detail"] as? String, !detail.isEmpty {
+            remoteDirectorStatusText = detail
+            if type == "remote_director_result" {
+                remoteDirectorLastResult = detail
+            }
+        }
+
+        let statePayload = (payload["payload"] as? [String: Any]) ?? payload
+        updateRemoteDirectorMirroredState(from: statePayload)
+    }
+
+    private func updateRemoteDirectorMirroredState(from payload: [String: Any]) {
+        if let experimentName = payload["experiment_name"] as? String, !experimentName.isEmpty {
+            if !hasEditedRemoteDirectorExperimentName {
+                isApplyingRemoteDirectorExperimentMirror = true
+                remoteDirectorExperimentName = experimentName
+                isApplyingRemoteDirectorExperimentMirror = false
+            }
+        }
+        if let takeNumber = payload["take_number"] as? Int {
+            remoteDirectorTakeNumberText = String(takeNumber)
+        } else if let takeNumber = payload["take_number"] as? NSNumber {
+            remoteDirectorTakeNumberText = takeNumber.stringValue
+        }
+
+        let connected = intFromRemoteDirectorPayload(payload["connected_cameras"])
+        let recording = intFromRemoteDirectorPayload(payload["recording_cameras"])
+        let armed = intFromRemoteDirectorPayload(payload["armed_cameras"])
+        var lines = [
+            "Cameras: \(connected) connected, \(recording) recording, \(armed) armed"
+        ]
+        if let directorTimecode = payload["director_timecode"] as? String, !directorTimecode.isEmpty {
+            lines.append(directorTimecode)
+        }
+        remoteDirectorSummaryLines = lines
+    }
+
+    private func intFromRemoteDirectorPayload(_ value: Any?) -> Int {
+        if let value = value as? Int {
+            return value
+        }
+        if let value = value as? NSNumber {
+            return value.intValue
+        }
+        if let value = value as? String, let parsed = Int(value) {
+            return parsed
+        }
+        return 0
+    }
+
+    func requestRemoteDirectorApproval() async {
+        guard isRemoteDirectorModeEnabled else { return }
+        remoteDirectorApprovalState = .requesting
+        remoteDirectorStatusText = "Requesting laptop approval..."
+        remoteDirectorClient.setConnectionRole(.remoteDirectorCandidate)
+        remoteDirectorClient.start()
+        remoteDirectorClient.requestRemoteDirectorApproval()
+    }
+
+    func exitRemoteDirectorMode() async {
+        await remoteDirectorClient.sendRemoteDirectorExitNow()
+        remoteDirectorClient.stop()
+        remoteDirectorApprovalState = .inactive
+        remoteDirectorStatusText = "Remote director inactive."
+        remoteDirectorSummaryLines = []
+        hasEditedRemoteDirectorExperimentName = false
+        isRemoteDirectorModeEnabled = false
+    }
+
+    func remoteDirectorSetExperimentName() async {
+        let experimentName = remoteDirectorExperimentName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !experimentName.isEmpty else {
+            remoteDirectorLastResult = "Experiment name is required."
+            return
+        }
+        remoteDirectorClient.sendRemoteDirectorControl(action: "set_experiment_name",
+                                                       payload: ["experiment_name": experimentName])
+    }
+
+    func remoteDirectorPrepareCommitStart() async {
+        let experimentName = remoteDirectorExperimentName.trimmingCharacters(in: .whitespacesAndNewlines)
+        var payload: [String: Any] = [:]
+        if !experimentName.isEmpty {
+            payload["experiment_name"] = experimentName
+        }
+        remoteDirectorClient.sendRemoteDirectorControl(action: "prepare_commit_start",
+                                                       payload: payload)
+    }
+
+    func remoteDirectorPrepareStop() async {
+        remoteDirectorClient.sendRemoteDirectorControl(action: "prepare_stop")
+    }
+
+    func remoteDirectorArmIdleAll() async {
+        remoteDirectorClient.sendRemoteDirectorControl(action: "arm_idle_all")
     }
 
     var isRigKioskMode: Bool {
@@ -1472,6 +1644,11 @@ final class CameraModel: Camera {
     // MARK: - Starting the camera
     /// Start the camera and begin the stream of data.
     func start() async {
+        if isRemoteDirectorModeEnabled {
+            await startRemoteDirectorControllerMode()
+            return
+        }
+        remoteDirectorClient.setConnectionRole(.camera)
         if let failure = await ensureCaptureSessionRunningForRig(reason: "camera_start") {
             logger.error("Failed to start capture service. \(failure.detail, privacy: .public)")
             return
@@ -1493,6 +1670,9 @@ final class CameraModel: Camera {
             await toggleRecording()
         }
 
+        if isRemoteDirectorModeEnabled {
+            await remoteDirectorClient.sendRemoteDirectorExitNow()
+        }
         remotePullVideosTask?.cancel()
         remotePullVideosTask = nil
         remotePreviewPhotoTask?.cancel()

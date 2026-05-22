@@ -20,7 +20,9 @@ struct CameraView<CameraModel: Camera>: PlatformView {
 
     var body: some View {
         ZStack {
-            if camera.isRigLowPowerUIActive {
+            if camera.isRemoteDirectorModeEnabled {
+                RemoteDirectorModeView(camera: camera)
+            } else if camera.isRigLowPowerUIActive {
                 RigLowPowerView(statusLines: camera.rigStatusLines)
             } else {
                 // A container view that manages the placement of the preview.
@@ -51,9 +53,136 @@ struct CameraView<CameraModel: Camera>: PlatformView {
                 }
             }
             // The main camera user interface.
-            if !camera.isRigLowPowerUIActive {
+            if !camera.isRigLowPowerUIActive && !camera.isRemoteDirectorModeEnabled {
                 CameraUI(camera: camera, openLocalVideos: openLocalVideos)
             }
+        }
+    }
+}
+
+private struct RemoteDirectorModeView<CameraModel: Camera>: View {
+    let camera: CameraModel
+
+    var body: some View {
+        ScrollView {
+            VStack(spacing: 18) {
+                VStack(spacing: 8) {
+                    Image(systemName: camera.remoteDirectorApprovalState.isApproved ? "checkmark.seal.fill" : "hand.raised.fill")
+                        .font(.system(size: 42, weight: .semibold))
+                        .foregroundStyle(camera.remoteDirectorApprovalState.isApproved ? Color.green : Color.orange)
+                    Text("Remote Director")
+                        .font(.title.bold())
+                    Text(statusText)
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("Experiment")
+                            .font(.headline)
+                        Spacer()
+                        Text("Take")
+                            .font(.headline)
+                            .frame(width: 72, alignment: .leading)
+                    }
+                    HStack(alignment: .center, spacing: 12) {
+                        TextField("experiment", text: Binding(
+                            get: { camera.remoteDirectorExperimentName },
+                            set: { camera.remoteDirectorExperimentName = $0 }
+                        ))
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .textFieldStyle(.roundedBorder)
+
+                        Text(camera.remoteDirectorTakeNumberText)
+                            .font(.title3.monospacedDigit().weight(.semibold))
+                            .frame(width: 72, alignment: .leading)
+                            .frame(minHeight: 36)
+                    }
+                    Button("Set Experiment Name") {
+                        Task { await camera.remoteDirectorSetExperimentName() }
+                    }
+                    .disabled(!camera.remoteDirectorApprovalState.isApproved)
+                }
+
+                VStack(spacing: 12) {
+                    Button("Prepare + Commit Start") {
+                        Task { await camera.remoteDirectorPrepareCommitStart() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(!camera.remoteDirectorApprovalState.isApproved)
+
+                    Button("Prepare Stop") {
+                        Task { await camera.remoteDirectorPrepareStop() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .disabled(!camera.remoteDirectorApprovalState.isApproved)
+
+                    Button("Arm Idle All") {
+                        Task { await camera.remoteDirectorArmIdleAll() }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.large)
+                    .disabled(!camera.remoteDirectorApprovalState.isApproved)
+                }
+                .frame(maxWidth: .infinity)
+
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(camera.remoteDirectorSummaryLines, id: \.self) { line in
+                        Text(line)
+                            .font(.callout.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    if !camera.remoteDirectorLastResult.isEmpty {
+                        Text(camera.remoteDirectorLastResult)
+                            .font(.callout)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                VStack(spacing: 10) {
+                    Button("Request Approval Again") {
+                        Task { await camera.requestRemoteDirectorApproval() }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(camera.remoteDirectorApprovalState.isApproved)
+
+                    Button("Exit Remote Director") {
+                        Task { await camera.exitRemoteDirectorMode() }
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.red)
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.top, 28)
+            .padding(.bottom, 24)
+            .frame(maxWidth: 520)
+            .frame(maxWidth: .infinity)
+        }
+        .background(Color(.systemBackground).ignoresSafeArea())
+    }
+
+    private var statusText: String {
+        switch camera.remoteDirectorApprovalState {
+        case .approved:
+            return "Approved. Commands will be sent through the laptop director."
+        case .pending, .requesting:
+            return camera.remoteDirectorStatusText
+        case .busy:
+            return "Another phone is currently the remote director."
+        case .denied:
+            return "Request denied by the laptop director."
+        case .released:
+            return "Remote director slot was released."
+        case .disconnected:
+            return "Disconnected from the laptop director."
+        case .inactive:
+            return camera.remoteDirectorStatusText
         }
     }
 }

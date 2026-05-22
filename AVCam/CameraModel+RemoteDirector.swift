@@ -8,6 +8,24 @@ Remote director control plane types and client.
 import Foundation
 import SwiftUI
 
+enum RemoteDirectorClientRole: String {
+    case camera
+    case remoteDirectorCandidate = "remote_director_candidate"
+}
+
+enum RemoteDirectorApprovalState: String, Equatable {
+    case inactive
+    case requesting
+    case pending
+    case approved
+    case denied
+    case released
+    case busy
+    case disconnected
+
+    var isApproved: Bool { self == .approved }
+}
+
 struct RemoteDirectorStatusPayload {
     let recording: Bool
     let armed: Bool
@@ -125,6 +143,7 @@ final class RemoteDirectorClient {
     typealias StatusProvider = () -> RemoteDirectorStatusPayload
     typealias CommandHandler = (RemoteDirectorCommandEnvelope) async -> RemoteDirectorCommandReply
     typealias TimeSyncHandler = (DirectorTimeSyncPacket) -> Void
+    typealias RemoteDirectorMessageHandler = ([String: Any]) -> Void
 
     private static let deviceIDDefaultsKey = "RemoteDirectorDeviceID"
     private static let reconnectDelayMS: UInt64 = 2_000
@@ -135,6 +154,7 @@ final class RemoteDirectorClient {
     var statusProvider: StatusProvider?
     var commandHandler: CommandHandler?
     var timeSyncHandler: TimeSyncHandler?
+    var remoteDirectorMessageHandler: RemoteDirectorMessageHandler?
     var deviceNameProvider: (() -> String)?
     private(set) var connectionStatus = "disconnected"
 
@@ -151,6 +171,7 @@ final class RemoteDirectorClient {
     private var pendingBurstStatusTask: Task<Void, Never>?
     private var shouldRun = false
     private var isConnecting = false
+    private var role: RemoteDirectorClientRole = .camera
     private var clockOffsetSamplesMS = [Double]()
     private var estimatedClockOffsetMS = 0.0
 
@@ -194,6 +215,59 @@ final class RemoteDirectorClient {
 
     var hasConfiguredDirectorURL: Bool {
         directorURL() != nil
+    }
+
+    func setConnectionRole(_ newRole: RemoteDirectorClientRole) {
+        guard role != newRole else { return }
+        let shouldRestart = shouldRun
+        if shouldRestart {
+            stop()
+        }
+        role = newRole
+        if shouldRestart {
+            start()
+        }
+    }
+
+    func requestRemoteDirectorApproval() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.sendJSONObject([
+                "type": "remote_director_request",
+                "device_id": self.deviceID,
+                "name": self.resolvedDeviceName(),
+                "role": RemoteDirectorClientRole.remoteDirectorCandidate.rawValue
+            ])
+        }
+    }
+
+    func sendRemoteDirectorControl(action: String, payload: [String: Any] = [:]) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.sendJSONObject([
+                "type": "remote_director_control",
+                "device_id": self.deviceID,
+                "name": self.resolvedDeviceName(),
+                "request_id": UUID().uuidString,
+                "action": action,
+                "payload": payload
+            ])
+        }
+    }
+
+    func sendRemoteDirectorExit() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.sendRemoteDirectorExitNow()
+        }
+    }
+
+    func sendRemoteDirectorExitNow() async {
+        await sendJSONObject([
+            "type": "remote_director_exit",
+            "device_id": deviceID,
+            "name": resolvedDeviceName()
+        ])
     }
 
     func currentDirectorSynchronizedUnixMilliseconds() -> Int64 {
@@ -451,6 +525,7 @@ final class RemoteDirectorClient {
             "type": "hello",
             "device_id": deviceID,
             "name": resolvedDeviceName(),
+            "role": role.rawValue,
             "app_version": appVersion,
             "app_build": appBuild
         ]
@@ -465,6 +540,7 @@ final class RemoteDirectorClient {
             "type": "status",
             "device_id": deviceID,
             "name": resolvedDeviceName(),
+            "role": role.rawValue,
             "app_version": appVersion,
             "app_build": appBuild,
             "recording": status.recording,
@@ -529,6 +605,10 @@ final class RemoteDirectorClient {
 
         if type == "time_sync" {
             handleTimeSyncPayload(payload)
+            return
+        }
+        if type == "remote_director_status" || type == "remote_director_state" || type == "remote_director_result" {
+            remoteDirectorMessageHandler?(payload)
             return
         }
         guard type == "command" else { return }

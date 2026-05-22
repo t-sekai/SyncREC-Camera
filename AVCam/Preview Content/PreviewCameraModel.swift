@@ -28,6 +28,13 @@ class PreviewCameraModel: Camera {
     var displayedTentacleFPS: Int? = 30
     var directorWebSocketURL = RemoteDirectorConfiguration.defaultDirectorWebSocketURL
     var directorDeviceName = "Camera A"
+    var isRemoteDirectorModeEnabled = false
+    var remoteDirectorApprovalState = RemoteDirectorApprovalState.inactive
+    var remoteDirectorStatusText = "Preview remote director inactive."
+    var remoteDirectorExperimentName = "experiment"
+    var remoteDirectorTakeNumberText = "1"
+    var remoteDirectorSummaryLines = ["Cameras: 0 connected, 0 recording, 0 armed", "Take: 1"]
+    var remoteDirectorLastResult = ""
     var manualControlState = ManualCameraControlState.default
     var selectedVideoCaptureMode = VideoCaptureModePreset.hd1080p30
     var videoCaptureModeSupport = VideoCaptureModePreset.allCases.map {
@@ -127,6 +134,32 @@ class PreviewCameraModel: Camera {
     
     func syncState() async {
         logger.debug("Syncing state isn't implemented in PreviewCamera.")
+    }
+
+    func requestRemoteDirectorApproval() async {
+        remoteDirectorApprovalState = .approved
+        remoteDirectorStatusText = "Preview approved."
+    }
+
+    func exitRemoteDirectorMode() async {
+        isRemoteDirectorModeEnabled = false
+        remoteDirectorApprovalState = .inactive
+    }
+
+    func remoteDirectorSetExperimentName() async {
+        remoteDirectorLastResult = "Preview experiment set."
+    }
+
+    func remoteDirectorPrepareCommitStart() async {
+        remoteDirectorLastResult = "Preview start sent."
+    }
+
+    func remoteDirectorPrepareStop() async {
+        remoteDirectorLastResult = "Preview stop sent."
+    }
+
+    func remoteDirectorArmIdleAll() async {
+        remoteDirectorLastResult = "Preview arm idle sent."
     }
 
     func refreshLocalVideos() async {

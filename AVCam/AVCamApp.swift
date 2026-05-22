@@ -26,25 +26,31 @@ struct AVCamApp: App {
     
     var body: some Scene {
         WindowGroup {
-            TabView(selection: $selectedTab) {
-                CameraView(camera: camera, openLocalVideos: {
-                    selectedTab = .videos
-                })
-                    .tabItem {
-                        Label("Camera", systemImage: "camera")
-                    }
-                    .tag(AppTab.camera)
+            Group {
+                if camera.isRemoteDirectorModeEnabled {
+                    CameraView(camera: camera, openLocalVideos: {})
+                } else {
+                    TabView(selection: $selectedTab) {
+                        CameraView(camera: camera, openLocalVideos: {
+                            selectedTab = .videos
+                        })
+                            .tabItem {
+                                Label("Camera", systemImage: "camera")
+                            }
+                            .tag(AppTab.camera)
 
-                LocalVideosView(camera: camera)
-                    .tabItem {
-                        Label("Videos", systemImage: "film.stack")
+                        LocalVideosView(camera: camera)
+                            .tabItem {
+                                Label("Videos", systemImage: "film.stack")
+                            }
+                            .tag(AppTab.videos)
                     }
-                    .tag(AppTab.videos)
+                }
             }
                 .statusBarHidden(true)
                 .task {
                     // Start the capture pipeline.
-                    if selectedTab == .camera {
+                    if camera.isRemoteDirectorModeEnabled || selectedTab == .camera {
                         await camera.start()
                     } else {
                         await camera.refreshLocalVideos()
@@ -68,7 +74,7 @@ struct AVCamApp: App {
                     Task { @MainActor in
                         switch newPhase {
                         case .active:
-                            if selectedTab == .camera {
+                            if camera.isRemoteDirectorModeEnabled || selectedTab == .camera {
                                 await camera.start()
                                 await camera.syncState()
                             } else {

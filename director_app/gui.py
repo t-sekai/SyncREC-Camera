@@ -11,7 +11,7 @@ import time
 import zlib
 from datetime import datetime
 from pathlib import Path
-from tkinter import END, StringVar, Text, Tk, messagebox, ttk
+from tkinter import Canvas, END, StringVar, Text, Tk, messagebox, ttk
 from typing import Any
 
 from .models import (
@@ -143,9 +143,10 @@ class DirectorGUI:
         self.port_var = StringVar(value="8765")
         self.upload_host_var = StringVar(value="")
         self.upload_port_var = StringVar(value="8780")
-        self.experiment_name_var = StringVar(value="experiment")
         self._take_numbers_by_experiment: dict[str, int] = self._load_take_numbers()
-        self.take_number_var = StringVar(value=str(self._take_numbers_by_experiment.get("experiment", 1)))
+        initial_experiment_name = self._load_last_experiment_name()
+        self.experiment_name_var = StringVar(value=initial_experiment_name)
+        self.take_number_var = StringVar(value=str(self._take_numbers_by_experiment.get(initial_experiment_name, 1)))
         self.start_delay_var = StringVar(value="2.0")
         self.stop_delay_var = StringVar(value="2.0")
         self.tentacle_name_var = StringVar(value="NeuROK")
@@ -165,10 +166,15 @@ class DirectorGUI:
         self.connected_summary_var = StringVar(value="0 cameras")
         self.recording_summary_var = StringVar(value="0 recording")
         self.armed_summary_var = StringVar(value="0 armed")
+        self.remote_director_summary_var = StringVar(value="None")
+        self.remote_director_status_var = StringVar(value="Remote Director: none")
+        self.remote_director_request_var = StringVar(value="No pending remote director request")
         self.selected_device_var = StringVar(value="No camera selected")
         self._upload_url_for_clients = ""
         self._latest_devices_by_id: dict[str, dict[str, Any]] = {}
-        self._last_experiment_key = "experiment"
+        self._pending_remote_director_id = ""
+        self._active_remote_director_id = ""
+        self._last_experiment_key = initial_experiment_name
         self._is_syncing_experiment_take = False
         self.workspace: ttk.PanedWindow | None = None
 
@@ -269,6 +275,7 @@ class DirectorGUI:
             ("Cameras", self.connected_summary_var),
             ("Recording", self.recording_summary_var),
             ("Armed", self.armed_summary_var),
+            ("Remote", self.remote_director_summary_var),
         )):
             self._build_stat_card(stats, caption, variable).grid(row=0, column=index, padx=(10 if index else 0, 0))
 
@@ -365,10 +372,50 @@ class DirectorGUI:
         return panel
 
     def _build_setup_tab(self, notebook: ttk.Notebook) -> ttk.Frame:
-        tab = ttk.Frame(notebook, padding=12, style="Panel.TFrame")
+        tab = ttk.Frame(notebook, style="Panel.TFrame")
         tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
 
-        server = ttk.LabelFrame(tab, text="Server", padding=10, style="Panel.TLabelframe")
+        canvas = Canvas(tab, borderwidth=0, highlightthickness=0, background="#ffffff")
+        scroll = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        content = ttk.Frame(canvas, padding=12, style="Panel.TFrame")
+        content.columnconfigure(0, weight=1)
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _resize_content(_event: Any | None = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _resize_window(event: Any) -> None:
+            canvas.itemconfigure(content_window, width=event.width)
+
+        def _on_mousewheel(event: Any) -> str:
+            if event.delta:
+                direction = -1 if event.delta > 0 else 1
+            else:
+                direction = -1 if getattr(event, "num", 0) == 4 else 1
+            canvas.yview_scroll(direction, "units")
+            return "break"
+
+        def _bind_mousewheel(_event: Any) -> None:
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            canvas.bind_all("<Button-4>", _on_mousewheel)
+            canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_mousewheel(_event: Any) -> None:
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        content.bind("<Configure>", _resize_content)
+        canvas.bind("<Configure>", _resize_window)
+        canvas.bind("<Enter>", _bind_mousewheel)
+        canvas.bind("<Leave>", _unbind_mousewheel)
+
+        server = ttk.LabelFrame(content, text="Server", padding=10, style="Panel.TLabelframe")
         server.grid(row=0, column=0, sticky="ew")
         for col in range(4):
             server.columnconfigure(col, weight=1)
@@ -386,7 +433,7 @@ class DirectorGUI:
         self.status_label = ttk.Label(server, textvariable=self.server_status_var, style="Muted.TLabel")
         self.status_label.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
-        timecode = ttk.LabelFrame(tab, text="Timecode", padding=10, style="Panel.TLabelframe")
+        timecode = ttk.LabelFrame(content, text="Timecode", padding=10, style="Panel.TLabelframe")
         timecode.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         for col in range(3):
             timecode.columnconfigure(col, weight=1)
@@ -424,13 +471,41 @@ class DirectorGUI:
         self.tentacle_timecode_label = ttk.Label(timecode, textvariable=self.tentacle_timecode_var, style="StatusValue.TLabel")
         self.tentacle_timecode_label.grid(row=3, column=0, columnspan=3, sticky="w")
 
-        status = ttk.LabelFrame(tab, text="Director Status", padding=10, style="Panel.TLabelframe")
+        status = ttk.LabelFrame(content, text="Director Status", padding=10, style="Panel.TLabelframe")
         status.grid(row=2, column=0, sticky="ew", pady=(12, 0))
         status.columnconfigure(0, weight=1)
         self.upload_endpoint_label = ttk.Label(status, textvariable=self.upload_endpoint_var, style="Muted.TLabel", wraplength=380)
         self.upload_endpoint_label.grid(row=0, column=0, sticky="w")
         self.pull_status_label = ttk.Label(status, textvariable=self.pull_status_var, style="Muted.TLabel", wraplength=380)
         self.pull_status_label.grid(row=1, column=0, sticky="w", pady=(6, 0))
+
+        remote = ttk.LabelFrame(content, text="Remote Director", padding=10, style="Panel.TLabelframe")
+        remote.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        remote.columnconfigure(0, weight=1)
+        remote.columnconfigure(1, weight=1)
+        self.remote_director_status_label = ttk.Label(
+            remote,
+            textvariable=self.remote_director_status_var,
+            style="Muted.TLabel",
+            wraplength=380,
+        )
+        self.remote_director_status_label.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.remote_director_request_label = ttk.Label(
+            remote,
+            textvariable=self.remote_director_request_var,
+            style="Muted.TLabel",
+            wraplength=380,
+        )
+        self.remote_director_request_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Button(remote, text="Approve Request", command=self.approve_remote_director).grid(
+            row=2, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
+        )
+        ttk.Button(remote, text="Deny Request", command=self.deny_remote_director).grid(
+            row=2, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
+        )
+        ttk.Button(remote, text="Release Active Remote Director", command=self.release_remote_director).grid(
+            row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0)
+        )
 
         return tab
 
@@ -681,6 +756,12 @@ class DirectorGUI:
                 self.server_summary_var.set("Stopped")
             elif etype == "devices_updated":
                 latest_devices = payload
+            elif etype == "remote_director_updated":
+                if isinstance(payload, dict):
+                    self._refresh_remote_director_status(payload)
+            elif etype == "remote_director_control":
+                if isinstance(payload, dict):
+                    self._handle_remote_director_control(payload)
             elif etype == "preview_upload_received":
                 if isinstance(payload, dict):
                     self.server.handle_preview_upload_received(payload)
@@ -710,7 +791,10 @@ class DirectorGUI:
         return not self.event_queue.empty()
 
     def _schedule_status_refresh(self) -> None:
-        self._refresh_tree(self.server.snapshot_devices())
+        devices = self.server.snapshot_devices()
+        self._refresh_tree(devices)
+        self._refresh_remote_director_status(self.server.remote_director_status())
+        self.server.publish_remote_director_state(self._remote_director_state_payload(devices))
         pull = self.server.pull_status()
         active_device_ids = pull.get("active_device_ids") or []
         active_count = int(pull.get("active_count") or 0)
@@ -909,6 +993,107 @@ class DirectorGUI:
         self.recording_summary_var.set(f"{recording} recording")
         self.armed_summary_var.set(f"{armed} armed")
 
+    def _refresh_remote_director_status(self, snapshot: dict[str, Any]) -> None:
+        active = snapshot.get("active") if isinstance(snapshot.get("active"), dict) else None
+        pending = snapshot.get("pending") if isinstance(snapshot.get("pending"), list) else []
+        pending_items = [item for item in pending if isinstance(item, dict)]
+
+        self._active_remote_director_id = str(active.get("device_id") or "") if active else ""
+        self._pending_remote_director_id = str(pending_items[0].get("device_id") or "") if pending_items else ""
+
+        if active:
+            name = str(active.get("name") or active.get("device_id") or "Remote director")
+            endpoint = str(active.get("endpoint") or "-")
+            if active.get("connected") is False:
+                self.remote_director_summary_var.set("Disconnected")
+                self.remote_director_status_var.set(
+                    f"Remote Director: disconnected - {name}; will auto-approve on reconnect"
+                )
+            else:
+                self.remote_director_summary_var.set("Active")
+                self.remote_director_status_var.set(f"Remote Director: active - {name} ({endpoint})")
+        else:
+            self.remote_director_status_var.set("Remote Director: none active")
+            if pending_items:
+                self.remote_director_summary_var.set("Pending")
+            else:
+                self.remote_director_summary_var.set("None")
+
+        if pending_items:
+            first = pending_items[0]
+            name = str(first.get("name") or first.get("device_id") or "Remote director")
+            state = str(first.get("state") or "pending")
+            detail = str(first.get("detail") or "")
+            suffix = f"; +{len(pending_items) - 1} more" if len(pending_items) > 1 else ""
+            detail_text = f" - {detail}" if detail else ""
+            self.remote_director_request_var.set(f"Request: {name} ({state}){detail_text}{suffix}")
+        else:
+            self.remote_director_request_var.set("No pending remote director request")
+
+    def _remote_director_state_payload(self, devices: list[dict[str, Any]]) -> dict[str, Any]:
+        recording = sum(1 for d in devices if bool(d.get("recording")))
+        armed = sum(1 for d in devices if bool(d.get("armed")))
+        return {
+            "experiment_name": self._current_experiment_name(),
+            "take_number": self._current_take_number(),
+            "start_delay": parse_delay(self.start_delay_var.get(), fallback=2.0),
+            "stop_delay": parse_delay(self.stop_delay_var.get(), fallback=2.0),
+            "connected_cameras": len(devices),
+            "recording_cameras": recording,
+            "armed_cameras": armed,
+            "director_timecode": self.tentacle_timecode_var.get(),
+        }
+
+    def _reply_remote_director_control(self,
+                                       request: dict[str, Any],
+                                       ok: bool,
+                                       detail: str,
+                                       payload: dict[str, Any] | None = None) -> None:
+        device_id = str(request.get("device_id") or "")
+        request_id = str(request.get("request_id") or "")
+        if not device_id or not request_id:
+            return
+        state = self._remote_director_state_payload(self.server.snapshot_devices())
+        if payload:
+            state.update(payload)
+        self.server.send_remote_director_result(device_id=device_id,
+                                                request_id=request_id,
+                                                ok=ok,
+                                                detail=detail,
+                                                payload=state)
+        self.server.publish_remote_director_state(state)
+
+    def _handle_remote_director_control(self, request: dict[str, Any]) -> None:
+        action = str(request.get("action") or "")
+        payload = request.get("payload") if isinstance(request.get("payload"), dict) else {}
+
+        try:
+            if action == "set_experiment_name":
+                experiment_name = str(payload.get("experiment_name") or "").strip()
+                if not experiment_name:
+                    self._reply_remote_director_control(request, False, "Experiment name is required.")
+                    return
+                self.experiment_name_var.set(experiment_name)
+                self._reply_remote_director_control(request, True, f"Experiment set to {self._current_experiment_name()}.")
+            elif action == "prepare_commit_start":
+                experiment_name = str(payload.get("experiment_name") or "").strip()
+                if experiment_name:
+                    self.experiment_name_var.set(experiment_name)
+                self.start_all()
+                self._reply_remote_director_control(request, True, "Prepare + Commit Start sent.")
+            elif action == "prepare_stop":
+                self.stop_all()
+                self._reply_remote_director_control(request, True, "Prepare Stop sent.")
+            elif action == "arm_idle_all":
+                self.arm_all()
+                self._reply_remote_director_control(request, True, "Arm Idle All sent.")
+            elif action == "get_state":
+                self._reply_remote_director_control(request, True, "State refreshed.")
+            else:
+                self._reply_remote_director_control(request, False, f"Unknown remote director action: {action}")
+        except Exception as exc:
+            self._reply_remote_director_control(request, False, f"Remote director action failed: {exc}")
+
     def _on_tree_select(self, _event: Any | None = None) -> None:
         self._update_selected_device_detail()
 
@@ -1059,6 +1244,18 @@ class DirectorGUI:
             take_numbers["experiment"] = 1
         return take_numbers
 
+    def _load_last_experiment_name(self) -> str:
+        try:
+            with TAKE_NUMBERS_STATE_PATH.open("r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+        except FileNotFoundError:
+            return "experiment"
+        except Exception:
+            return "experiment"
+
+        raw_name = state.get("last_experiment_name") if isinstance(state, dict) else None
+        return self._safe_recording_component(str(raw_name or ""), fallback="experiment")
+
     def _persist_take_numbers(self) -> None:
         current_experiment = self._current_experiment_name()
         self._take_numbers_by_experiment[current_experiment] = self._current_take_number(current_experiment)
@@ -1067,6 +1264,7 @@ class DirectorGUI:
     def _write_take_numbers_state(self) -> None:
         payload = {
             "schema_version": 1,
+            "last_experiment_name": self._current_experiment_name(),
             "take_numbers_by_experiment": dict(sorted(self._take_numbers_by_experiment.items())),
         }
         try:
@@ -1090,6 +1288,7 @@ class DirectorGUI:
             self.take_number_var.set(str(max(1, next_take)))
         finally:
             self._is_syncing_experiment_take = False
+        self._write_take_numbers_state()
 
     def _on_take_number_changed(self, *_args: Any) -> None:
         if self._is_syncing_experiment_take:
@@ -1246,6 +1445,24 @@ class DirectorGUI:
     def get_status_all(self) -> None:
         self.server.send_command_all("get_status", {})
 
+    def approve_remote_director(self) -> None:
+        if not self._pending_remote_director_id:
+            self._append_log("No pending remote director request to approve.")
+            return
+        self.server.approve_remote_director(self._pending_remote_director_id)
+
+    def deny_remote_director(self) -> None:
+        if not self._pending_remote_director_id:
+            self._append_log("No pending remote director request to deny.")
+            return
+        self.server.deny_remote_director(self._pending_remote_director_id)
+
+    def release_remote_director(self) -> None:
+        if not self._active_remote_director_id:
+            self._append_log("No active remote director to release.")
+            return
+        self.server.release_remote_director()
+
     def start_tentacle(self) -> None:
         if self._time_source_is_laptop():
             self._append_log("Time source is set to laptop. Switch to 'tentacle' to connect BLE timecode.")
@@ -1298,8 +1515,10 @@ class DirectorGUI:
         payload["start_at_unix_ms"] = start_at_ms
 
         # Two-step for safer coordination.
-        self.server.send_command_all("prepare_start", payload)
-        self.server.send_command_all("commit_start", payload)
+        self.server.send_command_sequence_all([
+            ("prepare_start", payload),
+            ("commit_start", payload),
+        ])
         self._increment_take_after_recording_trigger(payload)
 
     def stop_all(self) -> None:

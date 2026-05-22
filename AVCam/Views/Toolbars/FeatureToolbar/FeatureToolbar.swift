@@ -17,6 +17,7 @@ struct FeaturesToolbar<CameraModel: Camera>: PlatformView {
     @State private var isShowingDirectorSettings = false
     @State private var draftDirectorWebSocketURL = ""
     @State private var draftDirectorDeviceName = ""
+    @State private var draftRemoteDirectorMode = false
     
     var body: some View {
         HStack(spacing: 30) {
@@ -101,6 +102,7 @@ struct FeaturesToolbar<CameraModel: Camera>: PlatformView {
         Button {
             draftDirectorWebSocketURL = camera.directorWebSocketURL
             draftDirectorDeviceName = camera.directorDeviceName
+            draftRemoteDirectorMode = camera.isRemoteDirectorModeEnabled
             isShowingDirectorSettings = true
         } label: {
             Image(systemName: "gearshape")
@@ -128,6 +130,12 @@ struct FeaturesToolbar<CameraModel: Camera>: PlatformView {
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
+                Section("Remote Director Phone") {
+                    Toggle("Use this iPhone as handheld director", isOn: $draftRemoteDirectorMode)
+                    Text("When enabled, this phone requests laptop approval and shows controller buttons instead of recording.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             }
             .navigationTitle("Remote Control")
             .toolbar {
@@ -140,6 +148,7 @@ struct FeaturesToolbar<CameraModel: Camera>: PlatformView {
                     Button("Save") {
                         camera.directorWebSocketURL = draftDirectorWebSocketURL
                         camera.directorDeviceName = draftDirectorDeviceName
+                        camera.isRemoteDirectorModeEnabled = draftRemoteDirectorMode
                         isShowingDirectorSettings = false
                     }
                 }

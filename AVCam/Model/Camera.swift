@@ -50,6 +50,34 @@ protocol Camera: AnyObject, SendableMetatype {
     /// The user-defined device name exposed to remote director clients.
     var directorDeviceName: String { get set }
 
+    /// Whether this iPhone should act as a handheld remote director instead of a recording camera.
+    var isRemoteDirectorModeEnabled: Bool { get set }
+
+    /// Approval state for handheld remote director mode.
+    var remoteDirectorApprovalState: RemoteDirectorApprovalState { get }
+
+    /// Human-readable remote director connection/control status.
+    var remoteDirectorStatusText: String { get }
+
+    /// Editable experiment name sent from the handheld remote director.
+    var remoteDirectorExperimentName: String { get set }
+
+    /// Take number mirrored from the laptop director.
+    var remoteDirectorTakeNumberText: String { get }
+
+    /// Compact summary lines mirrored from the laptop director.
+    var remoteDirectorSummaryLines: [String] { get }
+
+    /// Most recent remote director command result.
+    var remoteDirectorLastResult: String { get }
+
+    func requestRemoteDirectorApproval() async
+    func exitRemoteDirectorMode() async
+    func remoteDirectorSetExperimentName() async
+    func remoteDirectorPrepareCommitStart() async
+    func remoteDirectorPrepareStop() async
+    func remoteDirectorArmIdleAll() async
+
     /// The current values and lock states for manual camera controls.
     var manualControlState: ManualCameraControlState { get set }
 
