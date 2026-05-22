@@ -550,7 +550,7 @@ class DirectorServer:
                 for d in self.devices.values()
                 if d.role == "camera"
             ]
-        data.sort(key=lambda x: x["name"])
+        data.sort(key=lambda x: (str(x["name"]).casefold(), str(x["name"]), str(x["device_id"])))
         return data
 
     def log(self, message: str) -> None:

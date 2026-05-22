@@ -863,6 +863,14 @@ class DirectorGUI:
         self.tentacle_timecode_var.set(f"Director timecode: {tc} @ {fps} fps")
 
     def _refresh_tree(self, devices: list[dict[str, Any]]) -> None:
+        sorted_devices = sorted(
+            devices,
+            key=lambda d: (
+                str(d.get("name") or "").casefold(),
+                str(d.get("name") or ""),
+                str(d.get("device_id") or ""),
+            ),
+        )
         selected_device_id = ""
         selected_items = self.tree.selection()
         if selected_items:
@@ -870,7 +878,7 @@ class DirectorGUI:
 
         self._latest_devices_by_id = {
             str(d.get("device_id") or ""): d
-            for d in devices
+            for d in sorted_devices
             if d.get("device_id")
         }
         self._update_device_summary(devices)
@@ -878,7 +886,7 @@ class DirectorGUI:
         existing_row_ids = set(self.tree.get_children())
         updated_row_ids: set[str] = set()
         now = time.time()
-        for d in devices:
+        for display_index, d in enumerate(sorted_devices):
             device_id = str(d.get("device_id") or "")
             if not device_id:
                 continue
@@ -960,6 +968,7 @@ class DirectorGUI:
                 self.tree.item(device_id, tags=tuple(tags), values=values)
             else:
                 self.tree.insert("", END, iid=device_id, tags=tuple(tags), values=values)
+            self.tree.move(device_id, "", display_index)
 
         for stale_row_id in existing_row_ids - updated_row_ids:
             self.tree.delete(stale_row_id)
