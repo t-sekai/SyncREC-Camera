@@ -1,321 +1,55 @@
-# SyncREC Camera
-Capture photos and record video using the front and rear iPhone and iPad cameras.
+# SyncREC: A Synchronized Multi-iPhone Video Capture System for 3D/4D Reconstruction
 
-## Overview
-SyncREC Camera is adapted from Apple's AVCam sample for building a camera app on iOS. It demonstrates how to use AVFoundation to access device cameras and microphones, configure a capture session, capture photos and videos, and much more. It also shows how to use the [PhotoKit](https://developer.apple.com/documentation/photokit) framework to save your captured media to the Photos library.
+SyncREC is a multi-iPhone video capture system developed by Stanford Vision and Learning Lab (SVL) for high-fidelity 3D/4D capture, pairing a foreground iOS camera app with a Python remote director for millisecond-level coordination<sup>*</sup>, remote control, preview checks, capture-parameter sync, and media ingest across a camera rig.
 
-The sample uses SwiftUI and the features of Swift concurrency to build a responsive camera app. The following diagram describes the app’s design:
+## Screenshots
 
-![A diagram that describes the relationships between app objects. When the app starts, it creates an instance of CameraModel. The camera model creates instances of the CaptureService and MediaLibrary types, which it uses to perform its essential functions. Finally, the app creates an instance of CameraView, which provides the main user interface, and passes it a reference to the CameraModel object.](Documentation/app-assembly-overview.png)
+| Camera App | Remote Director |
+| --- | --- |
+| ![Camera app screenshot placeholder](docs/images/camera-app-placeholder.svg) | ![Remote director screenshot placeholder](docs/images/remote-director-placeholder.svg) |
+| Replace with a screenshot of the iPhone capture interface. | Replace with a screenshot of the Python director control surface. |
 
-The key type the app defines is `CaptureService`, an actor that manages the interactions with the AVFoundation capture APIs. This object configures the capture pipeline and manages its life cycle, and defines an asynchronous interface to capture photos and videos. It delegates the handling of those operations to the app’s `PhotoCapture` and `MovieCapture` objects, respectively.
+## What It Does
 
-- Note: Configuring and starting a capture session are blocking operations that can take time to complete. To keep the user interface responsive, the app defines `CaptureService` as an actor type to ensure that AVFoundation capture API calls don’t occur on the main thread.
+SyncREC turns a group of iPhones into coordinated capture nodes for volumetric, 3D/4D reconstruction, and multi-view video workflows. Each phone runs the camera app in the foreground while the director discovers connected devices, applies shared capture settings, schedules recording commands, monitors health, pulls footage, and keeps operators aware of which devices are ready.
 
-## Configure the sample code project
-Because Simulator doesn't have access to device cameras, it isn't suitable for running the app—you'll need to run it on a device. To run this sample, you'll need the following:
-* An iOS device with iOS 18 or later
+The system is designed around practical rig operation: fast setup, clear device status, repeatable take naming, sidecar metadata, and selective or all-device controls for every important action. Its purpose is to make low-cost, high-fidelity reconstruction practical with commodity phones: refurbished iPhones can cost around $100 each while still providing 4K 60fps capture, making the rig far cheaper than many dedicated 3D/4D reconstruction or motion-capture setups. The project is intended as a first of its kind research-grade iPhone-based capture system.
 
-SyncREC Camera adopts the [LockedCameraCapture](https://developer.apple.com/documentation/lockedcameracapture) framework, which makes the app eligible to launch from the Lock Screen, Control Center, Action Button, and the Camera Control. To support this framework, the sample adds a capture extension target and a Control Center extension target in addition to the main app target. Set your signing credentials on each target to build and run the sample.
+<sup>*</sup> Director-only synchronization uses millisecond timestamps, but real network and device scheduling delays can still leave starts off by at most 5 frames at 30fps. For high-fidelity 4D reconstruction, pairing director coordination with an initial clap or movie slate enables post-capture clap-sync and can bring offsets within a frame at 60fps.
 
-## Remote rig mode
-This project includes a local-network Python director for controlling multiple foregrounded iPhones. The rig mode is intentionally foreground-only: it doesn't use background camera access, screen-lock camera behavior, background modes, silent audio, or private APIs.
+## Camera App
 
-For low-power kiosk operation, enable Guided Access on each iPhone after launching the app:
+- Captures high-quality video on iPhone using AVFoundation, with presets for 720p, 1080p, and 4K at supported frame rates.
+- Connects to the director over the local network and reports recording state, battery, storage, capture mode, timecode, transfer state, and camera-parameter status.
+- Supports remote arm, prepare, scheduled start, scheduled stop, preview photo, capture-mode change, camera-parameter sync, video pull, and cleanup commands.
+- Stores each take locally with a calibration JSON sidecar containing session metadata, capture settings, camera parameters, and AVFoundation calibration fields when the device exposes them.
+- Includes rig-friendly power behavior: recording and active transfers keep the phone awake, Guided Access can keep a foregrounded rig phone ready, and the director can allow Auto-Lock after pulls.
 
-1. Open Settings > Accessibility > Guided Access and turn Guided Access on.
-2. Launch SyncREC Camera and connect it to the director.
-3. Triple-click the side button or home button and start Guided Access for SyncREC Camera.
+## Remote Director
 
-When `UIAccessibility.isGuidedAccessEnabled` is true, the app treats the phone as being in rig/kiosk mode. In `armed_idle`, it disables the iOS idle timer, dims the screen, shows a mostly black status UI, stops the `AVCaptureSession`, and keeps the lightweight director WebSocket connected at a low heartbeat rate. Outside Guided Access, the app behaves like a normal iOS camera app: idle screens don't force the phone awake, and the app doesn't aggressively dim the display unless explicitly commanded.
+- Provides a desktop Python control surface for managing all connected camera phones from one place.
+- Shows a live device table with connection, recording, armed, transfer, capture-mode, preview, battery, storage, and parameter-sync status.
+- Applies capture modes to all or selected devices and remembers the last selected mode so the director clock starts at the matching FPS on launch.
+- Schedules coordinated recording starts and stops with prepare/commit flows for repeatable multi-device takes.
+- Captures preview photos from all or selected devices and can build a grid image for quick framing checks.
+- Copies, dry-runs, syncs, locks, unlocks, and validates camera parameters across the rig.
+- Pulls videos through a bounded transfer queue, supports per-device or all-device operations, and can optionally allow Auto-Lock after transfer completion.
 
-Recommended director flow:
+## Typical Workflow
 
-1. Launch the app on all iPhones.
-2. Optionally enable Guided Access for always-awake rig/kiosk behavior.
-3. Connect all iPhones to the Python director.
-4. Send `arm_idle`.
-5. Optionally send `capture_preview_photo` to verify framing.
-6. Send `prepare_recording`.
-7. Send `start_recording`.
-8. Send `stop_recording`.
-9. Return to `arm_idle`.
+1. Start the Python director on the control computer.
+2. Wake up the camera phones if they are off or sleeping.
+3. Record from the director.
+4. Pull videos to the computer.
 
-The director can send these commands to all connected devices or to the selected device. Preview photos are downscaled JPEG uploads saved by the director under `director_app/captures/preview_photos/`, with sidecar JSON metadata next to each image. For larger rigs, the director batches and jitters preview requests so many phones don't upload at the same instant.
+## Technical Notes
 
-## Configure a capture session
-The central object in any capture app is an instance of [AVCaptureSession](https://developer.apple.com/documentation/avfoundation/avcapturesession). A capture session is the central hub to which the app connects inputs from camera and microphone devices, and attaches them to outputs that capture media like photos and video. After configuring the session, the app uses it to control the flow of data through the capture pipeline.
+- [Mobile app dev notes](docs/mobile-app-dev-notes.md)
+- [Python director dev notes](docs/python-director-dev-notes.md)
+- [Optional device setup guide](docs/device-setup-guide.md)
 
-![A diagram that describes the configuration of a capture session. It shows how a capture session connects inputs from camera and microphone devices to compatible outputs that capture photos or video, or display a video preview.](Documentation/avcapturesession-overview.png)
+## Technology
 
-The capture service performs the session configuration in its `setUpSession()` method.
-It retrieves the default camera and microphone for the host device and adds them as inputs to the capture session.
-
-```swift
-// Retrieve the default camera and microphone.
-let defaultCamera = try deviceLookup.defaultCamera
-let defaultMic = try deviceLookup.defaultMic
-
-// Add inputs for the default camera and microphone devices.
-activeVideoInput = try addInput(for: defaultCamera)
-try addInput(for: defaultMic)
-```
-
-To add the inputs, it uses a helper method that creates a new [AVCaptureDeviceInput](https://developer.apple.com/documentation/avfoundation/avcapturedeviceinput) for the specified camera or microphone device and adds it to the capture session, if possible.
-
-```swift
-// Adds an input to the capture session to connect the specified capture device.
-@discardableResult
-private func addInput(for device: AVCaptureDevice) throws -> AVCaptureDeviceInput {
-    let input = try AVCaptureDeviceInput(device: device)
-    if captureSession.canAddInput(input) {
-        captureSession.addInput(input)
-    } else {
-        throw CameraError.addInputFailed
-    }
-    return input
-}
-```
-
-After adding the device inputs, the method configures the capture session for the app’s default photo capture mode. It optimizes the pipeline for high-resolution photo quality output by setting the capture session’s [.photo](https://developer.apple.com/documentation/avfoundation/avcapturesession/preset/1390112-photo) preset. Finally, to enable the app to capture photos, it adds an [AVCapturePhotoOutput](https://developer.apple.com/documentation/avfoundation/avcapturephotooutput) instance to the session.
-
-```swift
-// Configure the session for photo capture by default.
-captureSession.sessionPreset = .photo
-
-// Add the photo capture output as the default output type.
-if captureSession.canAddOutput(photoCapture.output) {
-    captureSession.addOutput(photoCapture.output)
-} else {
-    throw CameraError.addOutputFailed
-}
-```
-
-
-## Set up a capture preview
-To preview the content a camera is capturing, AVFoundation provides a Core Animation layer subclass called  [AVCaptureVideoPreviewLayer](https://developer.apple.com/documentation/avfoundation/avcapturevideopreviewlayer). SwiftUI doesn’t support using layers directly, so instead, the app hosts this layer in a [UIView](https://developer.apple.com/documentation/uikit/uiview) subclass called `PreviewView`. It overrides the [layerClass](https://developer.apple.com/documentation/uikit/uiview/1622626-layerclass ) property to make the preview layer the backing for the view.
-
-```swift
-class PreviewView: UIView, PreviewTarget {
-    
-    // Use `AVCaptureVideoPreviewLayer` as the view's backing layer.
-    override class var layerClass: AnyClass {
-        AVCaptureVideoPreviewLayer.self
-    }
-    
-    var previewLayer: AVCaptureVideoPreviewLayer {
-        layer as! AVCaptureVideoPreviewLayer
-    }
-    
-    func setSession(_ session: AVCaptureSession) {
-        // Connects the session with the preview layer, which allows the layer
-        // to provide a live view of the captured content.
-        previewLayer.session = session
-    }
-}
-```
-
-To make this view accessible to SwiftUI, the app wraps it as a [UIViewRepresentable](https://developer.apple.com/documentation/swiftui/uiviewrepresentable) type called `CameraPreview`.
-
-```swift
-struct CameraPreview: UIViewRepresentable {
-    
-    private let source: PreviewSource
-    
-    init(source: PreviewSource) {
-        self.source = source
-    }
-    
-    func makeUIView(context: Context) -> PreviewView {
-        let preview = PreviewView()
-        // Connect the preview layer to the capture session.
-        source.connect(to: preview)
-        return preview
-    }
-    
-    func updateUIView(_ previewView: PreviewView, context: Context) {
-        // No implementation needed.
-    }
-}
-```
-
-To connect the preview to the capture session without directly exposing the capture service’s protected state, the sample defines app-specific `PreviewSource` and `PreviewTarget` protocols. The app passes the `CameraPreview` a preview source, which provides a reference to the capture session. Calling the preview source’s `connect(to:)` method sets the capture session on the `PreviewView` instance.
-
-## Request authorization
-The initial capture configuration is complete, but before the app can successfully start the capture session, it needs to determine whether it has authorization to use device inputs. The system requires that a person explicitly authorize the app to capture input from cameras and microphones. To determine the app’s status, the capture service defines an asynchronous `isAuthorized` property as follows:
-
-```swift
-var isAuthorized: Bool {
-    get async {
-        let status = AVCaptureDevice.authorizationStatus(for: .video)
-        // Determine whether a person previously authorized camera access.
-        var isAuthorized = status == .authorized
-        // If the system hasn't determined their authorization status,
-        // explicitly prompt them for approval.
-        if status == .notDetermined {
-            isAuthorized = await AVCaptureDevice.requestAccess(for: .video)
-        }
-        return isAuthorized
-    }
-}
-```
-
-The property’s implementation uses the methods of [AVCaptureDevice](https://developer.apple.com/documentation/avfoundation/avcapturedevice) to check the current status, and if the app hasn’t made a determination, requests authorization from the user. If the app has authorization, it starts the capture session to begin the flow of data. If not, it shows an error message in the user interface.
-
-To learn more about the configuration required to access cameras and microphones, see [Requesting authorization to capture and save media](https://developer.apple.com/documentation/avfoundation/capture_setup/requesting_authorization_to_capture_and_save_media).
-
-
-## Change the capture mode
-The app starts in photo capture mode. Changing modes requires a reconfiguration of the capture session as follows:
-
-```swift
-func setCaptureMode(_ captureMode: CaptureMode) throws {
-    
-    self.captureMode = captureMode
-    
-    // Change the configuration atomically.
-    captureSession.beginConfiguration()
-    defer { captureSession.commitConfiguration() }
-    
-    // Configure the capture session for the selected capture mode.
-    switch captureMode {
-    case .photo:
-        // The app needs to remove the movie capture output to perform Live Photo capture.
-        captureSession.sessionPreset = .photo
-        captureSession.removeOutput(movieCapture.output)
-    case .video:
-        captureSession.sessionPreset = .high
-        try addOutput(movieCapture.output)
-    }
-
-    // Update the advertised capabilities after reconfiguration.
-    updateCaptureCapabilities()
-}
-```
-
-In photo capture mode, the app sets the [.photo](https://developer.apple.com/documentation/avfoundation/avcapturesession/preset/1390112-photo) preset on the capture session, which optimizes the capture pipeline for high-quality photo output. It also removes the movie capture output, which prevents the photo output from performing Live Photo capture. In video capture mode, it sets the session preset to [.high](https://developer.apple.com/documentation/avfoundation/avcapturesession/preset/1388084-high) and adds the movie file capture output to the session.
-
-## Select a new camera
-The app provides a button that lets people switch between the front and back cameras and, in iPadOS, connected external cameras. To change the active camera, the app reconfigures the session as follows:
-
-```swift
-// Changes the device the service uses for video capture.
-private func changeCaptureDevice(to device: AVCaptureDevice) {
-    // The service must have a valid video input prior to calling this method.
-    guard let currentInput = activeVideoInput else { fatalError() }
-    
-    // Bracket the following configuration in a begin/commit configuration pair.
-    captureSession.beginConfiguration()
-    defer { captureSession.commitConfiguration() }
-    
-    // Remove the existing video input before attempting to connect a new one.
-    captureSession.removeInput(currentInput)
-    do {
-        // Attempt to connect a new input and device to the capture session.
-        activeVideoInput = try addInput(for: device)
-        // Configure a new rotation coordinator for the new device.
-        createRotationCoordinator(for: device)
-        // Register for device observations.
-        observeSubjectAreaChanges(of: device)
-        // Update the service's advertised capabilities.
-        updateCaptureCapabilities()
-    } catch {
-        // Reconnect the existing camera on failure.
-        captureSession.addInput(currentInput)
-    }
-}
-```
-
-[AVCaptureSession](https://developer.apple.com/documentation/avfoundation/avcapturesession) only allows attaching a single camera input at a time, so this method begins by removing the existing camera’s input. It then attempts to add an input for the new device and, if successful, performs some internal configuration to reflect the device change. If the capture session can’t add the new device, it reconnects the removed input.
-
-- Note: If your app requires capturing from multiple cameras simultaneously, use [AVCaptureMultiCamSession](https://developer.apple.com/documentation/avfoundation/avcapturemulticamsession) instead.
-
-## Capture a photo
-The capture service delegates handling of the app’s photo capture features to the `PhotoCapture` object, which manages the life cycle of and interaction with an [AVCapturePhotoOutput](https://developer.apple.com/documentation/avfoundation/avcapturephotooutput). The app captures photos with this object by calling its [capturePhoto(with:delegate:)](https://developer.apple.com/documentation/avfoundation/avcapturephotooutput/1648765-capturephoto) method, passing it an object that describes photo capture settings to enable and a delegate for the system to call as capture proceeds. To use this delegate-based API in an `async` context , the app wraps this call with a checked throwing continuation as follows:
-
-```swift
-/// The app calls this method when the user taps the photo capture button.
-func capturePhoto(with features: EnabledPhotoFeatures) async throws -> Photo {
-    // Wrap the delegate-based capture API in a continuation to use it in an async context.
-    try await withCheckedThrowingContinuation { continuation in
-        
-        // Create a settings object to configure the photo capture.
-        let photoSettings = createPhotoSettings(with: features)
-        
-        let delegate = PhotoCaptureDelegate(continuation: continuation)
-        monitorProgress(of: delegate)
-        
-        // Capture a new photo with the specified settings.
-        photoOutput.capturePhoto(with: photoSettings, delegate: delegate)
-    }
-}
-```
-
-When the system finishes capturing a photo, it calls the delegate’s [photoOutput(_:didFinishCaptureFor:error:)](https://developer.apple.com/documentation/avfoundation/avcapturephotocapturedelegate/1778618-photooutput) method. The delegate object’s implementation of this method uses the continuation to resume execution by returning a photo or throwing an error.
-
-```swift
-func photoOutput(_ output: AVCapturePhotoOutput, didFinishCaptureFor resolvedSettings: AVCaptureResolvedPhotoSettings, error: Error?) {
-
-    // If an error occurs, resume the continuation by throwing an error, and return.
-    if let error {
-        continuation.resume(throwing: error)
-        return
-    }
-    
-    /// Create a photo object to save to the `MediaLibrary`.
-    let photo = Photo(data: photoData, isProxy: isProxyPhoto, livePhotoMovieURL: livePhotoMovieURL)
-    // Resume the continuation by returning the captured photo.
-    continuation.resume(returning: photo)
-}
-```
-
-To learn more about capturing photos with AVFoundation, see [Capturing Still and Live Photos](https://developer.apple.com/documentation/avfoundation/photo_capture/capturing_still_and_live_photos).
-
-## Record a movie
-The capture service delegates handling of the app’s video capture features to the `MovieCapture` object, which manages the life cycle of and interaction with an [AVCaptureMovieFileOutput](https://developer.apple.com/documentation/avfoundation/avcapturemoviefileoutput). To start recording a movie, the app calls the movie file output’s [startRecording(to:recordingDelegate:)](https://developer.apple.com/documentation/avfoundation/avcapturefileoutput/1387224-startrecording) method, which takes a URL to write the move to and a delegate for the system to call when recording completes.
-
-```swift
-/// Starts movie recording.
-func startRecording() {
-    // Return early if already recording.
-    guard !movieOutput.isRecording else { return }
-
-    // Start a timer to update the recording time.
-    startMonitoringDuration()
-    
-    delegate = MovieCaptureDelegate()
-    movieOutput.startRecording(to: URL.movieFileURL, recordingDelegate: delegate!)
-}
-```
-
-To finish recording the video, the app calls the movie file output’s [stopRecording()](https://developer.apple.com/documentation/avfoundation/avcapturefileoutput/1389485-stoprecording) method, which causes the system to call the delegate to handle the captured output. To adapt this delegate-based callback, the app wraps this interaction in a checked throwing continuation as follows:
-
-```swift
-/// Stops movie recording.
-/// - Returns: A `Movie` object that represents the captured movie.
-func stopRecording() async throws -> Movie {
-    // Use a continuation to adapt the delegate-based capture API to an async interface.
-    return try await withCheckedThrowingContinuation { continuation in
-        // Set the continuation on the delegate to handle the capture result.
-        delegate?.continuation = continuation
-        
-        /// Stops recording, which causes the output to call the `MovieCaptureDelegate` object.
-        movieOutput.stopRecording()
-        stopMonitoringDuration()
-    }
-}
-```
-
-When the app calls the movie file output’s [stopRecording()](https://developer.apple.com/documentation/avfoundation/avcapturefileoutput/1389485-stoprecording) method, the system calls the delegate, which resumes execution either by returning a movie or throwing an error.
-
-```swift
-func fileOutput(_ output: AVCaptureFileOutput, didFinishRecordingTo outputFileURL: URL, from connections: [AVCaptureConnection], error: Error?) {
-    if let error {
-        // If an error occurs, throw it to the caller.
-        continuation?.resume(throwing: error)
-    } else {
-        // Return a new movie object.
-        continuation?.resume(returning: Movie(url: outputFileURL))
-    }
-}
-```
+- iOS app: Swift, SwiftUI, AVFoundation, URLSession WebSocket, local file sidecars.
+- Director: Python, Tkinter, asyncio, WebSocket command routing, local HTTP upload ingest.
+- Origin: adapted from Apple's AVCam sample and extended into a multi-device capture rig.
