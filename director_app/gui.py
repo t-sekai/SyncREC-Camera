@@ -510,10 +510,50 @@ class DirectorGUI:
         return tab
 
     def _build_record_tab(self, notebook: ttk.Notebook) -> ttk.Frame:
-        tab = ttk.Frame(notebook, padding=12, style="Panel.TFrame")
+        tab = ttk.Frame(notebook, style="Panel.TFrame")
         tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
 
-        timing = ttk.LabelFrame(tab, text="Scheduled Recording", padding=10, style="Panel.TLabelframe")
+        canvas = Canvas(tab, borderwidth=0, highlightthickness=0, background="#ffffff")
+        scroll = ttk.Scrollbar(tab, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=scroll.set)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scroll.grid(row=0, column=1, sticky="ns")
+
+        content = ttk.Frame(canvas, padding=12, style="Panel.TFrame")
+        content.columnconfigure(0, weight=1)
+        content_window = canvas.create_window((0, 0), window=content, anchor="nw")
+
+        def _resize_content(_event: Any | None = None) -> None:
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _resize_window(event: Any) -> None:
+            canvas.itemconfigure(content_window, width=event.width)
+
+        def _on_mousewheel(event: Any) -> str:
+            if event.delta:
+                direction = -1 if event.delta > 0 else 1
+            else:
+                direction = -1 if getattr(event, "num", 0) == 4 else 1
+            canvas.yview_scroll(direction, "units")
+            return "break"
+
+        def _bind_mousewheel(_event: Any) -> None:
+            canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            canvas.bind_all("<Button-4>", _on_mousewheel)
+            canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_mousewheel(_event: Any) -> None:
+            canvas.unbind_all("<MouseWheel>")
+            canvas.unbind_all("<Button-4>")
+            canvas.unbind_all("<Button-5>")
+
+        content.bind("<Configure>", _resize_content)
+        canvas.bind("<Configure>", _resize_window)
+        canvas.bind("<Enter>", _bind_mousewheel)
+        canvas.bind("<Leave>", _unbind_mousewheel)
+
+        timing = ttk.LabelFrame(content, text="Scheduled Recording", padding=10, style="Panel.TLabelframe")
         timing.grid(row=0, column=0, sticky="ew")
         for col in range(2):
             timing.columnconfigure(col, weight=1)
@@ -524,33 +564,60 @@ class DirectorGUI:
         ttk.Button(timing, text="Prepare + Commit Start", command=self.start_all, style="Primary.TButton").grid(
             row=2, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
         )
-        ttk.Button(timing, text="Prepare Stop", command=self.stop_all).grid(
+        ttk.Button(timing, text="Prepare Stop", command=self.stop_all, style="Primary.TButton").grid(
             row=2, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
         )
 
-        global_actions = ttk.LabelFrame(tab, text="All Cameras", padding=10, style="Panel.TLabelframe")
-        global_actions.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        self._button_grid(
-            global_actions,
-            (
-                ("Arm Idle All", self.arm_all),
-                ("Prepare Rec All", self.prepare_recording_all),
-                ("Start Rec All", self.start_recording_all),
-                ("Stop Rec All", self.stop_recording_all),
-            ),
+        recording_actions = ttk.LabelFrame(content, text="Recording Controls", padding=10, style="Panel.TLabelframe")
+        recording_actions.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        recording_actions.columnconfigure(0, weight=1)
+        recording_actions.columnconfigure(1, weight=1)
+        ttk.Button(recording_actions, text="Arm Idle All", command=self.arm_all).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6)
+        )
+        ttk.Button(recording_actions, text="Arm Idle Selected", command=self.arm_selected).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0)
+        )
+        ttk.Button(recording_actions, text="Prepare Rec All", command=self.prepare_recording_all).grid(
+            row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
+        )
+        ttk.Button(recording_actions, text="Prepare Selected", command=self.prepare_recording_selected).grid(
+            row=1, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
+        )
+        ttk.Button(recording_actions, text="Start Rec All", command=self.start_recording_all).grid(
+            row=2, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
+        )
+        ttk.Button(recording_actions, text="Start Selected", command=self.start_recording_selected).grid(
+            row=2, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
+        )
+        ttk.Button(recording_actions, text="Stop Rec All", command=self.stop_recording_all).grid(
+            row=3, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
+        )
+        ttk.Button(recording_actions, text="Stop Selected", command=self.stop_recording_selected).grid(
+            row=3, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
         )
 
-        selected_actions = ttk.LabelFrame(tab, text="Selected Camera", padding=10, style="Panel.TLabelframe")
-        selected_actions.grid(row=2, column=0, sticky="ew", pady=(12, 0))
-        self._button_grid(
-            selected_actions,
-            (
-                ("Arm Idle Selected", self.arm_selected),
-                ("Prepare Selected", self.prepare_recording_selected),
-                ("Start Selected", self.start_recording_selected),
-                ("Stop Selected", self.stop_recording_selected),
-            ),
+        preview = ttk.LabelFrame(content, text="Preview Photos", padding=10, style="Panel.TLabelframe")
+        preview.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        preview.columnconfigure(0, weight=1)
+        preview.columnconfigure(1, weight=1)
+        ttk.Button(preview, text="Preview All", command=self.preview_photos_all).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6)
         )
+        ttk.Button(preview, text="Preview Selected", command=self.preview_photo_selected).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0)
+        )
+        ttk.Button(preview, text="Open Grid-view Image", command=self.open_preview_grid_image).grid(
+            row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
+        )
+        ttk.Button(preview, text="Open Selected Image", command=self.open_selected_preview_image).grid(
+            row=1, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
+        )
+        ttk.Button(preview, text="Open Preview Folder", command=self.open_preview_folder).grid(
+            row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0)
+        )
+        self.preview_status_label = ttk.Label(preview, textvariable=self.preview_status_var, style="Muted.TLabel", wraplength=380)
+        self.preview_status_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
         return tab
 
     def _build_media_tab(self, notebook: ttk.Notebook) -> ttk.Frame:
@@ -566,40 +633,41 @@ class DirectorGUI:
         ttk.Button(transfer, text="Pull Videos All", command=self.pull_all_devices, style="Primary.TButton").grid(
             row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
         )
-        ttk.Button(transfer, text="Delete Uploaded All", command=self.delete_uploaded_videos_all).grid(
+        ttk.Button(transfer, text="Pull Videos Selected", command=self.pull_selected_device, style="Primary.TButton").grid(
             row=1, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
         )
-        ttk.Button(transfer, text="Pull Videos Selected", command=self.pull_selected_device, style="Primary.TButton").grid(
+        ttk.Button(transfer, text="Pull All + Auto-Lock", command=self.pull_all_devices_then_auto_lock).grid(
             row=2, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
         )
-        ttk.Button(transfer, text="Delete Uploaded Selected", command=self.delete_uploaded_videos_selected).grid(
+        ttk.Button(transfer, text="Pull Selected + Auto-Lock", command=self.pull_selected_device_then_auto_lock).grid(
             row=2, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
         )
+        ttk.Button(transfer, text="Delete Uploaded All", command=self.delete_uploaded_videos_all).grid(
+            row=3, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
+        )
+        ttk.Button(transfer, text="Delete Uploaded Selected", command=self.delete_uploaded_videos_selected).grid(
+            row=3, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
+        )
         ttk.Button(transfer, text="Force Delete Selected", command=self.force_delete_videos_selected, style="Danger.TButton").grid(
-            row=3, column=0, columnspan=2, sticky="ew", pady=(10, 0)
+            row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0)
         )
 
-        preview = ttk.LabelFrame(tab, text="Preview Photos", padding=10, style="Panel.TLabelframe")
-        preview.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        preview.columnconfigure(0, weight=1)
-        preview.columnconfigure(1, weight=1)
-        ttk.Button(preview, text="Preview Selected", command=self.preview_photo_selected).grid(
+        power = ttk.LabelFrame(tab, text="Auto-Lock", padding=10, style="Panel.TLabelframe")
+        power.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        power.columnconfigure(0, weight=1)
+        power.columnconfigure(1, weight=1)
+        ttk.Button(power, text="Allow Auto-Lock All", command=self.allow_auto_lock_all).grid(
             row=0, column=0, sticky="ew", padx=(0, 6)
         )
-        ttk.Button(preview, text="Open Selected Image", command=self.open_selected_preview_image).grid(
+        ttk.Button(power, text="Allow Auto-Lock Selected", command=self.allow_auto_lock_selected).grid(
             row=0, column=1, sticky="ew", padx=(6, 0)
         )
-        ttk.Button(preview, text="Preview All", command=self.preview_photos_all).grid(
+        ttk.Button(power, text="Resume Awake Policy All", command=self.resume_awake_policy_all).grid(
             row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
         )
-        ttk.Button(preview, text="Open Grid-view Image", command=self.open_preview_grid_image).grid(
+        ttk.Button(power, text="Resume Awake Policy Selected", command=self.resume_awake_policy_selected).grid(
             row=1, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
         )
-        ttk.Button(preview, text="Open Preview Folder", command=self.open_preview_folder).grid(
-            row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0)
-        )
-        self.preview_status_label = ttk.Label(preview, textvariable=self.preview_status_var, style="Muted.TLabel", wraplength=380)
-        self.preview_status_label.grid(row=3, column=0, columnspan=2, sticky="w", pady=(12, 0))
         return tab
 
     def _build_camera_tab(self, notebook: ttk.Notebook) -> ttk.Frame:
@@ -637,17 +705,18 @@ class DirectorGUI:
         mode = ttk.LabelFrame(tab, text="Capture Mode", padding=10, style="Panel.TLabelframe")
         mode.grid(row=1, column=0, sticky="ew", pady=(12, 0))
         mode.columnconfigure(0, weight=1)
+        mode.columnconfigure(1, weight=1)
         mode_menu = ttk.Combobox(mode,
                                  textvariable=self.capture_mode_var,
                                  width=14,
                                  values=CAPTURE_MODES,
                                  state="readonly")
-        mode_menu.grid(row=0, column=0, sticky="ew")
-        ttk.Button(mode, text="Set Mode Selected", command=self.set_capture_mode_selected).grid(
-            row=1, column=0, sticky="ew", pady=(10, 0)
-        )
+        mode_menu.grid(row=0, column=0, columnspan=2, sticky="ew")
         ttk.Button(mode, text="Set Mode All", command=self.set_capture_mode_all).grid(
-            row=2, column=0, sticky="ew", pady=(10, 0)
+            row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
+        )
+        ttk.Button(mode, text="Set Mode Selected", command=self.set_capture_mode_selected).grid(
+            row=1, column=1, sticky="ew", pady=(10, 0), padx=(6, 0)
         )
         return tab
 
@@ -1137,6 +1206,13 @@ class DirectorGUI:
                 f"rig={device.get('rig_state') or '-'}  "
                 f"last seen={self._format_last_seen(device)}"
             ),
+            (
+                f"Power: policy={device.get('awake_policy') or '-'}  "
+                f"idleTimerDisabled={yes_no(bool(device.get('idle_timer_disabled')))}  "
+                f"guidedAccess={yes_no(bool(device.get('guided_access_enabled')))}  "
+                f"allowAutoLockOnce={yes_no(bool(device.get('allow_auto_lock_once')))}  "
+                f"transferKeepAwake={yes_no(bool(device.get('transfer_keep_awake')))}"
+            ),
             f"Media: battery={battery}  free={storage}  videos={local} ({uploaded} uploaded/{pending_upload} pending)",
             (
                 f"Capture: requested={device.get('capture_mode') or '-'}  "
@@ -1537,7 +1613,7 @@ class DirectorGUI:
         payload = {"session_id": session_id, "stop_at_unix_ms": stop_at_ms}
         self.server.send_command_all("prepare_stop", payload)
 
-    def pull_selected_device(self) -> None:
+    def pull_selected_device(self, allow_auto_lock_after_pull: bool = False) -> None:
         selected = self.tree.selection()
         if not selected:
             self._append_log("Select one device row before pulling videos.")
@@ -1553,9 +1629,13 @@ class DirectorGUI:
         self.server.queue_pull_videos(device_id=device_id,
                                       max_files=max_files,
                                       policy="new_only",
-                                      upload_url=self._upload_url_for_clients)
+                                      upload_url=self._upload_url_for_clients,
+                                      allow_auto_lock_after_pull=allow_auto_lock_after_pull)
 
-    def pull_all_devices(self) -> None:
+    def pull_selected_device_then_auto_lock(self) -> None:
+        self.pull_selected_device(allow_auto_lock_after_pull=True)
+
+    def pull_all_devices(self, allow_auto_lock_after_pull: bool = False) -> None:
         if not self.upload_server.is_running or not self._upload_url_for_clients:
             self._append_log("Upload endpoint is not running. Start server first.")
             return
@@ -1587,13 +1667,31 @@ class DirectorGUI:
                                            max_files=max_files,
                                            policy="new_only",
                                            upload_url=self._upload_url_for_clients,
-                                           concurrency_limit=concurrency)
+                                           concurrency_limit=concurrency,
+                                           allow_auto_lock_after_pull=allow_auto_lock_after_pull)
         detail = f"Queued Pull Videos All for {len(device_ids)} device(s) with concurrency {concurrency}."
+        if allow_auto_lock_after_pull:
+            detail += " Auto-Lock will be allowed when each transfer exits."
         if skipped_recording:
             detail += f" Skipped recording: {', '.join(skipped_recording)}."
         if skipped_busy:
             detail += f" Skipped busy transfers: {', '.join(skipped_busy)}."
         self._append_log(detail)
+
+    def pull_all_devices_then_auto_lock(self) -> None:
+        self.pull_all_devices(allow_auto_lock_after_pull=True)
+
+    def allow_auto_lock_selected(self) -> None:
+        self._send_selected_command("set_awake_policy", {"mode": "allow_auto_lock_once"})
+
+    def resume_awake_policy_selected(self) -> None:
+        self._send_selected_command("set_awake_policy", {"mode": "default"})
+
+    def allow_auto_lock_all(self) -> None:
+        self.server.send_command_all("set_awake_policy", {"mode": "allow_auto_lock_once"})
+
+    def resume_awake_policy_all(self) -> None:
+        self.server.send_command_all("set_awake_policy", {"mode": "default"})
 
     def delete_uploaded_videos_selected(self) -> None:
         device_id = self._selected_device_id()

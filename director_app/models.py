@@ -35,6 +35,11 @@ class DeviceState:
     timecode: str = ""
     fps: int | None = None
     rig_state: str = ""
+    guided_access_enabled: bool = False
+    idle_timer_disabled: bool = False
+    awake_policy: str = ""
+    allow_auto_lock_once: bool = False
+    transfer_keep_awake: bool = False
     pending_acks: dict[str, str] = field(default_factory=dict)
     transfer_state: str = ""
     transfer_job_id: str = ""
@@ -116,6 +121,22 @@ def to_int_or_none(value: Any) -> int | None:
         return max(0, value)
     if isinstance(value, float):
         return max(0, int(value))
+    return None
+
+
+def to_bool_or_none(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1", "on"}:
+            return True
+        if normalized in {"false", "no", "0", "off"}:
+            return False
     return None
 
 

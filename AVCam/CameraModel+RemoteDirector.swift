@@ -49,6 +49,11 @@ struct RemoteDirectorStatusPayload {
     let cameraParamsStatus: String?
     let cameraParamsSummary: String?
     let rigState: RigState
+    let guidedAccessEnabled: Bool
+    let idleTimerDisabled: Bool
+    let awakePolicy: String
+    let allowAutoLockOnce: Bool
+    let transferKeepAwake: Bool
     let preferredStatusIntervalMS: UInt64
 
     static let empty = RemoteDirectorStatusPayload(recording: false,
@@ -73,6 +78,11 @@ struct RemoteDirectorStatusPayload {
                                                    cameraParamsStatus: nil,
                                                    cameraParamsSummary: nil,
                                                    rigState: .normalExit,
+                                                   guidedAccessEnabled: false,
+                                                   idleTimerDisabled: false,
+                                                   awakePolicy: "default",
+                                                   allowAutoLockOnce: false,
+                                                   transferKeepAwake: false,
                                                    preferredStatusIntervalMS: 1_000)
 }
 
@@ -95,7 +105,8 @@ enum RemoteDirectorCommand {
     case stopRecording(sessionID: String?, stopAtUnixMS: Int64?)
     case getStatus
     case setBrightness(Double)
-    case pullVideos(jobID: String, policy: String, maxFiles: Int, uploadURL: String?)
+    case setAwakePolicy(String)
+    case pullVideos(jobID: String, policy: String, maxFiles: Int, uploadURL: String?, allowAutoLockAfterPull: Bool)
     case deleteLocalVideos(policy: RemoteLocalVideoDeletePolicy)
     case setCaptureMode(VideoCaptureModePreset)
     case capturePreviewPhoto(batchID: String,
@@ -587,6 +598,11 @@ final class RemoteDirectorClient {
             message["camera_params_summary"] = cameraParamsSummary
         }
         message["rig_state"] = status.rigState.rawValue
+        message["guided_access_enabled"] = status.guidedAccessEnabled
+        message["idle_timer_disabled"] = status.idleTimerDisabled
+        message["awake_policy"] = status.awakePolicy
+        message["allow_auto_lock_once"] = status.allowAutoLockOnce
+        message["transfer_keep_awake"] = status.transferKeepAwake
 
         await sendJSONObject(message)
     }
@@ -772,6 +788,12 @@ final class RemoteDirectorClient {
                 return nil
             }
             command = .setBrightness(brightness)
+        case "set_awake_policy":
+            let mode = ((payload["mode"] as? String) ?? (payload["policy"] as? String) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .lowercased()
+            guard !mode.isEmpty else { return nil }
+            command = .setAwakePolicy(mode)
         case "pull_videos":
             let jobID = (payload["job_id"] as? String).flatMap {
                 let trimmed = $0.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -780,10 +802,12 @@ final class RemoteDirectorClient {
             let policy = (payload["policy"] as? String) ?? "new_only"
             let maxFiles = max(0, intValue(payload["max_files"]) ?? 0)
             let uploadURL = payload["upload_url"] as? String
+            let allowAutoLockAfterPull = boolValue(payload["allow_auto_lock_after_pull"]) ?? false
             command = .pullVideos(jobID: jobID,
                                   policy: policy,
                                   maxFiles: maxFiles,
-                                  uploadURL: uploadURL)
+                                  uploadURL: uploadURL,
+                                  allowAutoLockAfterPull: allowAutoLockAfterPull)
         case "delete_uploaded_videos", "delete_uploaded_local_videos", "cleanup_uploaded_videos":
             command = .deleteLocalVideos(policy: .uploadedOnly)
         case "force_delete_videos", "force_delete_local_videos", "delete_all_videos":

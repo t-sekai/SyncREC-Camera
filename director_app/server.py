@@ -13,7 +13,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from .models import DeviceState, timestamp_now, to_float_or_none, to_int_or_none
+from .models import DeviceState, timestamp_now, to_bool_or_none, to_float_or_none, to_int_or_none
 
 try:
     import websockets
@@ -297,7 +297,8 @@ class DirectorServer:
                           device_id: str,
                           max_files: int = 0,
                           policy: str = "new_only",
-                          upload_url: str | None = None) -> None:
+                          upload_url: str | None = None,
+                          allow_auto_lock_after_pull: bool = False) -> None:
         loop = self._loop
         if not loop:
             self.log("Server not running.")
@@ -311,6 +312,8 @@ class DirectorServer:
             payload["max_files"] = max_files
         if upload_url:
             payload["upload_url"] = upload_url
+        if allow_auto_lock_after_pull:
+            payload["allow_auto_lock_after_pull"] = True
 
         request = PullVideosRequest(device_id=device_id, payload=payload)
 
@@ -337,7 +340,8 @@ class DirectorServer:
                                max_files: int = 0,
                                policy: str = "new_only",
                                upload_url: str | None = None,
-                               concurrency_limit: int | None = None) -> None:
+                               concurrency_limit: int | None = None,
+                               allow_auto_lock_after_pull: bool = False) -> None:
         loop = self._loop
         if not loop:
             self.log("Server not running.")
@@ -369,6 +373,8 @@ class DirectorServer:
                         payload["max_files"] = max_files
                     if upload_url:
                         payload["upload_url"] = upload_url
+                    if allow_auto_lock_after_pull:
+                        payload["allow_auto_lock_after_pull"] = True
 
                     self._pull_queue.append(PullVideosRequest(device_id=device_id, payload=payload))
                     queued_jobs.append((device_id, str(payload["job_id"])))
@@ -532,6 +538,11 @@ class DirectorServer:
                     "timecode": d.timecode,
                     "fps": d.fps,
                     "rig_state": d.rig_state,
+                    "guided_access_enabled": d.guided_access_enabled,
+                    "idle_timer_disabled": d.idle_timer_disabled,
+                    "awake_policy": d.awake_policy,
+                    "allow_auto_lock_once": d.allow_auto_lock_once,
+                    "transfer_keep_awake": d.transfer_keep_awake,
                     "pending_acks": dict(d.pending_acks),
                     "transfer_state": d.transfer_state,
                     "transfer_detail": d.transfer_detail,
@@ -555,6 +566,26 @@ class DirectorServer:
 
     def log(self, message: str) -> None:
         self.event_queue.put(("log", f"[{timestamp_now()}] {message}"))
+
+    def _apply_power_status_payload(self, device: DeviceState, payload: dict[str, Any]) -> None:
+        if "guided_access_enabled" in payload:
+            value = to_bool_or_none(payload.get("guided_access_enabled"))
+            if value is not None:
+                device.guided_access_enabled = value
+        if "idle_timer_disabled" in payload:
+            value = to_bool_or_none(payload.get("idle_timer_disabled"))
+            if value is not None:
+                device.idle_timer_disabled = value
+        if "awake_policy" in payload:
+            device.awake_policy = str(payload.get("awake_policy") or "")
+        if "allow_auto_lock_once" in payload:
+            value = to_bool_or_none(payload.get("allow_auto_lock_once"))
+            if value is not None:
+                device.allow_auto_lock_once = value
+        if "transfer_keep_awake" in payload:
+            value = to_bool_or_none(payload.get("transfer_keep_awake"))
+            if value is not None:
+                device.transfer_keep_awake = value
 
     def _remote_director_snapshot_locked(self, device_id: str | None) -> dict[str, Any] | None:
         if not device_id:
@@ -1138,6 +1169,7 @@ class DirectorServer:
                 device.last_camera_params_summary = str(msg.get("camera_params_summary") or "")
             if "rig_state" in msg:
                 device.rig_state = str(msg.get("rig_state") or "")
+            self._apply_power_status_payload(device, msg)
 
         elif mtype == "ack":
             request_id = str(msg.get("request_id") or "")
@@ -1198,6 +1230,7 @@ class DirectorServer:
                     device.last_camera_params_status = str(payload.get("camera_params_status") or "")
                 if "camera_params_summary" in payload:
                     device.last_camera_params_summary = str(payload.get("camera_params_summary") or "")
+                self._apply_power_status_payload(device, payload)
             waiter = self._ack_waiters.pop((device.device_id, request_id), None)
             if waiter and not waiter.done():
                 waiter.set_result(msg)

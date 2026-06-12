@@ -20,6 +20,7 @@ enum RemoteDirectorConfiguration {
 private enum RemoteTransferConfiguration {
     static let uploadedVideoFingerprintsDefaultsKey = "RemoteUploadedVideoFingerprints"
     static let maxRememberedFingerprints = 5_000
+    static let uploadRetryAttempts = 3
 }
 
 private enum ManualControlConfiguration {
@@ -218,6 +219,21 @@ final class CameraModel: Camera {
 
     /// Task for an active remote pull-videos upload job.
     private var remotePullVideosTask: Task<Void, Never>?
+
+    /// Keeps Auto-Lock disabled while remote video transfers are active.
+    private var transferKeepAwake = false
+
+    /// One-shot override that permits Auto-Lock until the app becomes active again.
+    private var allowAutoLockOnce = false
+
+    /// Last Auto-Lock decision requested from UIApplication.
+    private var lastAppliedIdleTimerDisabled = false
+
+    /// Human-readable reason for the last Auto-Lock decision.
+    private var awakePolicyReason = "default"
+
+    /// Monotonic counter for manual awake-policy commands.
+    private var awakePolicyCommandGeneration = 0
 
     /// Task for an active remote preview-photo capture/upload job.
     private var remotePreviewPhotoTask: Task<Void, Never>?
@@ -625,8 +641,28 @@ final class CameraModel: Camera {
         // Camera/network control in this app is foreground-only. Guided Access can keep the app
         // onscreen as a rig/kiosk controller, but this code does not rely on background camera
         // access, screen-lock camera access, background modes, silent audio, or private APIs.
-        let shouldKeepAwake = captureActivity.isRecording || rigState == .recording || rigState == .recordingPrepared || (isRigKioskMode && rigState == .armedIdle)
+        let isRecordingNow = captureActivity.isRecording || rigState == .recording
+        let shouldKeepAwake: Bool
+        let policyReason: String
+        if isRecordingNow {
+            shouldKeepAwake = true
+            policyReason = "recording"
+        } else if transferKeepAwake {
+            shouldKeepAwake = true
+            policyReason = "transfer"
+        } else if allowAutoLockOnce {
+            shouldKeepAwake = false
+            policyReason = "auto_lock_allowed_once"
+        } else if isRigKioskMode {
+            shouldKeepAwake = true
+            policyReason = "guided_access_default"
+        } else {
+            shouldKeepAwake = false
+            policyReason = "default_auto_lock"
+        }
         setApplicationIdleTimerDisabled(shouldKeepAwake)
+        lastAppliedIdleTimerDisabled = shouldKeepAwake
+        awakePolicyReason = policyReason
 
         let shouldDimForRig = isRigKioskMode && (rigState == .armedIdle || rigState == .preview || rigState == .recordingPrepared || rigState == .recording)
         if shouldDimForRig {
@@ -665,7 +701,8 @@ final class CameraModel: Camera {
             "Director: \(remoteDirectorClient.connectionStatus)",
             "Battery: \(batteryText)",
             "Storage: \(storageText)",
-            "Rig: \(rigState.rawValue)"
+            "Rig: \(rigState.rawValue)",
+            "Awake: \(awakePolicyReason)"
         ]
     }
 
@@ -1648,6 +1685,9 @@ final class CameraModel: Camera {
             await startRemoteDirectorControllerMode()
             return
         }
+        if allowAutoLockOnce {
+            allowAutoLockOnce = false
+        }
         remoteDirectorClient.setConnectionRole(.camera)
         if let failure = await ensureCaptureSessionRunningForRig(reason: "camera_start") {
             logger.error("Failed to start capture service. \(failure.detail, privacy: .public)")
@@ -1675,6 +1715,7 @@ final class CameraModel: Camera {
         }
         remotePullVideosTask?.cancel()
         remotePullVideosTask = nil
+        transferKeepAwake = false
         remotePreviewPhotoTask?.cancel()
         remotePreviewPhotoTask = nil
         await captureService.stop()
@@ -1961,6 +2002,8 @@ final class CameraModel: Camera {
         let policy: RemotePullVideosPolicy
         let maxFiles: Int
         let uploadURLString: String?
+        let allowAutoLockAfterPull: Bool
+        let awakePolicyCommandGenerationAtStart: Int
     }
 
     private struct RemotePreviewPhotoRequest {
@@ -2040,6 +2083,11 @@ final class CameraModel: Camera {
             cameraParamsStatus: activeManualLockProfile == nil ? "none" : manualProfileDriftStatus.rawValue,
             cameraParamsSummary: manualCameraParamsSummary(),
             rigState: rigState,
+            guidedAccessEnabled: isRigKioskMode,
+            idleTimerDisabled: lastAppliedIdleTimerDisabled,
+            awakePolicy: awakePolicyReason,
+            allowAutoLockOnce: allowAutoLockOnce,
+            transferKeepAwake: transferKeepAwake,
             preferredStatusIntervalMS: rigState == .armedIdle ? 5_000 : 1_000
         )
     }
@@ -2270,6 +2318,32 @@ final class CameraModel: Camera {
                         extra: ["brightness": clamped])
     }
 
+    private func setRemoteAwakePolicy(_ mode: String) -> RemoteDirectorCommandReply {
+        let normalizedMode = mode.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "-", with: "_")
+        switch normalizedMode {
+        case "allow_auto_lock_once", "allow_auto_lock", "allow_sleep", "auto_lock_allowed_once":
+            allowAutoLockOnce = true
+        case "default", "resume_awake_policy", "resume_awake", "clear_override", "disallow_sleep":
+            allowAutoLockOnce = false
+        default:
+            return rigReply(ok: false,
+                            message: "Unsupported awake policy mode: \(mode).",
+                            error: "invalid_awake_policy",
+                            extra: ["requested_awake_policy": mode])
+        }
+        awakePolicyCommandGeneration += 1
+
+        applyRigPowerPolicy()
+        updateRigStatusLines()
+        remoteDirectorClient.sendStatusNow()
+        let message = allowAutoLockOnce ? "Auto-Lock allowed until next wake." : "Default awake policy resumed."
+        return rigReply(ok: true,
+                        message: message,
+                        extra: ["requested_awake_policy": normalizedMode])
+    }
+
     private func rigReply(ok: Bool,
                           message: String,
                           error: String? = nil,
@@ -2293,6 +2367,10 @@ final class CameraModel: Camera {
             "device_name": directorDeviceName,
             "message": message,
             "guided_access_enabled": isRigKioskMode,
+            "idle_timer_disabled": lastAppliedIdleTimerDisabled,
+            "awake_policy": awakePolicyReason,
+            "allow_auto_lock_once": allowAutoLockOnce,
+            "transfer_keep_awake": transferKeepAwake,
             "director_connection": remoteDirectorClient.connectionStatus,
             "local_video_count": localVideoSummary.totalCount,
             "uploaded_video_count": localVideoSummary.uploadedCount,
@@ -2439,7 +2517,10 @@ final class CameraModel: Camera {
         case .setBrightness(let brightness):
             return setRigBrightness(brightness)
 
-        case .pullVideos(let jobID, let policyRawValue, let maxFiles, let uploadURL):
+        case .setAwakePolicy(let mode):
+            return setRemoteAwakePolicy(mode)
+
+        case .pullVideos(let jobID, let policyRawValue, let maxFiles, let uploadURL, let allowAutoLockAfterPull):
             if let remotePullVideosTask, !remotePullVideosTask.isCancelled {
                 return rigReply(ok: false,
                                 message: "A pull_videos transfer is already running.",
@@ -2449,8 +2530,14 @@ final class CameraModel: Camera {
             let request = RemotePullVideosRequest(jobID: jobID,
                                                   policy: RemotePullVideosPolicy(rawValue: policyRawValue),
                                                   maxFiles: max(0, maxFiles),
-                                                  uploadURLString: uploadURL)
+                                                  uploadURLString: uploadURL,
+                                                  allowAutoLockAfterPull: allowAutoLockAfterPull,
+                                                  awakePolicyCommandGenerationAtStart: awakePolicyCommandGeneration)
 
+            transferKeepAwake = true
+            applyRigPowerPolicy()
+            updateRigStatusLines()
+            remoteDirectorClient.sendStatusNow()
             remotePullVideosTask = Task { @MainActor [weak self] in
                 guard let self else { return }
                 defer { self.remotePullVideosTask = nil }
@@ -3218,6 +3305,17 @@ final class CameraModel: Camera {
     }
 
     private func runRemotePullVideosJob(_ request: RemotePullVideosRequest) async {
+        defer {
+            transferKeepAwake = false
+            if request.allowAutoLockAfterPull &&
+                awakePolicyCommandGeneration == request.awakePolicyCommandGenerationAtStart {
+                allowAutoLockOnce = true
+            }
+            applyRigPowerPolicy()
+            updateRigStatusLines()
+            remoteDirectorClient.sendStatusSoon()
+        }
+
         remoteDirectorClient.sendTransferUpdate(jobID: request.jobID,
                                                 state: "starting",
                                                 detail: "Preparing local video list.")
@@ -3296,6 +3394,15 @@ final class CameraModel: Camera {
                                                         totalFiles: transferItems.count,
                                                         sentBytes: sentBytes)
             } catch {
+                if Task.isCancelled {
+                    remoteDirectorClient.sendTransferUpdate(jobID: request.jobID,
+                                                            state: "cancelled",
+                                                            detail: "Transfer task cancelled.",
+                                                            sentFiles: sentFiles,
+                                                            totalFiles: transferItems.count,
+                                                            sentBytes: sentBytes)
+                    return
+                }
                 let detail = "Upload failed for \(item.videoURL.lastPathComponent): \(error.localizedDescription)"
                 remoteDirectorClient.sendTransferUpdate(jobID: request.jobID,
                                                         state: "failed",
@@ -3369,27 +3476,62 @@ final class CameraModel: Camera {
                                     uploadBaseURL: URL,
                                     jobID: String) async throws -> Int64 {
         var uploadedBytes: Int64 = 0
-        try await uploadSingleTransferFile(fileURL: item.videoURL,
-                                           uploadBaseURL: uploadBaseURL,
-                                           jobID: jobID,
-                                           sessionFolderName: item.sessionFolderName,
-                                           contentKind: "video",
-                                           mimeType: mimeType(for: item.videoURL),
-                                           fingerprint: item.fingerprint)
+        try await uploadSingleTransferFileWithRetry(fileURL: item.videoURL,
+                                                    uploadBaseURL: uploadBaseURL,
+                                                    jobID: jobID,
+                                                    sessionFolderName: item.sessionFolderName,
+                                                    contentKind: "video",
+                                                    mimeType: mimeType(for: item.videoURL),
+                                                    fingerprint: item.fingerprint)
         uploadedBytes += item.videoBytes
 
         if let sidecarURL = item.sidecarURL {
-            try await uploadSingleTransferFile(fileURL: sidecarURL,
-                                               uploadBaseURL: uploadBaseURL,
-                                               jobID: jobID,
-                                               sessionFolderName: item.sessionFolderName,
-                                               contentKind: "calibration_json",
-                                               mimeType: "application/json",
-                                               fingerprint: item.fingerprint)
+            try await uploadSingleTransferFileWithRetry(fileURL: sidecarURL,
+                                                        uploadBaseURL: uploadBaseURL,
+                                                        jobID: jobID,
+                                                        sessionFolderName: item.sessionFolderName,
+                                                        contentKind: "calibration_json",
+                                                        mimeType: "application/json",
+                                                        fingerprint: item.fingerprint)
             uploadedBytes += item.sidecarBytes
         }
 
         return uploadedBytes
+    }
+
+    private func uploadSingleTransferFileWithRetry(fileURL: URL,
+                                                   uploadBaseURL: URL,
+                                                   jobID: String,
+                                                   sessionFolderName: String,
+                                                   contentKind: String,
+                                                   mimeType: String,
+                                                   fingerprint: String) async throws {
+        var lastError: Error?
+        for attempt in 1...RemoteTransferConfiguration.uploadRetryAttempts {
+            do {
+                try await uploadSingleTransferFile(fileURL: fileURL,
+                                                   uploadBaseURL: uploadBaseURL,
+                                                   jobID: jobID,
+                                                   sessionFolderName: sessionFolderName,
+                                                   contentKind: contentKind,
+                                                   mimeType: mimeType,
+                                                   fingerprint: fingerprint)
+                return
+            } catch {
+                if Task.isCancelled {
+                    throw error
+                }
+                lastError = error
+                if attempt < RemoteTransferConfiguration.uploadRetryAttempts {
+                    let delayNS = UInt64(attempt) * 750_000_000
+                    try await Task.sleep(nanoseconds: delayNS)
+                }
+            }
+        }
+
+        if let lastError {
+            throw lastError
+        }
     }
 
     private func uploadSingleTransferFile(fileURL: URL,
