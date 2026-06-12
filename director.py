@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-Laptop director for multi-iPhone recording control.
+Director app for multi-iPhone recording control.
 
 This script is a thin entrypoint. Implementation lives under `director_app/`:
 - `director_app.server`: WebSocket server and command routing
-- `director_app.tentacle`: Tentacle BLE reader
 - `director_app.gui`: Tkinter UI
 """
 

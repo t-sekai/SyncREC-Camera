@@ -44,7 +44,7 @@ protocol Camera: AnyObject, SendableMetatype {
     /// The frame rate for the displayed Tentacle timecode.
     var displayedTentacleFPS: Int? { get }
 
-    /// The WebSocket URL for the laptop director control plane.
+    /// The WebSocket URL for the director control plane.
     var directorWebSocketURL: String { get set }
 
     /// The user-defined device name exposed to remote director clients.
@@ -62,10 +62,10 @@ protocol Camera: AnyObject, SendableMetatype {
     /// Editable experiment name sent from the handheld remote director.
     var remoteDirectorExperimentName: String { get set }
 
-    /// Take number mirrored from the laptop director.
+    /// Take number mirrored from the director.
     var remoteDirectorTakeNumberText: String { get }
 
-    /// Compact summary lines mirrored from the laptop director.
+    /// Compact summary lines mirrored from the director.
     var remoteDirectorSummaryLines: [String] { get }
 
     /// Most recent remote director command result.

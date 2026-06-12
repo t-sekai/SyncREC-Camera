@@ -96,7 +96,7 @@ final class CameraModel: Camera {
     /// An object that manages Tentacle timecode mirrored from the director over LAN.
     private let directorLANTimecodeService: DirectorLANTimecodeService
 
-    /// An object that manages remote recording control from a laptop director.
+    /// An object that manages remote recording control from a director.
     private let remoteDirectorClient: RemoteDirectorClient
     private var activeTimecodeInputMode: ResolvedTimecodeInputMode = .tentacleBLE
 
@@ -115,12 +115,12 @@ final class CameraModel: Camera {
     /// The frame rate for the continuously advancing Tentacle timecode display value.
     private(set) var displayedTentacleFPS: Int?
 
-    /// The WebSocket endpoint for the laptop director.
+    /// The WebSocket endpoint for the director.
     var directorWebSocketURL = "" {
         didSet { handleDirectorWebSocketURLChange(from: oldValue) }
     }
 
-    /// User-configurable device name shown to the laptop director.
+    /// User-configurable device name shown to the director.
     var directorDeviceName = UIDevice.current.name {
         didSet { handleDirectorDeviceNameChange(from: oldValue) }
     }
@@ -498,8 +498,8 @@ final class CameraModel: Camera {
         isRemoteArmed = false
         isRigLowPowerUIActive = false
         remoteDirectorApprovalState = .requesting
-        remoteDirectorStatusText = "Requesting laptop approval..."
-        remoteDirectorSummaryLines = ["Waiting for laptop approval."]
+        remoteDirectorStatusText = "Requesting director approval..."
+        remoteDirectorSummaryLines = ["Waiting for director approval."]
         remoteDirectorClient.setConnectionRole(.remoteDirectorCandidate)
         remoteDirectorClient.start()
         remoteDirectorClient.requestRemoteDirectorApproval()
@@ -565,7 +565,7 @@ final class CameraModel: Camera {
     func requestRemoteDirectorApproval() async {
         guard isRemoteDirectorModeEnabled else { return }
         remoteDirectorApprovalState = .requesting
-        remoteDirectorStatusText = "Requesting laptop approval..."
+        remoteDirectorStatusText = "Requesting director approval..."
         remoteDirectorClient.setConnectionRole(.remoteDirectorCandidate)
         remoteDirectorClient.start()
         remoteDirectorClient.requestRemoteDirectorApproval()

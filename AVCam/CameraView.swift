@@ -170,17 +170,17 @@ private struct RemoteDirectorModeView<CameraModel: Camera>: View {
     private var statusText: String {
         switch camera.remoteDirectorApprovalState {
         case .approved:
-            return "Approved. Commands will be sent through the laptop director."
+            return "Approved. Commands will be sent through the director."
         case .pending, .requesting:
             return camera.remoteDirectorStatusText
         case .busy:
             return "Another phone is currently the remote director."
         case .denied:
-            return "Request denied by the laptop director."
+            return "Request denied by the director."
         case .released:
             return "Remote director slot was released."
         case .disconnected:
-            return "Disconnected from the laptop director."
+            return "Disconnected from the director."
         case .inactive:
             return camera.remoteDirectorStatusText
         }

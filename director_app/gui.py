@@ -22,7 +22,6 @@ from .models import (
     yes_no,
 )
 from .server import DirectorServer
-from .tentacle import TentacleReader
 from .upload_server import UploadIngestServer, discover_advertised_host
 
 
@@ -35,6 +34,7 @@ CAPTURE_MODE_FILENAME_COMPONENTS = {
     "uhd4k60": "4k60fps",
 }
 TAKE_NUMBERS_STATE_PATH = Path("director_app/state/take_numbers.json")
+DEFAULT_CAPTURE_MODE = "hd1080p30"
 DEFAULT_PULL_CONCURRENCY = 3
 MAX_PULL_CONCURRENCY = 8
 
@@ -50,7 +50,6 @@ DEVICE_COLUMNS = (
     "videos",
     "mode",
     "actual_video",
-    "tentacle",
     "timecode",
     "rig",
     "camera_params",
@@ -70,7 +69,6 @@ DEVICE_DISPLAY_COLUMNS = (
     "videos",
     "mode",
     "actual_video",
-    "tentacle",
     "timecode",
     "rig",
     "camera_params",
@@ -92,7 +90,6 @@ DEVICE_HEADINGS = {
     "videos": "Videos",
     "mode": "Mode",
     "actual_video": "Actual Video",
-    "tentacle": "Tentacle",
     "timecode": "Timecode",
     "rig": "Rig",
     "camera_params": "Camera Params",
@@ -115,7 +112,6 @@ DEVICE_WIDTHS = {
     "videos": 175,
     "mode": 105,
     "actual_video": 135,
-    "tentacle": 125,
     "timecode": 145,
     "rig": 130,
     "camera_params": 215,
@@ -136,7 +132,6 @@ class DirectorGUI:
 
         self.event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
         self.server = DirectorServer(self.event_queue)
-        self.tentacle_reader = TentacleReader(self.event_queue)
         self.upload_server = UploadIngestServer(self.event_queue)
 
         self.host_var = StringVar(value="0.0.0.0")
@@ -145,18 +140,17 @@ class DirectorGUI:
         self.upload_port_var = StringVar(value="8780")
         self._take_numbers_by_experiment: dict[str, int] = self._load_take_numbers()
         initial_experiment_name = self._load_last_experiment_name()
+        initial_capture_mode = self._load_last_capture_mode()
+        initial_director_fps = self._capture_mode_fps(initial_capture_mode) or 30
         self.experiment_name_var = StringVar(value=initial_experiment_name)
         self.take_number_var = StringVar(value=str(self._take_numbers_by_experiment.get(initial_experiment_name, 1)))
         self.start_delay_var = StringVar(value="2.0")
         self.stop_delay_var = StringVar(value="2.0")
-        self.tentacle_name_var = StringVar(value="NeuROK")
-        self.time_source_var = StringVar(value="laptop")
-        self.laptop_fps_var = StringVar(value="30")
+        self.director_fps_var = StringVar(value=str(initial_director_fps))
         self.pull_max_files_var = StringVar(value="0")
         self.pull_concurrency_var = StringVar(value=str(DEFAULT_PULL_CONCURRENCY))
-        self.capture_mode_var = StringVar(value="hd1080p30")
-        self.tentacle_state_var = StringVar(value="Tentacle: idle")
-        self.tentacle_timecode_var = StringVar(value="Director timecode: --:--:--:--")
+        self.capture_mode_var = StringVar(value=initial_capture_mode)
+        self.director_timecode_var = StringVar(value="Director timecode: --:--:--:--")
         self.pull_status_var = StringVar(value="Pull queue: idle")
         self.upload_endpoint_var = StringVar(value="Upload endpoint: stopped")
         self.camera_params_var = StringVar(value="Camera params: no preset")
@@ -164,6 +158,7 @@ class DirectorGUI:
         self.server_status_var = StringVar(value="Server: stopped")
         self.server_summary_var = StringVar(value="Stopped")
         self.connected_summary_var = StringVar(value="0 cameras")
+        self.params_sync_summary_var = StringVar(value="0 in sync")
         self.recording_summary_var = StringVar(value="0 recording")
         self.armed_summary_var = StringVar(value="0 armed")
         self.remote_director_summary_var = StringVar(value="None")
@@ -178,17 +173,13 @@ class DirectorGUI:
         self._is_syncing_experiment_take = False
         self.workspace: ttk.PanedWindow | None = None
 
-        self._tentacle_anchor_monotonic: float | None = None
-        self._tentacle_anchor_total_frames: int | None = None
-        self._tentacle_anchor_fps: int | None = None
-
         self._build_ui()
         self.experiment_name_var.trace_add("write", self._on_experiment_name_changed)
         self.take_number_var.trace_add("write", self._on_take_number_changed)
-        self._apply_time_source_settings()
+        self._apply_director_clock_settings()
         self._schedule_pump()
         self._schedule_status_refresh()
-        self._schedule_tentacle_clock()
+        self._schedule_director_clock()
         self.root.after(100, self.start_server)
 
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -273,6 +264,7 @@ class DirectorGUI:
         for index, (caption, variable) in enumerate((
             ("Server", self.server_summary_var),
             ("Cameras", self.connected_summary_var),
+            ("Params", self.params_sync_summary_var),
             ("Recording", self.recording_summary_var),
             ("Armed", self.armed_summary_var),
             ("Remote", self.remote_director_summary_var),
@@ -283,7 +275,7 @@ class DirectorGUI:
 
     def _build_stat_card(self, parent: ttk.Frame, caption: str, variable: StringVar) -> ttk.Frame:
         card = ttk.Frame(parent, padding=(14, 10), style="Panel.TFrame")
-        card.configure(width=160, height=64)
+        card.configure(width=145, height=64)
         card.grid_propagate(False)
         ttk.Label(card, text=caption, style="StatusCaption.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(card, textvariable=variable, style="StatusValue.TLabel").grid(row=1, column=0, sticky="w", pady=(3, 0))
@@ -433,43 +425,23 @@ class DirectorGUI:
         self.status_label = ttk.Label(server, textvariable=self.server_status_var, style="Muted.TLabel")
         self.status_label.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
-        timecode = ttk.LabelFrame(content, text="Timecode", padding=10, style="Panel.TLabelframe")
-        timecode.grid(row=1, column=0, sticky="ew", pady=(12, 0))
-        for col in range(3):
-            timecode.columnconfigure(col, weight=1)
+        clock = ttk.LabelFrame(content, text="Director Clock", padding=10, style="Panel.TLabelframe")
+        clock.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        for col in range(2):
+            clock.columnconfigure(col, weight=1)
 
-        source_menu = self._labeled_combo(
-            timecode,
-            "Source",
-            self.time_source_var,
+        fps_menu = self._labeled_combo(
+            clock,
+            "Timecode FPS",
+            self.director_fps_var,
             row=0,
             column=0,
-            width=12,
-            values=("tentacle", "laptop"),
-        )
-        source_menu.bind("<<ComboboxSelected>>", self._on_time_source_changed)
-        fps_menu = self._labeled_combo(
-            timecode,
-            "Laptop FPS",
-            self.laptop_fps_var,
-            row=0,
-            column=1,
             width=8,
             values=("30", "60"),
         )
-        fps_menu.bind("<<ComboboxSelected>>", self._on_time_source_changed)
-        self._labeled_entry(timecode, "Tentacle Name", self.tentacle_name_var, row=0, column=2, width=14)
-
-        ttk.Button(timecode, text="Connect TC", command=self.start_tentacle).grid(
-            row=1, column=0, sticky="ew", pady=(10, 0), padx=(0, 6)
-        )
-        ttk.Button(timecode, text="Stop TC", command=self.stop_tentacle).grid(
-            row=1, column=1, sticky="ew", pady=(10, 0), padx=(6, 6)
-        )
-        self.tentacle_status_label = ttk.Label(timecode, textvariable=self.tentacle_state_var, style="Muted.TLabel")
-        self.tentacle_status_label.grid(row=2, column=0, columnspan=3, sticky="w", pady=(12, 2))
-        self.tentacle_timecode_label = ttk.Label(timecode, textvariable=self.tentacle_timecode_var, style="StatusValue.TLabel")
-        self.tentacle_timecode_label.grid(row=3, column=0, columnspan=3, sticky="w")
+        fps_menu.bind("<<ComboboxSelected>>", self._on_director_fps_changed)
+        self.director_timecode_label = ttk.Label(clock, textvariable=self.director_timecode_var, style="StatusValue.TLabel")
+        self.director_timecode_label.grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
 
         status = ttk.LabelFrame(content, text="Director Status", padding=10, style="Panel.TLabelframe")
         status.grid(row=2, column=0, sticky="ew", pady=(12, 0))
@@ -727,7 +699,7 @@ class DirectorGUI:
         toolbar = ttk.Frame(panel, style="Panel.TFrame")
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         toolbar.columnconfigure(0, weight=1)
-        ttk.Label(toolbar, text="Server, upload, command, and timecode events", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(toolbar, text="Server, upload, command, and time sync events", style="Muted.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Button(toolbar, text="Clear", command=self.clear_log).grid(row=0, column=1, sticky="e")
 
         self.log_box = Text(
@@ -805,7 +777,6 @@ class DirectorGUI:
         max_events = 40
         processed = 0
         latest_devices: list[dict[str, Any]] | None = None
-        latest_tentacle_packet: dict[str, Any] | None = None
         log_lines: list[str] = []
 
         while processed < max_events:
@@ -836,26 +807,11 @@ class DirectorGUI:
                     self.server.handle_preview_upload_received(payload)
             elif etype == "camera_params_status":
                 self.camera_params_var.set(str(payload))
-            elif etype == "tentacle_state":
-                if self._time_source_is_laptop():
-                    continue
-                state = str(payload.get("state", "unknown")) if isinstance(payload, dict) else "unknown"
-                self.tentacle_state_var.set(f"Tentacle: {state}")
-                if not state.lower().startswith("connected"):
-                    self.server.clear_timecode_anchor()
-            elif etype == "tentacle_timecode":
-                if self._time_source_is_laptop():
-                    continue
-                if isinstance(payload, dict):
-                    latest_tentacle_packet = payload
 
         if log_lines:
             self._append_log_lines(log_lines)
         if latest_devices is not None:
             self._refresh_tree(latest_devices)
-        if latest_tentacle_packet is not None:
-            self._set_tentacle_anchor_from_packet(latest_tentacle_packet)
-            self.server.update_timecode_anchor(latest_tentacle_packet)
 
         return not self.event_queue.empty()
 
@@ -884,52 +840,16 @@ class DirectorGUI:
 
         self.root.after(1000, self._schedule_status_refresh)
 
-    def _schedule_tentacle_clock(self) -> None:
-        self._tick_tentacle_clock()
-        self.root.after(200, self._schedule_tentacle_clock)
+    def _schedule_director_clock(self) -> None:
+        self._tick_director_clock()
+        self.root.after(200, self._schedule_director_clock)
 
-    def _set_tentacle_anchor_from_packet(self, packet: dict[str, Any]) -> None:
-        fps = packet.get("fps")
-        hours = packet.get("hours")
-        minutes = packet.get("minutes")
-        seconds = packet.get("seconds")
-        frames = packet.get("frames")
-        if not all(isinstance(v, int) for v in (fps, hours, minutes, seconds, frames)):
-            tc = str(packet.get("timecode") or "")
-            self.tentacle_timecode_var.set(f"Director timecode: {timecode_text(tc, None)}")
-            return
-        if fps <= 0:
-            return
-
-        total_frames = ((((hours * 60) + minutes) * 60) + seconds) * fps + frames
-        self._tentacle_anchor_monotonic = time.monotonic()
-        self._tentacle_anchor_total_frames = total_frames
-        self._tentacle_anchor_fps = fps
-        self._tick_tentacle_clock()
-
-    def _tick_tentacle_clock(self) -> None:
-        if self._time_source_is_laptop():
-            fps = self._resolved_laptop_fps()
-            now = time.time()
-            total_frames = int((now % (24 * 60 * 60)) * fps)
-            tc = timecode_from_total_frames(total_frames, fps)
-            self.tentacle_timecode_var.set(f"Director timecode: {tc} @ {fps} fps")
-            return
-
-        if (
-            self._tentacle_anchor_monotonic is None
-            or self._tentacle_anchor_total_frames is None
-            or self._tentacle_anchor_fps is None
-            or self._tentacle_anchor_fps <= 0
-        ):
-            return
-
-        fps = self._tentacle_anchor_fps
-        elapsed = max(0.0, time.monotonic() - self._tentacle_anchor_monotonic)
-        advanced_frames = int(elapsed * fps)
-        total_frames = self._tentacle_anchor_total_frames + advanced_frames
+    def _tick_director_clock(self) -> None:
+        fps = self._resolved_director_fps()
+        now = time.time()
+        total_frames = int((now % (24 * 60 * 60)) * fps)
         tc = timecode_from_total_frames(total_frames, fps)
-        self.tentacle_timecode_var.set(f"Director timecode: {tc} @ {fps} fps")
+        self.director_timecode_var.set(f"Director timecode: {tc} @ {fps} fps")
 
     def _refresh_tree(self, devices: list[dict[str, Any]]) -> None:
         sorted_devices = sorted(
@@ -1023,7 +943,6 @@ class DirectorGUI:
                 videos,
                 capture_mode,
                 actual_video,
-                d["tentacle_state"],
                 timecode_text(d["timecode"], d["fps"]),
                 str(d.get("rig_state") or ""),
                 camera_params,
@@ -1067,9 +986,27 @@ class DirectorGUI:
         connected = len(devices)
         recording = sum(1 for d in devices if bool(d.get("recording")))
         armed = sum(1 for d in devices if bool(d.get("armed")))
+        params_in_sync = sum(1 for d in devices if self._device_params_in_sync(d))
         self.connected_summary_var.set(f"{connected} camera{'s' if connected != 1 else ''}")
+        self.params_sync_summary_var.set(f"{params_in_sync} in sync")
         self.recording_summary_var.set(f"{recording} recording")
         self.armed_summary_var.set(f"{armed} armed")
+
+    def _device_params_in_sync(self, device: dict[str, Any]) -> bool:
+        status = str(device.get("camera_params_status") or "")
+        normalized = status.strip().replace("-", "_").lower()
+        if normalized not in {
+            "in_sync",
+            "insync",
+            "exact_match",
+            "exactmatch",
+            "adjusted_match",
+            "adjustedmatch",
+            "copied",
+        }:
+            return False
+        report = device.get("camera_params_report")
+        return not (isinstance(report, dict) and bool(report.get("dry_run")))
 
     def _refresh_remote_director_status(self, snapshot: dict[str, Any]) -> None:
         active = snapshot.get("active") if isinstance(snapshot.get("active"), dict) else None
@@ -1119,7 +1056,7 @@ class DirectorGUI:
             "connected_cameras": len(devices),
             "recording_cameras": recording,
             "armed_cameras": armed,
-            "director_timecode": self.tentacle_timecode_var.get(),
+            "director_timecode": self.director_timecode_var.get(),
         }
 
     def _reply_remote_director_control(self,
@@ -1271,37 +1208,23 @@ class DirectorGUI:
             return f"{state_text} ({detail_text})"
         return state_text or detail_text or "-"
 
-    def _time_source_is_laptop(self) -> bool:
-        return self.time_source_var.get().strip().lower() == "laptop"
-
-    def _resolved_laptop_fps(self) -> int:
+    def _resolved_director_fps(self) -> int:
         try:
-            fps = int(self.laptop_fps_var.get().strip())
+            fps = int(self.director_fps_var.get().strip())
         except ValueError:
             fps = 30
         fps = 60 if fps == 60 else 30
-        if self.laptop_fps_var.get() != str(fps):
-            self.laptop_fps_var.set(str(fps))
+        if self.director_fps_var.get() != str(fps):
+            self.director_fps_var.set(str(fps))
         return fps
 
-    def _apply_time_source_settings(self) -> None:
-        source = "laptop" if self._time_source_is_laptop() else "tentacle"
-        fps = self._resolved_laptop_fps()
-        self.server.configure_time_source(source=source, fps=fps)
+    def _apply_director_clock_settings(self) -> None:
+        fps = self._resolved_director_fps()
+        self.server.configure_timecode_fps(fps)
+        self._tick_director_clock()
 
-        if source == "laptop":
-            self.tentacle_reader.stop()
-            self.server.clear_timecode_anchor()
-            self._tentacle_anchor_monotonic = None
-            self._tentacle_anchor_total_frames = None
-            self._tentacle_anchor_fps = None
-            self.tentacle_state_var.set("Tentacle: bypassed (laptop clock)")
-        else:
-            self.tentacle_state_var.set("Tentacle: idle")
-            self.tentacle_timecode_var.set("Director timecode: --:--:--:--")
-
-    def _on_time_source_changed(self, _event: Any | None = None) -> None:
-        self._apply_time_source_settings()
+    def _on_director_fps_changed(self, _event: Any | None = None) -> None:
+        self._apply_director_clock_settings()
 
     def _load_take_numbers(self) -> dict[str, int]:
         try:
@@ -1341,6 +1264,19 @@ class DirectorGUI:
         raw_name = state.get("last_experiment_name") if isinstance(state, dict) else None
         return self._safe_recording_component(str(raw_name or ""), fallback="experiment")
 
+    def _load_last_capture_mode(self) -> str:
+        try:
+            with TAKE_NUMBERS_STATE_PATH.open("r", encoding="utf-8") as state_file:
+                state = json.load(state_file)
+        except FileNotFoundError:
+            return DEFAULT_CAPTURE_MODE
+        except Exception:
+            return DEFAULT_CAPTURE_MODE
+
+        raw_mode = state.get("last_capture_mode") if isinstance(state, dict) else None
+        mode = str(raw_mode or "").strip()
+        return mode if mode in CAPTURE_MODES else DEFAULT_CAPTURE_MODE
+
     def _persist_take_numbers(self) -> None:
         current_experiment = self._current_experiment_name()
         self._take_numbers_by_experiment[current_experiment] = self._current_take_number(current_experiment)
@@ -1349,6 +1285,7 @@ class DirectorGUI:
     def _write_take_numbers_state(self) -> None:
         payload = {
             "schema_version": 1,
+            "last_capture_mode": self._current_capture_mode(),
             "last_experiment_name": self._current_experiment_name(),
             "take_numbers_by_experiment": dict(sorted(self._take_numbers_by_experiment.items())),
         }
@@ -1395,6 +1332,15 @@ class DirectorGUI:
             self.take_number_var.set(str(take))
         return take
 
+    def _current_capture_mode(self) -> str:
+        mode = self.capture_mode_var.get().strip()
+        return mode if mode in CAPTURE_MODES else DEFAULT_CAPTURE_MODE
+
+    def _remember_capture_mode(self, mode: str) -> None:
+        if mode in CAPTURE_MODES and self.capture_mode_var.get().strip() != mode:
+            self.capture_mode_var.set(mode)
+        self._write_take_numbers_state()
+
     def _safe_recording_component(self,
                                   value: str,
                                   fallback: str,
@@ -1418,7 +1364,7 @@ class DirectorGUI:
         return cleaned[:max_length] if cleaned else fallback
 
     def _capture_mode_filename_component(self) -> str:
-        mode = self.capture_mode_var.get().strip()
+        mode = self._current_capture_mode()
         return CAPTURE_MODE_FILENAME_COMPONENTS.get(
             mode,
             self._safe_recording_component(mode, fallback="capturemode"),
@@ -1471,15 +1417,14 @@ class DirectorGUI:
             return 30
         return None
 
-    def _sync_laptop_fps_to_capture_mode(self, mode: str) -> None:
+    def _sync_director_fps_to_capture_mode(self, mode: str) -> None:
         fps = self._capture_mode_fps(mode)
         if fps is None:
             return
-        self.laptop_fps_var.set(str(fps))
-        if self._time_source_is_laptop():
-            self.server.configure_time_source(source="laptop", fps=fps)
-            self._tick_tentacle_clock()
-            self._append_log(f"Laptop timecode FPS set to {fps} for capture mode {mode}.")
+        self.director_fps_var.set(str(fps))
+        self.server.configure_timecode_fps(fps)
+        self._tick_director_clock()
+        self._append_log(f"Director clock FPS set to {fps} for capture mode {mode}.")
 
     def start_server(self) -> None:
         host = self.host_var.get().strip() or "0.0.0.0"
@@ -1497,7 +1442,7 @@ class DirectorGUI:
         self.server_status_var.set(f"Server: starting on ws://{host}:{port}")
         self.server_summary_var.set("Starting")
         self.server.start(host, port)
-        self._apply_time_source_settings()
+        self._apply_director_clock_settings()
 
         if self.upload_server.start(bind_host=host, port=upload_port):
             configured_upload_host = self.upload_host_var.get().strip()
@@ -1547,21 +1492,6 @@ class DirectorGUI:
             self._append_log("No active remote director to release.")
             return
         self.server.release_remote_director()
-
-    def start_tentacle(self) -> None:
-        if self._time_source_is_laptop():
-            self._append_log("Time source is set to laptop. Switch to 'tentacle' to connect BLE timecode.")
-            return
-        target_name = self.tentacle_name_var.get().strip() or "NeuROK"
-        self.tentacle_reader.start(target_name)
-
-    def stop_tentacle(self) -> None:
-        self.tentacle_reader.stop()
-        self.server.clear_timecode_anchor()
-        self._tentacle_anchor_monotonic = None
-        self._tentacle_anchor_total_frames = None
-        self._tentacle_anchor_fps = None
-        self.tentacle_timecode_var.set("Director timecode: --:--:--:--")
 
     def arm_all(self) -> None:
         self.server.send_command_all("arm_idle", {})
@@ -2128,25 +2058,25 @@ class DirectorGUI:
         self._send_selected_command("release_camera_param_locks", {"preserve_focus": True})
 
     def set_capture_mode_selected(self) -> None:
-        mode = self.capture_mode_var.get().strip()
+        mode = self._current_capture_mode()
         if not mode:
             self._append_log("Select a capture mode before sending.")
             return
-        self._sync_laptop_fps_to_capture_mode(mode)
+        self._remember_capture_mode(mode)
+        self._sync_director_fps_to_capture_mode(mode)
         self._send_selected_command("set_capture_mode", {"mode": mode})
 
     def set_capture_mode_all(self) -> None:
-        mode = self.capture_mode_var.get().strip()
+        mode = self._current_capture_mode()
         if not mode:
             self._append_log("Select a capture mode before broadcasting.")
             return
-        self._sync_laptop_fps_to_capture_mode(mode)
+        self._remember_capture_mode(mode)
+        self._sync_director_fps_to_capture_mode(mode)
         self.server.send_command_all("set_capture_mode", {"mode": mode})
 
     def on_close(self) -> None:
         self._persist_take_numbers()
-        self.tentacle_reader.stop()
-        self.server.clear_timecode_anchor()
         self.upload_server.stop()
         self.server.stop()
         self.root.destroy()

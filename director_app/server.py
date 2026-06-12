@@ -77,14 +77,8 @@ class DirectorServer:
         self._preview_requests: dict[tuple[str, str], PreviewPhotoRequest] = {}
         self._preview_current_request_by_device: dict[str, str] = {}
 
-        # Director-side anchor derived from the single Tentacle BLE reader.
         self._time_sync_sequence = 0
-        self._timecode_anchor_monotonic: float | None = None
-        self._timecode_anchor_total_frames: int | None = None
-        self._timecode_anchor_fps: int | None = None
-        self._timecode_anchor_source = "tentacle_sync_e"
-        self._time_source = "laptop"
-        self._laptop_timecode_fps = 30
+        self._director_timecode_fps = 30
 
         self._camera_param_preset: dict[str, Any] | None = None
         self._camera_param_preset_path: Path | None = None
@@ -144,45 +138,16 @@ class DirectorServer:
 
         self.event_queue.put(("server_stopped", None))
 
-    def update_timecode_anchor(self, packet: dict[str, Any]) -> None:
-        loop = self._loop
-        if not loop:
-            return
-
-        fps = packet.get("fps")
-        hours = packet.get("hours")
-        minutes = packet.get("minutes")
-        seconds = packet.get("seconds")
-        frames = packet.get("frames")
-        if not all(isinstance(v, int) for v in (fps, hours, minutes, seconds, frames)):
-            return
-        if fps <= 0:
-            return
-
-        total_frames = ((((hours * 60) + minutes) * 60) + seconds) * fps + frames
-        loop.call_soon_threadsafe(self._set_timecode_anchor,
-                                  total_frames,
-                                  fps,
-                                  "tentacle_sync_e")
-
-    def clear_timecode_anchor(self) -> None:
-        loop = self._loop
-        if not loop:
-            return
-        loop.call_soon_threadsafe(self._clear_timecode_anchor)
-
-    def configure_time_source(self, source: str, fps: int | None = None) -> None:
-        normalized_source = "laptop" if source.strip().lower() == "laptop" else "tentacle"
-        normalized_fps = fps if isinstance(fps, int) and fps > 0 else self._laptop_timecode_fps
+    def configure_timecode_fps(self, fps: int | None = None) -> None:
+        normalized_fps = fps if isinstance(fps, int) and fps > 0 else self._director_timecode_fps
         normalized_fps = min(max(normalized_fps, 1), 120)
 
         loop = self._loop
         if not loop:
-            self._time_source = normalized_source
-            self._laptop_timecode_fps = normalized_fps
+            self._director_timecode_fps = normalized_fps
             return
 
-        loop.call_soon_threadsafe(self._set_time_source, normalized_source, normalized_fps)
+        loop.call_soon_threadsafe(self._set_timecode_fps, normalized_fps)
 
     def send_command_all(self, command: str, payload: dict[str, Any] | None = None) -> None:
         payload = payload or {}
@@ -534,7 +499,6 @@ class DirectorServer:
                     "actual_video_height": d.actual_video_height,
                     "actual_video_fps": d.actual_video_fps,
                     "supported_capture_modes": list(d.supported_capture_modes),
-                    "tentacle_state": d.tentacle_state,
                     "timecode": d.timecode,
                     "fps": d.fps,
                     "rig_state": d.rig_state,
@@ -683,7 +647,7 @@ class DirectorServer:
         self.log(f"Approved remote director: {target.name} ({target.device_id})")
         await self._send_remote_director_status(target,
                                                 "approved",
-                                                "Approved by laptop director.",
+                                                "Approved by director.",
                                                 approved=True)
 
     async def _deny_remote_director(self, device_id: str) -> None:
@@ -703,7 +667,7 @@ class DirectorServer:
         self.log(f"Denied remote director: {target.name} ({target.device_id})")
         await self._send_remote_director_status(target,
                                                 "denied",
-                                                "Denied by laptop director.",
+                                                "Denied by director.",
                                                 approved=False)
 
     async def _release_remote_director(self) -> None:
@@ -726,7 +690,7 @@ class DirectorServer:
         self.log(f"Released remote director: {target.name} ({target.device_id})")
         await self._send_remote_director_status(target,
                                                 "released",
-                                                "Remote director slot released by laptop.",
+                                                "Remote director slot released by director.",
                                                 approved=False)
 
     async def _send_remote_director_result(self,
@@ -808,21 +772,8 @@ class DirectorServer:
                 pass
         self.event_queue.put(("devices_updated", self.snapshot_devices()))
 
-    def _set_timecode_anchor(self, total_frames: int, fps: int, source: str) -> None:
-        self._timecode_anchor_monotonic = time.monotonic()
-        self._timecode_anchor_total_frames = total_frames
-        self._timecode_anchor_fps = fps
-        self._timecode_anchor_source = source
-
-    def _set_time_source(self, source: str, fps: int) -> None:
-        self._time_source = source
-        self._laptop_timecode_fps = min(max(fps, 1), 120)
-
-    def _clear_timecode_anchor(self) -> None:
-        self._timecode_anchor_monotonic = None
-        self._timecode_anchor_total_frames = None
-        self._timecode_anchor_fps = None
-        self._timecode_anchor_source = "tentacle_sync_e"
+    def _set_timecode_fps(self, fps: int) -> None:
+        self._director_timecode_fps = min(max(fps, 1), 120)
 
     async def _heartbeat_monitor(self) -> None:
         while True:
@@ -870,40 +821,7 @@ class DirectorServer:
         return message
 
     def _current_timecode_payload(self, unix_ms: int) -> dict[str, Any]:
-        if self._time_source == "laptop":
-            return self._laptop_timecode_payload(unix_ms=unix_ms)
-
-        anchor_monotonic = self._timecode_anchor_monotonic
-        anchor_total_frames = self._timecode_anchor_total_frames
-        fps = self._timecode_anchor_fps
-        if anchor_monotonic is None or anchor_total_frames is None or fps is None or fps <= 0:
-            return {}
-
-        elapsed = max(0.0, time.monotonic() - anchor_monotonic)
-        advanced_frames = int(elapsed * fps)
-        frames_per_day = 24 * 60 * 60 * fps
-        total_frames = (anchor_total_frames + advanced_frames) % frames_per_day
-
-        hours = total_frames // (3600 * fps)
-        minute_remainder = total_frames % (3600 * fps)
-        minutes = minute_remainder // (60 * fps)
-        second_remainder = minute_remainder % (60 * fps)
-        seconds = second_remainder // fps
-        frames = second_remainder % fps
-
-        return {
-            "source": self._timecode_anchor_source,
-            "fps": fps,
-            "hours": hours,
-            "minutes": minutes,
-            "seconds": seconds,
-            "frames": frames,
-            "timecode": f"{hours:02d}:{minutes:02d}:{seconds:02d}:{frames:02d}",
-            "total_frames_of_day": total_frames,
-        }
-
-    def _laptop_timecode_payload(self, unix_ms: int) -> dict[str, Any]:
-        fps = min(max(self._laptop_timecode_fps, 1), 120)
+        fps = min(max(self._director_timecode_fps, 1), 120)
         now_local = datetime.fromtimestamp(unix_ms / 1000.0)
         seconds_of_day = (now_local.hour * 3600) + (now_local.minute * 60) + now_local.second
         frames = int((now_local.microsecond / 1_000_000.0) * fps)
@@ -911,7 +829,7 @@ class DirectorServer:
         total_frames = (seconds_of_day * fps) + frames
 
         return {
-            "source": "director_laptop_clock",
+            "source": "director_clock",
             "fps": fps,
             "hours": now_local.hour,
             "minutes": now_local.minute,
@@ -1038,7 +956,7 @@ class DirectorServer:
                 self.log(f"HELLO from approved remote director {device.name} ({device.device_id})")
                 await self._send_remote_director_status(device,
                                                         "approved",
-                                                        "Approved by laptop director.",
+                                                        "Approved by director.",
                                                         approved=True)
             elif device.role == "remote_director_candidate":
                 active_id = self._remote_director_active_id
@@ -1052,7 +970,7 @@ class DirectorServer:
                 else:
                     await self._send_remote_director_status(device,
                                                             "pending",
-                                                            "Waiting for laptop director approval.",
+                                                            "Waiting for director approval.",
                                                             approved=False)
                     self.log(f"Remote director approval requested by {device.name} ({device.device_id})")
             else:
@@ -1074,7 +992,7 @@ class DirectorServer:
             if device.role == "remote_director":
                 await self._send_remote_director_status(device,
                                                         "approved",
-                                                        "Approved by laptop director.",
+                                                        "Approved by director.",
                                                         approved=True)
             elif self._remote_director_active_id or (
                 self._remote_director_approved_id and self._remote_director_approved_id != device.device_id
@@ -1087,7 +1005,7 @@ class DirectorServer:
                 self.log(f"Remote director approval requested by {device.name} ({device.device_id})")
                 await self._send_remote_director_status(device,
                                                         "pending",
-                                                        "Waiting for laptop director approval.",
+                                                        "Waiting for director approval.",
                                                         approved=False)
 
         elif mtype == "remote_director_exit":
@@ -1097,7 +1015,7 @@ class DirectorServer:
             device.role = "remote_director_denied"
             await self._send_remote_director_status(device,
                                                     "released",
-                                                    "Remote director exited. Laptop approval is retained for reconnect.",
+                                                    "Remote director exited. Director approval is retained for reconnect.",
                                                     approved=False)
             self.log(f"Remote director exited: {device.name} ({device.device_id})")
 
@@ -1113,7 +1031,7 @@ class DirectorServer:
                                                         payload={})
                 await self._send_remote_director_status(device,
                                                         "pending",
-                                                        "Waiting for laptop director approval.",
+                                                        "Waiting for director approval.",
                                                         approved=False)
                 return
             self.event_queue.put(("remote_director_control", {
@@ -1157,8 +1075,6 @@ class DirectorServer:
                 device.actual_video_fps = to_float_or_none(msg.get("actual_video_fps"))
             if "supported_capture_modes" in msg and isinstance(msg.get("supported_capture_modes"), list):
                 device.supported_capture_modes = [str(value) for value in msg.get("supported_capture_modes") if value]
-            if "tentacle_state" in msg:
-                device.tentacle_state = str(msg.get("tentacle_state") or "unknown")
             if "timecode" in msg:
                 device.timecode = str(msg.get("timecode") or "")
             fps = msg.get("fps")

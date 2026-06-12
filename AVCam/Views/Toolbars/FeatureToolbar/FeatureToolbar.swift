@@ -117,11 +117,11 @@ struct FeaturesToolbar<CameraModel: Camera>: PlatformView {
                     TextField("Camera A", text: $draftDirectorDeviceName)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                    Text("Name shown in the laptop director.")
+                    Text("Name shown in the director.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }
-                Section("Laptop Director") {
+                Section("Director") {
                     TextField(RemoteDirectorConfiguration.defaultDirectorWebSocketURL, text: $draftDirectorWebSocketURL)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
@@ -132,7 +132,7 @@ struct FeaturesToolbar<CameraModel: Camera>: PlatformView {
                 }
                 Section("Remote Director Phone") {
                     Toggle("Use this iPhone as handheld director", isOn: $draftRemoteDirectorMode)
-                    Text("When enabled, this phone requests laptop approval and shows controller buttons instead of recording.")
+                    Text("When enabled, this phone requests director approval and shows controller buttons instead of recording.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

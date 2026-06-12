@@ -31,7 +31,6 @@ class DeviceState:
     actual_video_height: int | None = None
     actual_video_fps: float | None = None
     supported_capture_modes: list[str] = field(default_factory=list)
-    tentacle_state: str = "unknown"
     timecode: str = ""
     fps: int | None = None
     rig_state: str = ""
