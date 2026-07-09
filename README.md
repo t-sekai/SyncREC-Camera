@@ -2,12 +2,15 @@
 
 SyncREC is a multi-iPhone video capture system developed by Stanford Vision and Learning Lab (SVL) for high-fidelity 3D/4D capture, pairing a foreground iOS camera app with a Python remote director for millisecond-level coordination<sup>*</sup>, remote control, preview checks, capture-parameter sync, and media ingest across a camera rig.
 
-## Screenshots
+| Operator View | External Rig View |
+| --- | --- |
+| ![Operator view of the SyncREC iPhone capture rig](docs/images/camera_rig_operator_view.JPG) | ![External view of the SyncREC multi-iPhone capture rig](docs/images/camera_rig_external_view.jpg) |
+| Phone array aimed at the capture volume. | Physical rig with mounted iPhones, power, and calibration target. |
 
 | Camera App | Remote Director |
 | --- | --- |
-| ![Camera app screenshot placeholder](docs/images/camera-app-placeholder.svg) | ![Remote director screenshot placeholder](docs/images/remote-director-placeholder.svg) |
-| Replace with a screenshot of the iPhone capture interface. | Replace with a screenshot of the Python director control surface. |
+| ![SyncREC iPhone camera tab](docs/images/iphone_main_camera_tab.PNG) | ![SyncREC director record page](docs/images/director_record_page.png) |
+| Foreground iPhone capture UI with locked camera parameters. | Director record page showing connected devices and record/preview interface. |
 
 ## What It Does
 
@@ -47,6 +50,7 @@ The system is designed around practical rig operation: fast setup, clear device 
 - [Mobile app dev notes](docs/mobile-app-dev-notes.md)
 - [Python director dev notes](docs/python-director-dev-notes.md)
 - [Optional device setup guide](docs/device-setup-guide.md)
+- [In-app and director functionality guide](docs/in-app-director-functionality-guide.md)
 
 ## Technology
 
